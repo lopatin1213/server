@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
 x25519-dalek = "2.0"
 rand = "0.8"
 aes = "0.8"
@@ -17,3 +18,7 @@ aes-gcm = "0.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 bcrypt = "0.15"
+axum = { version = "0.8", features = ["ws"] }   # ← добавляем фичу ws
+tokio-tungstenite = "0.21"
+futures-util = "0.3"
+tungstenite = "0.29.0"
