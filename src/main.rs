@@ -2036,7 +2036,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         handle_shutdown(state_clone).await;
     });
 
-    let listener = TcpListener::bind("0.0.0.0:8080").await?;
+    use std::env;
+
+    let ip = env::var("IP").unwrap_or_else(|_| "::".to_string());
+    let port = env::var("PORT").unwrap_or_else(|_| "8100".to_string());
+    let addr = format!("[{}]:{}", ip, port);
+    let listener = TcpListener::bind(&addr).await?;
     println!("[Сервер] Запущен на 0.0.0.0:8080 с БД и аутентификацией.");
 
     loop {
