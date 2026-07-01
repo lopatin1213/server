@@ -6,7 +6,7 @@ use cbc::cipher::{KeyIvInit, block_padding::Pkcs7};
 use aes::cipher::{BlockEncryptMut, BlockDecryptMut};
 use hkdf::Hkdf;
 use sha2::Sha256;
-use tokio::net::{TcpListener, TcpStream};   // ← добавлен TcpStream
+use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use futures_util::{SinkExt, StreamExt};
 use std::sync::Arc;
@@ -17,6 +17,7 @@ use rusqlite::{Connection, params};
 use uuid::Uuid;
 use bcrypt::{hash, verify, DEFAULT_COST};
 use tokio::sync::mpsc;
+use std::time::Instant;
 
 type Aes256CbcEnc = Encryptor<Aes256>;
 type Aes256CbcDec = Decryptor<Aes256>;
@@ -57,7 +58,7 @@ impl Session {
 struct AppState {
     db: Arc<StdMutex<Connection>>,
     sessions: HashMap<String, Arc<Mutex<Session>>>,
-    online_users: HashMap<String, String>, // username -> user_id
+    online_users: HashMap<String, String>,
 }
 
 impl AppState {
@@ -476,23 +477,35 @@ impl AppState {
 
 // ---- WebSocket Handshake ----
 async fn ws_handshake(stream: &mut tokio_tungstenite::WebSocketStream<TcpStream>) -> Result<SessionKeys, String> {
+    println!("[Сервер] Handshake: ожидание первого сообщения");
     let msg = stream.next().await
         .ok_or("No message received")?
         .map_err(|e| format!("WebSocket error: {}", e))?;
+    println!("[Сервер] Handshake: получено сообщение, тип={:?}", msg);
+
     let data = match msg {
-        Message::Binary(d) => d,
+        Message::Binary(d) => {
+            println!("[Сервер] Handshake: бинарные данные, длина={}", d.len());
+            d
+        },
+        Message::Text(t) => {
+            println!("[Сервер] Handshake: текстовое сообщение: {}", t);
+            return Err("Expected binary".to_string());
+        },
         _ => return Err("Expected binary".to_string()),
     };
     if data.len() != 32 {
-        return Err("Invalid public key length".to_string());
+        return Err(format!("Invalid public key length: {}", data.len()));
     }
     let client_key: [u8; 32] = data.to_vec().try_into().map_err(|_| "Invalid key array")?;
+    println!("[Сервер] Handshake: получен публичный ключ клиента");
 
     let secret = EphemeralSecret::random_from_rng(OsRng);
     let public = PublicKey::from(&secret);
     stream.send(Message::Binary(public.as_bytes().to_vec().into()))
         .await
         .map_err(|e| format!("Failed to send public key: {}", e))?;
+    println!("[Сервер] Handshake: отправлен публичный ключ сервера");
 
     let peer_public = PublicKey::from(client_key);
     let shared = secret.diffie_hellman(&peer_public);
@@ -503,7 +516,7 @@ async fn ws_handshake(stream: &mut tokio_tungstenite::WebSocketStream<TcpStream>
     hk.expand(b"relay-server", &mut derived).map_err(|e| e.to_string())?;
     let key = derived[..32].to_vec();
     let iv = derived[32..].to_vec();
-
+    println!("[Сервер] Handshake: успешно завершён");
     Ok(SessionKeys { key, iv })
 }
 
@@ -577,10 +590,17 @@ async fn handle_client(
     stream: TcpStream,
     state: Arc<Mutex<AppState>>,
 ) {
-    let mut ws_stream = match accept_async(stream).await {
-        Ok(ws) => ws,
+    let start_time = Instant::now();
+    println!("[Сервер] Принято TCP-соединение от {}", stream.peer_addr().unwrap());
+
+    let ws_result = accept_async(stream).await;
+    let mut ws_stream = match ws_result {
+        Ok(ws) => {
+            println!("[Сервер] WebSocket-соединение успешно установлено");
+            ws
+        },
         Err(e) => {
-            eprintln!("WebSocket accept error: {}", e);
+            eprintln!("[Сервер] WebSocket accept error: {}", e);
             return;
         }
     };
@@ -589,7 +609,7 @@ async fn handle_client(
     let keys = match ws_handshake(&mut ws_stream).await {
         Ok(k) => k,
         Err(e) => {
-            eprintln!("Handshake error: {}", e);
+            eprintln!("[Сервер] Handshake error: {}", e);
             return;
         }
     };
@@ -604,48 +624,62 @@ async fn handle_client(
     {
         let mut state_guard = state.lock().await;
         state_guard.sessions.insert(temp_id.clone(), session.clone());
+        println!("[Сервер] Временная сессия создана: {}", temp_id);
     }
 
-    // Задача отправки (использует sink)
+    // Задача отправки
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let Err(e) = sink.send(msg).await {
-                eprintln!("Send error: {}", e);
+                eprintln!("[Сервер] Ошибка отправки: {}", e);
                 break;
             }
         }
+        println!("[Сервер] Задача отправки завершена");
     });
 
-    // Функция чтения бинарных сообщений (использует stream)
+    // Функция чтения бинарных сообщений
     async fn read_binary_message(stream: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>) -> Result<Vec<u8>, String> {
         let msg = stream.next().await
             .ok_or("Connection closed")?
             .map_err(|e| format!("WebSocket error: {}", e))?;
         match msg {
-            Message::Binary(data) => Ok(data.to_vec()),
-            _ => Err("Expected binary".to_string()),
+            Message::Binary(data) => {
+                println!("[Сервер] Получено бинарное сообщение, длина={}", data.len());
+                Ok(data.to_vec())
+            },
+            Message::Text(t) => {
+                println!("[Сервер] Получено текстовое сообщение: {}", t);
+                Err("Expected binary".to_string())
+            },
+            _ => Err("Unexpected message type".to_string()),
         }
     }
 
     // ------ Аутентификация ------
     let data = match read_binary_message(&mut stream).await {
-        Ok(d) => d,
+        Ok(d) => {
+            println!("[Сервер] Первый пакет аутентификации, длина={}", d.len());
+            d
+        },
         Err(e) => {
-            eprintln!("Auth read error: {}", e);
+            eprintln!("[Сервер] Ошибка чтения аутентификации: {}", e);
             let _ = send_task.await;
             return;
         }
     };
     if data.is_empty() || data[0] != MSG_TYPE_AUTH {
-        eprintln!("Expected MSG_TYPE_AUTH, got {:?}", data.first());
+        eprintln!("[Сервер] Ожидался MSG_TYPE_AUTH, получено {:?}", data.first());
         let _ = send_task.await;
         return;
     }
+    println!("[Сервер] Получен пакет аутентификации");
 
     let auth_str = String::from_utf8(data[1..].to_vec()).unwrap_or_default();
+    println!("[Сервер] Auth string: {}", auth_str);
     let parts: Vec<&str> = auth_str.split('|').collect();
     if parts.len() < 3 {
-        eprintln!("Invalid auth format");
+        eprintln!("[Сервер] Неверный формат аутентификации");
         let _ = send_task.await;
         return;
     }
@@ -653,6 +687,7 @@ async fn handle_client(
     let phone = parts[1].trim().to_string();
     let password = parts[2].trim().to_string();
     let device_name = if parts.len() > 3 { parts[3].trim().to_string() } else { "unknown".to_string() };
+    println!("[Сервер] Команда: {}, телефон: {}", command, phone);
 
     let mut username = String::new();
     let mut first_name = None;
@@ -683,6 +718,7 @@ async fn handle_client(
 
         match result {
             Ok((user_id, username_db)) => {
+                println!("[Сервер] Восстановлена сессия: user_id={}, username={}", user_id, username_db);
                 let msg = format!("Успех|{}|{}|{}", user_id, token, username_db);
                 let _ = send_system_message(&tx, &msg).await;
 
@@ -702,7 +738,7 @@ async fn handle_client(
                 broadcast_system_message(&state, &msg, Some(&username_db)).await;
             }
             Err(e) => {
-                eprintln!("Token restore error: {}", e);
+                eprintln!("[Сервер] Ошибка восстановления сессии: {}", e);
                 let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
                 let _ = send_task.await;
                 return;
@@ -794,7 +830,7 @@ async fn handle_client(
                         broadcast_system_message(&state, &msg, Some(&username)).await;
                     }
                     Err(e) => {
-                        eprintln!("Ошибка создания сессии: {}", e);
+                        eprintln!("[Сервер] Ошибка создания сессии: {}", e);
                         let _ = send_system_message(&tx, &format!("[Система] Ошибка создания сессии: {}", e)).await;
                         let _ = send_task.await;
                         return;
@@ -802,7 +838,7 @@ async fn handle_client(
                 }
             }
             Err(e) => {
-                eprintln!("Ошибка аутентификации: {}", e);
+                eprintln!("[Сервер] Ошибка аутентификации: {}", e);
                 let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
                 let _ = send_task.await;
                 return;
@@ -810,7 +846,7 @@ async fn handle_client(
         }
     }
 
-    // ------ Загрузка истории (упрощённо, только личные) ------
+    // ------ Загрузка истории (упрощённо) ------
     let username_clone = {
         let guard = session.lock().await;
         guard.username.clone().unwrap_or_default()
@@ -832,18 +868,21 @@ async fn handle_client(
                 let guard = session.lock().await;
                 guard.keys.clone()
             };
+            println!("[Сервер] Загружено {} личных сообщений", msgs.len());
             for (sender, recipient, content) in msgs {
                 let _ = send_encrypted_message(&tx, &keys, &sender, &recipient, content.as_bytes()).await;
             }
+
         }
     }
 
-    // ------ Основной цикл обработки сообщений ------
+    // ------ Основной цикл ------
+    println!("[Сервер] Начало основного цикла обработки для {}", username_clone);
     loop {
         let msg = match stream.next().await {
             Some(Ok(msg)) => msg,
             Some(Err(e)) => {
-                eprintln!("Read error: {}", e);
+                eprintln!("[Сервер] Ошибка чтения: {}", e);
                 break;
             }
             None => break,
@@ -874,7 +913,7 @@ async fn handle_client(
                     let plaintext = match cipher_dec.decrypt_padded_mut::<Pkcs7>(&mut decrypted) {
                         Ok(p) => p.to_vec(),
                         Err(e) => {
-                            eprintln!("Decrypt error: {}", e);
+                            eprintln!("[Сервер] Ошибка расшифровки: {}", e);
                             continue;
                         }
                     };
@@ -883,10 +922,8 @@ async fn handle_client(
                         let guard = session.lock().await;
                         guard.username.clone().unwrap_or_default()
                     };
-                    println!("[Сервер] Получено сообщение от {} для {}: {}", my_username, target, content);
-
-                    // Здесь можно добавить обработку команд, групп, каналов (как в TCP-версии)
-                    // Для примера просто эхо
+                    println!("[Сервер] Сообщение от {} для {}: {}", my_username, target, content);
+                    // Здесь будет логика обработки (эхо для примера)
                     let tx = {
                         let guard = session.lock().await;
                         guard.tx.clone()
@@ -904,6 +941,8 @@ async fn handle_client(
                 }
                 _ => {}
             }
+        } else {
+            println!("[Сервер] Получено небинарное сообщение, игнорируем");
         }
     }
 
@@ -928,6 +967,7 @@ async fn handle_client(
         drop(state_guard);
         broadcast_system_message(&state, &msg, Some(&username)).await;
     }
+    println!("[Сервер] Клиент {} отключён, время сессии: {:?}", username_clone, start_time.elapsed());
     let _ = send_task.await;
 }
 
@@ -943,7 +983,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = "[::]:8100";
     let listener = TcpListener::bind(&addr).await?;
-    println!("WebSocket сервер запущен на {}", addr);
+    println!("[Сервер] WebSocket сервер запущен на {}", addr);
 
     loop {
         let (stream, _) = listener.accept().await?;
