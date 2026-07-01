@@ -591,7 +591,7 @@ async fn handle_client(
     state: Arc<Mutex<AppState>>,
 ) {
     let start_time = Instant::now();
-    println!("[Сервер] Принято TCP-соединение от {}", stream.peer_addr().unwrap());
+    println!("[Сервер] Принято TCP-соединение от {:?}", stream.peer_addr().ok());
 
     let ws_result = accept_async(stream).await;
     let mut ws_stream = match ws_result {
@@ -605,7 +605,6 @@ async fn handle_client(
         }
     };
 
-    // Handshake
     let keys = match ws_handshake(&mut ws_stream).await {
         Ok(k) => k,
         Err(e) => {
@@ -614,7 +613,6 @@ async fn handle_client(
         }
     };
 
-    // Разделяем на отправитель и получатель
     let (mut sink, mut stream) = ws_stream.split();
 
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -627,7 +625,6 @@ async fn handle_client(
         println!("[Сервер] Временная сессия создана: {}", temp_id);
     }
 
-    // Задача отправки
     let send_task = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
             if let Err(e) = sink.send(msg).await {
@@ -638,7 +635,6 @@ async fn handle_client(
         println!("[Сервер] Задача отправки завершена");
     });
 
-    // Функция чтения бинарных сообщений
     async fn read_binary_message(stream: &mut futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<TcpStream>>) -> Result<Vec<u8>, String> {
         let msg = stream.next().await
             .ok_or("Connection closed")?
@@ -686,29 +682,18 @@ async fn handle_client(
     let command = parts[0];
     let phone = parts[1].trim().to_string();
     let password = parts[2].trim().to_string();
-    let device_name = if parts.len() > 3 { parts[3].trim().to_string() } else { "unknown".to_string() };
     println!("[Сервер] Команда: {}, телефон: {}", command, phone);
 
-    let mut username = String::new();
-    let mut first_name = None;
-    let mut last_name = None;
-    if command == "register" {
-        if parts.len() >= 7 {
-            first_name = Some(parts[3].trim());
-            last_name = Some(parts[4].trim());
-            username = parts[5].trim().to_string();
-        } else if parts.len() >= 6 {
-            first_name = Some(parts[3].trim());
-            last_name = Some(parts[4].trim());
-            username = phone.clone();
-        } else {
-            username = phone.clone();
-        }
-    }
-
-    // Обработка token
+    // Парсим в зависимости от команды
     if command == "token" {
+        // Формат: token|токен|устройство
+        if parts.len() < 2 {
+            eprintln!("[Сервер] Неверный формат token");
+            let _ = send_task.await;
+            return;
+        }
         let token = parts[1].trim();
+        let device_name = if parts.len() > 2 { parts[2].trim().to_string() } else { "unknown".to_string() };
         let db = state.lock().await.db.clone();
         let token_str = token.to_string();
         let result = tokio::task::spawn_blocking(move || {
@@ -744,62 +729,120 @@ async fn handle_client(
                 return;
             }
         }
-    } else {
-        // Обычный логин/регистрация
+    } else if command == "login" {
+        // Формат: login|телефон|пароль|устройство (опционально)
+        let device_name = if parts.len() > 3 { parts[3].trim().to_string() } else { "unknown".to_string() };
         let db = state.lock().await.db.clone();
-        let cmd = command.to_string();
         let ph = phone.clone();
         let pwd = password.clone();
-        let reg_username = username.clone();
-        let reg_first_name = first_name.map(|s| s.to_string());
-        let reg_last_name = last_name.map(|s| s.to_string());
-
-        let reg_username_for_closure = reg_username.clone();
-        let reg_first_name_for_closure = reg_first_name.clone();
-        let reg_last_name_for_closure = reg_last_name.clone();
-
         let result = tokio::task::spawn_blocking(move || {
             let mut conn = db.lock().unwrap();
-            match cmd.as_str() {
-                "register" => {
-                    let username = if reg_username_for_closure.is_empty() { ph.clone() } else { reg_username_for_closure };
-                    let first_name_ref = reg_first_name_for_closure.as_deref();
-                    let last_name_ref = reg_last_name_for_closure.as_deref();
-                    AppState::register_user(&mut conn, &username, &ph, &pwd, first_name_ref, last_name_ref)
-                }
-                "login" => AppState::login_user_by_phone(&mut conn, &ph, &pwd),
-                _ => Err("Неизвестная команда".to_string()),
-            }
+            AppState::login_user_by_phone(&mut conn, &ph, &pwd)
         }).await.unwrap();
 
         match result {
             Ok(user_id) => {
                 println!("[Сервер] Аутентификация успешна для user_id={}", user_id);
-                let username = if command == "register" && !reg_username.is_empty() {
-                    reg_username
-                } else if command == "login" {
-                    let db3 = state.lock().await.db.clone();
-                    let uid = user_id.clone();
-                    let username_from_db = tokio::task::spawn_blocking(move || {
-                        let mut conn = db3.lock().unwrap();
-                        let mut stmt = conn.prepare("SELECT username FROM users WHERE id = ?")
-                            .map_err(|e| e.to_string())?;
-                        let mut rows = stmt.query([&uid]).map_err(|e| e.to_string())?;
-                        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                            let username: String = row.get(0).map_err(|e| e.to_string())?;
-                            Ok(username)
-                        } else {
-                            Err("Пользователь не найден".to_string())
-                        }
-                    }).await.unwrap();
-                    match username_from_db {
-                        Ok(uname) => uname,
-                        Err(_) => phone
+                // Получаем username из БД
+                let db3 = state.lock().await.db.clone();
+                let uid = user_id.clone();
+                let username_from_db = tokio::task::spawn_blocking(move || {
+                    let mut conn = db3.lock().unwrap();
+                    let mut stmt = conn.prepare("SELECT username FROM users WHERE id = ?")
+                        .map_err(|e| e.to_string())?;
+                    let mut rows = stmt.query([&uid]).map_err(|e| e.to_string())?;
+                    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                        let username: String = row.get(0).map_err(|e| e.to_string())?;
+                        Ok(username)
+                    } else {
+                        Err("Пользователь не найден".to_string())
                     }
-                } else {
-                    phone
+                }).await.unwrap();
+                let username = match username_from_db {
+                    Ok(uname) => uname,
+                    Err(_) => phone.clone()
                 };
 
+                let db2 = state.lock().await.db.clone();
+                let uid2 = user_id.clone();
+                let dev = device_name.clone();
+                let token_result = tokio::task::spawn_blocking(move || {
+                    let mut conn = db2.lock().unwrap();
+                    AppState::create_session(&mut conn, &uid2, &dev)
+                }).await.unwrap();
+
+                match token_result {
+                    Ok(token) => {
+                        println!("[Сервер] Сессия создана, токен: {}", token);
+                        let msg = format!("Успех|{}|{}|{}", user_id, token, username);
+                        let _ = send_system_message(&tx, &msg).await;
+
+                        {
+                            let mut guard = session.lock().await;
+                            guard.user_id = Some(user_id.clone());
+                            guard.username = Some(username.clone());
+                            guard.token = Some(token.clone());
+                        }
+                        {
+                            let mut state_guard = state.lock().await;
+                            state_guard.sessions.remove(&temp_id);
+                            state_guard.sessions.insert(token.clone(), session.clone());
+                            state_guard.online_users.insert(username.clone(), user_id.clone());
+                        }
+                        let msg = format!("[Система] Пользователь {} подключился", username);
+                        broadcast_system_message(&state, &msg, Some(&username)).await;
+                    }
+                    Err(e) => {
+                        eprintln!("[Сервер] Ошибка создания сессии: {}", e);
+                        let _ = send_system_message(&tx, &format!("[Система] Ошибка создания сессии: {}", e)).await;
+                        let _ = send_task.await;
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[Сервер] Ошибка логина: {}", e);
+                let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
+                let _ = send_task.await;
+                return;
+            }
+        }
+    } else if command == "register" {
+        // Формат: register|телефон|пароль|имя|фамилия|username|устройство
+        // Минимум: register|телефон|пароль|имя|фамилия|username|устройство (7 полей)
+        // Если username не указан, используем телефон
+        let first_name = if parts.len() > 3 { Some(parts[3].trim()) } else { None };
+        let last_name = if parts.len() > 4 { Some(parts[4].trim()) } else { None };
+        let username = if parts.len() > 5 && !parts[5].trim().is_empty() {
+            parts[5].trim().to_string()
+        } else {
+            phone.clone()
+        };
+        let device_name = if parts.len() > 6 { parts[6].trim().to_string() } else { "unknown".to_string() };
+
+        let db = state.lock().await.db.clone();
+        let ph = phone.clone();
+        let pwd = password.clone();
+        let uname = username.clone();
+        let fn_opt = first_name.map(|s| s.to_string());
+        let ln_opt = last_name.map(|s| s.to_string());
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut conn = db.lock().unwrap();
+            AppState::register_user(
+                &mut conn,
+                &uname,
+                &ph,
+                &pwd,
+                fn_opt.as_deref(),
+                ln_opt.as_deref(),
+            )
+        }).await.unwrap();
+
+        match result {
+            Ok(user_id) => {
+                println!("[Сервер] Регистрация успешна для user_id={}", user_id);
+                // Создаём сессию
                 let db2 = state.lock().await.db.clone();
                 let uid = user_id.clone();
                 let dev = device_name.clone();
@@ -838,15 +881,20 @@ async fn handle_client(
                 }
             }
             Err(e) => {
-                eprintln!("[Сервер] Ошибка аутентификации: {}", e);
+                eprintln!("[Сервер] Ошибка регистрации: {}", e);
                 let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
                 let _ = send_task.await;
                 return;
             }
         }
+    } else {
+        eprintln!("[Сервер] Неизвестная команда: {}", command);
+        let _ = send_system_message(&tx, &format!("[Система] Ошибка: Неизвестная команда {}", command)).await;
+        let _ = send_task.await;
+        return;
     }
 
-    // ------ Загрузка истории (упрощённо) ------
+    // ------ Загрузка истории ------
     let username_clone = {
         let guard = session.lock().await;
         guard.username.clone().unwrap_or_default()
