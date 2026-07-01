@@ -3,7 +3,7 @@ name: Build Linux server binary
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:   # чтобы можно было запускать вручную
+  workflow_dispatch:
 
 jobs:
   build:
@@ -15,15 +15,14 @@ jobs:
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
-          target: x86_64-unknown-linux-musl
           profile: minimal
           override: true
 
       - name: Build release binary
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        run: cargo build --release
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: server-binary
-          path: target/x86_64-unknown-linux-musl/release/start2
+          path: target/release/start2   # замените на имя вашего бинарника, если отличается
