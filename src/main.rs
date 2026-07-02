@@ -204,6 +204,12 @@ impl AppState {
             Err("Недействительный токен".to_string())
         }
     }
+    // ---- Sessions ----
+    fn delete_session(conn: &mut Connection, token: &str) -> Result<(), String> {
+        conn.execute("DELETE FROM sessions WHERE token = ?", [token])
+            .map_err(|e| format!("Ошибка удаления сессии: {}", e))?;
+        Ok(())
+    }
 
     fn user_exists_by_username(conn: &mut Connection, username: &str) -> Result<bool, String> {
         let mut stmt = conn.prepare("SELECT 1 FROM users WHERE username = ?")
@@ -685,7 +691,7 @@ async fn handle_client(
     let password = parts[2].trim().to_string();
     println!("[Сервер] Команда: {}, телефон: {}", command, phone);
 
-    // Парсим в зависимости от команды
+    // Парсим в зависимости от команды хуй
     if command == "token" {
         // Формат: token|токен|устройство
         if parts.len() < 2 {
@@ -885,6 +891,37 @@ async fn handle_client(
                 return;
             }
         }
+    } else if command == "logout" {
+        // Формат: logout|токен|устройство (устройство опционально)
+        if parts.len() < 2 {
+            let _ = send_system_message(&tx, "[Система] Неверный формат выхода").await;
+            return;
+        }
+        let token = parts[1].trim();
+        let device_name = if parts.len() > 2 { parts[2].trim().to_string() } else { "unknown".to_string() };
+
+        // Проверяем токен и удаляем сессию
+        let mut state_guard = state.lock().await;
+        if let Some(session_arc) = state_guard.sessions.remove(token) {
+            // Удаляем из онлайн-пользователей
+            let username = {
+                let guard = session_arc.lock().await;
+                guard.username.clone()
+            };
+            let uname = username.clone();
+            if let Some(uname) = username {
+                state_guard.online_users.remove(&uname);
+            }
+            // Отправляем подтверждение
+            let _ = send_system_message(&tx, "[Система] Вы вышли из системы").await;
+            println!("[Сервер] Пользователь {} вышел по запросу (токен {})", uname.unwrap_or_default(), token);
+        } else {
+            let _ = send_system_message(&tx, "[Система] Сессия не найдена").await;
+        }
+        // Закрываем соединение (завершаем задачу отправки)
+        let _ = send_task.await;
+        return;
+
     } else {
         eprintln!("[Сервер] Неизвестная команда: {}", command);
         let _ = send_system_message(&tx, &format!("[Система] Ошибка: Неизвестная команда {}", command)).await;
@@ -1027,6 +1064,7 @@ async fn handle_client(
             }
             None => break,
         };
+        println!("msg: {}", msg);
         if let Message::Binary(data) = msg {
             if data.is_empty() {
                 continue;
@@ -1097,10 +1135,53 @@ async fn handle_client(
                                         let mut conn = db.lock().unwrap();
                                         AppState::join_group(&mut conn, &gname, &uname)
                                     }).await.unwrap();
+
+                                    let db2 = state.lock().await.db.clone();
+                                    let uname2 = username_clone.clone();
+                                    let groups_history = tokio::task::spawn_blocking(move || {
+                                        let mut conn = db2.lock().unwrap();
+                                        let group_names = {
+                                            let mut stmt = conn.prepare(
+                                                "SELECT g.name FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.username = ?"
+                                            ).map_err(|e| e.to_string())?;
+                                            let mut rows = stmt.query([&uname2]).map_err(|e| e.to_string())?;
+                                            let mut names = Vec::new();
+                                            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                                                let name: String = row.get(0).map_err(|e| e.to_string())?;
+                                                names.push(name);
+                                            }
+                                            names
+                                        };
+                                        let mut all_msgs = Vec::new();
+                                        for gname in group_names {
+                                            let msgs = AppState::get_group_messages(&mut conn, &gname, 50)?;
+                                            for (sender, content) in msgs {
+                                                all_msgs.push((sender, content, gname.clone()));
+                                            }
+                                        }
+                                        Ok::<_, String>(all_msgs)
+                                    }).await.unwrap();
+
+                                    if let Ok(msgs) = groups_history {
+                                        let tx = {
+                                            let guard = session.lock().await;
+                                            guard.tx.clone()
+                                        };
+                                        let keys = {
+                                            let guard = session.lock().await;
+                                            guard.keys.clone()
+                                        };println!("[Сервер] Загружено {} групповых сообщений", msgs.len());
+                                        for (sender, content, gname) in msgs {
+                                            let recipient = format!("#{}", gname);
+                                            let _ = send_encrypted_message(&tx, &keys, &sender, &recipient, content.as_bytes()).await;
+                                        }
+
+                                    }
                                     match result {
                                         Ok(_) => format!("[Система] Вы присоединились к группе {}", group_name),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
                                     }
+
                                 }
                             }
                             "/leavegroup" => {
@@ -1201,6 +1282,49 @@ async fn handle_client(
                                         let mut conn = db.lock().unwrap();
                                         AppState::subscribe_channel(&mut conn, &ch, &uname)
                                     }).await.unwrap();
+
+                                    let db3 = state.lock().await.db.clone();
+                                    let uname3 = username_clone.clone();
+                                    let channels_history = tokio::task::spawn_blocking(move || {
+                                        let mut conn = db3.lock().unwrap();
+                                        let channel_names = {
+                                            let mut stmt = conn.prepare(
+                                                "SELECT c.name FROM channels c JOIN channel_subscribers cs ON c.id = cs.channel_id WHERE cs.username = ?"
+                                            ).map_err(|e| e.to_string())?;
+                                            let mut rows = stmt.query([&uname3]).map_err(|e| e.to_string())?;
+                                            let mut names = Vec::new();
+                                            while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                                                let name: String = row.get(0).map_err(|e| e.to_string())?;
+                                                names.push(name);
+                                            }
+                                            names
+                                        };
+                                        let mut all_msgs = Vec::new();
+                                        for ch_name in channel_names {
+                                            let msgs = AppState::get_channel_messages(&mut conn, &ch_name, 50)?;
+                                            for (sender, content) in msgs {
+                                                all_msgs.push((sender, content, ch_name.clone()));
+                                            }
+                                        }
+                                        Ok::<_, String>(all_msgs)
+                                    }).await.unwrap();
+
+                                    if let Ok(msgs) = channels_history {
+                                        let tx = {
+                                            let guard = session.lock().await;
+                                            guard.tx.clone()
+                                        };
+                                        let keys = {
+                                            let guard = session.lock().await;
+                                            guard.keys.clone()
+                                        };
+                                        println!("[Сервер] Загружено {} канальных сообщений", msgs.len());
+                                        for (sender, content, ch_name) in msgs {
+                                            let recipient = format!("&{}", ch_name);
+                                            let _ = send_encrypted_message(&tx, &keys, &sender, &recipient, content.as_bytes()).await;
+                                        }
+
+                                    }
                                     match result {
                                         Ok(_) => format!("[Система] Вы подписались на канал {}", channel_name),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
@@ -1653,6 +1777,48 @@ async fn handle_client(
                                     let mut conn = db.lock().unwrap();
                                     AppState::join_group(&mut conn, &gname, &uname)
                                 }).await.unwrap();
+
+                                let db2 = state.lock().await.db.clone();
+                                let uname2 = username_clone.clone();
+                                let groups_history = tokio::task::spawn_blocking(move || {
+                                    let mut conn = db2.lock().unwrap();
+                                    let group_names = {
+                                        let mut stmt = conn.prepare(
+                                            "SELECT g.name FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.username = ?"
+                                        ).map_err(|e| e.to_string())?;
+                                        let mut rows = stmt.query([&uname2]).map_err(|e| e.to_string())?;
+                                        let mut names = Vec::new();
+                                        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                                            let name: String = row.get(0).map_err(|e| e.to_string())?;
+                                            names.push(name);
+                                        }
+                                        names
+                                    };
+                                    let mut all_msgs = Vec::new();
+                                    for gname in group_names {
+                                        let msgs = AppState::get_group_messages(&mut conn, &gname, 50)?;
+                                        for (sender, content) in msgs {
+                                            all_msgs.push((sender, content, gname.clone()));
+                                        }
+                                    }
+                                    Ok::<_, String>(all_msgs)
+                                }).await.unwrap();
+
+                                if let Ok(msgs) = groups_history {
+                                    let tx = {
+                                        let guard = session.lock().await;
+                                        guard.tx.clone()
+                                    };
+                                    let keys = {
+                                        let guard = session.lock().await;
+                                        guard.keys.clone()
+                                    };println!("[Сервер] Загружено {} групповых сообщений", msgs.len());
+                                    for (sender, content, gname) in msgs {
+                                        let recipient = format!("#{}", gname);
+                                        let _ = send_encrypted_message(&tx, &keys, &sender, &recipient, content.as_bytes()).await;
+                                    }
+
+                                }
                                 match result {
                                     Ok(_) => format!("[Система] Вы присоединились к группе {}", group_name),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -1757,6 +1923,49 @@ async fn handle_client(
                                     let mut conn = db.lock().unwrap();
                                     AppState::subscribe_channel(&mut conn, &ch, &uname)
                                 }).await.unwrap();
+
+                                let db3 = state.lock().await.db.clone();
+                                let uname3 = username_clone.clone();
+                                let channels_history = tokio::task::spawn_blocking(move || {
+                                    let mut conn = db3.lock().unwrap();
+                                    let channel_names = {
+                                        let mut stmt = conn.prepare(
+                                            "SELECT c.name FROM channels c JOIN channel_subscribers cs ON c.id = cs.channel_id WHERE cs.username = ?"
+                                        ).map_err(|e| e.to_string())?;
+                                        let mut rows = stmt.query([&uname3]).map_err(|e| e.to_string())?;
+                                        let mut names = Vec::new();
+                                        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                                            let name: String = row.get(0).map_err(|e| e.to_string())?;
+                                            names.push(name);
+                                        }
+                                        names
+                                    };
+                                    let mut all_msgs = Vec::new();
+                                    for ch_name in channel_names {
+                                        let msgs = AppState::get_channel_messages(&mut conn, &ch_name, 50)?;
+                                        for (sender, content) in msgs {
+                                            all_msgs.push((sender, content, ch_name.clone()));
+                                        }
+                                    }
+                                    Ok::<_, String>(all_msgs)
+                                }).await.unwrap();
+
+                                if let Ok(msgs) = channels_history {
+                                    let tx = {
+                                        let guard = session.lock().await;
+                                        guard.tx.clone()
+                                    };
+                                    let keys = {
+                                        let guard = session.lock().await;
+                                        guard.keys.clone()
+                                    };
+                                    println!("[Сервер] Загружено {} канальных сообщений", msgs.len());
+                                    for (sender, content, ch_name) in msgs {
+                                        let recipient = format!("&{}", ch_name);
+                                        let _ = send_encrypted_message(&tx, &keys, &sender, &recipient, content.as_bytes()).await;
+                                    }
+
+                                }
                                 match result {
                                     Ok(_) => format!("[Система] Вы подписались на канал {}", channel_name),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -1920,6 +2129,48 @@ async fn handle_client(
                         _ => format!("[Система] Неизвестная команда: {}", cmd),
                     };
                     let _ = send_system_message(&tx, &response).await;
+                }
+                MSG_TYPE_AUTH => {
+                    // Обработка повторной аутентификации (например, logout)
+                    let auth_str = String::from_utf8(rest[4..].to_vec()).unwrap_or_default();
+                    println!("{}", auth_str);
+                    let parts: Vec<&str> = auth_str.split('|').collect();
+                    if parts.is_empty() {
+                        continue;
+                    }
+                    let command = parts[0];
+                    if command == "logout" && parts.len() >= 2 {
+                        let token = parts[1].trim();
+                        // Удаляем сессию
+                        let db = state.lock().await.db.clone();
+                        let token_clone = token.to_string();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let mut conn = db.lock().unwrap();
+                            AppState::delete_session(&mut conn, &token_clone);
+                            println!("[Сервер] удалена запись из бд")
+                        }).await.unwrap();
+                        let mut state_guard = state.lock().await;
+                        if let Some(session_arc) = state_guard.sessions.remove(token) {
+                            let username = {
+                                let guard = session_arc.lock().await;
+                                guard.username.clone()
+                            };
+                            if let Some(uname) = &username {
+                                state_guard.online_users.remove(uname);
+                                let _ = send_system_message(&tx, &format!("[Система] Пользователь {} вышел", uname)).await;
+                            }
+                            let uname_display = username.unwrap_or_else(|| "неизвестный".to_string());
+                            println!("[Сервер] Пользователь {} вышел по logout (токен {})", uname_display, token);
+                        } else {
+                            let _ = send_system_message(&tx, "[Система] Сессия не найдена").await;
+                            println!("[Сервер] Попытка выхода с недействительным токеном: {}", token);
+                        }
+
+                        // Закрываем соединение – прерываем цикл
+                        break;
+                    } else {
+                        let _ = send_system_message(&tx, "[Система] Неизвестная команда аутентификации").await;
+                    }
                 }
 
                 _ => {
