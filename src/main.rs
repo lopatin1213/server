@@ -291,9 +291,9 @@ impl AppState {
 
     fn get_user_messages(conn: &mut Connection, username: &str, limit: i64) -> Result<Vec<(String, String, String, i64)>, String> {
         let mut stmt = conn.prepare(
-            "SELECT sender_username, recipient_username, content, strftime('%s', sent_at) * 1000 FROM messages WHERE sender_username = ? OR recipient_username = ? ORDER BY sent_at ASC LIMIT ?"
+            "SELECT sender_username, recipient_username, content, strftime('%s', sent_at) * 1000 FROM messages WHERE sender_username = ? OR recipient_username = ? ORDER BY sent_at ASC"
         ).map_err(|e| format!("Ошибка подготовки: {}", e))?;
-        let mut rows = stmt.query(params![username, username, limit]).map_err(|e| format!("Ошибка запроса: {}", e))?;
+        let mut rows = stmt.query(params![username, username]).map_err(|e| format!("Ошибка запроса: {}", e))?;
         let mut result = Vec::new();
         while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let sender: String = row.get(0).map_err(|e| format!("Ошибка чтения sender: {}", e))?;
