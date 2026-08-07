@@ -4,22 +4,34 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-
+# Криптография
 x25519-dalek = "2.0"
 rand = "0.8"
-aes = "0.8"
-cbc = "0.1"
+aes-gcm = "0.10"              # Вместо aes + cbc
 hkdf = "0.12"
 sha2 = "0.10"
+bcrypt = "0.15"
+
+# Асинхронность и сеть
 tokio = { version = "1", features = ["full", "signal"] }
-serde = "1"
+tokio-tungstenite = "0.21"
+tungstenite = "0.29.0"
+futures-util = "0.3"
+axum = { version = "0.8", features = ["ws"] }   # (для возможного расширения)
+
+# HTTP-клиент для FCM
+reqwest = { version = "0.11", features = ["json", "rustls-tls"] }
+jsonwebtoken = "8"
+
+# Работа с данными
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-aes-gcm = "0.10"
 rusqlite = { version = "0.31", features = ["bundled"] }
 uuid = { version = "1", features = ["v4", "serde"] }
-bcrypt = "0.15"
-axum = { version = "0.8", features = ["ws"] }   # ← добавляем фичу ws
-tokio-tungstenite = "0.21"
-futures-util = "0.3"
-tungstenite = "0.29.0"
 chrono = "0.4"
+
+# Логирование
+env_logger = "0.10"
+log = "0.4"
+hex = "0.4.3"
+
