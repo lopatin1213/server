@@ -1951,7 +1951,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             state_guard.online_users.contains_key(&recipient)
                         };
 
-                        if target_online {
+                        
                             let target_tokens = {
                                 let state_guard = state.lock().await;
                                 state_guard
@@ -1981,7 +1981,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         .await;
                                 }
                             }
-                        } else {
+                       
                             // Отправляем FCM push
                             let db = state.lock().await.db.clone();
                             let target_user = recipient.clone();
@@ -2002,7 +2002,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 });
                                 let _ = send_fcm_push(&fcm_tok, &title, &body, Some(data_payload)).await;
                             }
-                        }
+                        
                         continue;
                     }
 
