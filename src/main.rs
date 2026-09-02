@@ -53,7 +53,6 @@ async fn send_fcm_push(
     body: &str,
     data: Option<serde_json::Value>,
 ) -> Result<(), String> {
-    // Преобразуем data в HashMap<String, String> (если есть)
     let data_map: Option<HashMap<String, String>> = data.map(|v| {
         v.as_object()
             .unwrap_or(&serde_json::Map::new())
@@ -62,30 +61,39 @@ async fn send_fcm_push(
                 if let Some(s) = v.as_str() {
                     Some((k.clone(), s.to_string()))
                 } else {
-                    // Если значение не строка, сериализуем в строку
                     Some((k.clone(), v.to_string()))
                 }
             })
             .collect()
     });
 
-    // Вызов Python-функции в блокирующем потоке
     let token = fcm_token.to_string();
     let title = title.to_string();
     let body = body.to_string();
 
-    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
-        // Инициализируем интерпретатор Python (PyO3 сделает это автоматически, но можно явно)
+    tokio::task::spawn_blocking(move || -> Result<(), String> {
         Python::with_gil(|py| {
-            // Импортируем наш модуль
+            // Добавляем директорию, в которой лежит бинарник, в sys.path
+            let sys = py.import("sys")
+                .map_err(|e| format!("Ошибка импорта sys: {}", e))?;
+            let path = sys.getattr("path")
+                .map_err(|e| format!("Ошибка получения sys.path: {}", e))?;
+
+            if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(dir) = exe_path.parent() {
+                    if let Some(dir_str) = dir.to_str() {
+                        path.call_method1("insert", (0, dir_str))
+                            .map_err(|e| format!("Ошибка добавления пути в sys.path: {}", e))?;
+                    }
+                }
+            }
+
             let helper = py.import("fcm_helper")
                 .map_err(|e| format!("Не удалось импортировать fcm_helper: {}", e))?;
             let send_func = helper.getattr("send_fcm_push")
                 .map_err(|e| format!("Не удалось найти send_fcm_push: {}", e))?;
 
-            // Подготавливаем аргументы
             let args = (token, title, body, data_map);
-            // Вызываем функцию
             let result: bool = send_func.call1(args)
                 .map_err(|e| format!("Ошибка вызова send_fcm_push: {}", e))?
                 .extract()
@@ -97,7 +105,8 @@ async fn send_fcm_push(
                 Err("FCM отправка вернула False".to_string())
             }
         })
-    }).await
+    })
+        .await
         .map_err(|e| format!("Ошибка выполнения Python-кода: {}", e))?
         .map_err(|e| format!("Ошибка FCM: {}", e))?;
 
