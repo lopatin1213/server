@@ -3,7 +3,9 @@ from firebase_admin import credentials, messaging
 import os
 import json
 from typing import Optional
-
+import logging
+logging.basicConfig(level=logging.INFO)
+logging = logging.getLogger(__name__)
 # Путь к вашему JSON-ключу (можно задать через переменную окружения)
 SERVICE_ACCOUNT_PATH = os.getenv("FCM_SERVICE_ACCOUNT_PATH",
                                  "C:\\MyProjects\\PythonProject\\vartchat-2b256-firebase-adminsdk-fbsvc-349ef7246c.json")
@@ -29,8 +31,8 @@ def send_fcm_push(device_token: str, title: str, body: str, data_payload: Option
             token=device_token,
         )
         response = messaging.send(message)
-        print(f"FCM отправлено успешно, ID: {response}")
+        logging.info(f"FCM отправлено успешно, ID: {response}")
         return True
     except Exception as e:
-        print(f"Ошибка FCM: {e}")
+        logging.error(f"Ошибка FCM: {e}")
         return False
