@@ -17,11 +17,11 @@ jobs:
           sudo apt-get install -y software-properties-common
           sudo add-apt-repository ppa:deadsnakes/ppa -y
           sudo apt-get update
-          sudo apt-get install -y python3.13-dev libpython3.13-dev pkg-config libssl-dev
+          sudo apt-get install -y python3.13-dev libpython3.13-dev pkg-config libssl-dev curl
 
       - name: Install pip and firebase-admin
         run: |
-          python3.13 -m ensurepip --upgrade
+          curl -sS https://bootstrap.pypa.io/get-pip.py | python3.13
           python3.13 -m pip install --upgrade pip
           python3.13 -m pip install firebase-admin
 
