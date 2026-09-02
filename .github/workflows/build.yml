@@ -11,12 +11,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies (Python + libs)
+      - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y python3-dev python3-pip libpython3-dev pkg-config libssl-dev
 
-      - name: Install Python dependencies (firebase-admin)
+      - name: Install Python dependencies
         run: |
           pip3 install --upgrade pip
           pip3 install firebase-admin
@@ -28,19 +28,19 @@ jobs:
           profile: minimal
           override: true
 
-      # Явно указываем системный Python, чтобы PyO3 нашёл правильные заголовки и библиотеку
       - name: Build release binary
         env:
           PYO3_PYTHON: /usr/bin/python3
+          RUSTFLAGS: "-C link-args=-lpython3.12"   # явно указываем библиотеку Python
         run: cargo build --release
 
       - name: Copy Python helper
         run: cp fcm_helper.py target/release/
 
-      - name: Upload binary artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: server-binary
           path: |
-            target/release/start2           # замените на имя вашего бинарника
+            target/release/start2
             target/release/fcm_helper.py
