@@ -11,6 +11,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 1. Системные зависимости (заголовки Python, SSL, pkg-config)
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-dev libssl-dev pkg-config
+
+      # 2. Установка конкретной версии Python (можно оставить '3.x' для последней)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 3. Установка Python-зависимостей (firebase-admin)
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install firebase-admin
+
+      # 4. Установка Rust (стабильный)
       - name: Install Rust
         uses: actions-rs/toolchain@v1
         with:
@@ -18,11 +37,19 @@ jobs:
           profile: minimal
           override: true
 
+      # 5. Сборка релизного бинарника
       - name: Build release binary
         run: cargo build --release
 
+      # 6. Копирование Python-хелпера в папку с бинарником (чтобы был в артефакте)
+      - name: Copy Python helper
+        run: cp fcm_helper.py target/release/
+
+      # 7. Загрузка артефакта (бинарник + helper)
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
         with:
           name: server-binary
-          path: target/release/start2   # замените на имя вашего бинарника, если отличается
+          path: |
+            target/release/start2         # замените на имя вашего бинарника
+            target/release/fcm_helper.py  # теперь хелпер тоже попадет в архив

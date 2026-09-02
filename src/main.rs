@@ -1,7 +1,8 @@
 // ============================================================
 //  main.rs — Relay Server with E2EE, multi-device, FCM pushes
 // ============================================================
-
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyString};
 use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
     Aes256Gcm, Key, Nonce,
@@ -45,107 +46,62 @@ const RATE_LIMIT_MAX: usize = 10; // сообщений в секунду
 const HISTORY_LIMIT: i64 = 100; // пагинация
 
 // ==================== FCM ====================
-fn get_fcm_env() -> Result<(String, String, String), String> {
-    let project_id = env::var("FCM_PROJECT_ID").map_err(|_| "FCM_PROJECT_ID not set")?;
-    let private_key = env::var("FCM_PRIVATE_KEY").map_err(|_| "FCM_PRIVATE_KEY not set")?;
-    let client_email = env::var("FCM_CLIENT_EMAIL").map_err(|_| "FCM_CLIENT_EMAIL not set")?;
-    Ok((project_id, private_key, client_email))
-}
-
-fn generate_fcm_jwt(private_key_pem: &str, client_email: &str) -> Result<String, String> {
-    let now = Utc::now();
-    let exp = now + Duration::minutes(60);
-    let claims = json!({
-        "iss": client_email,
-        "scope": "https://www.googleapis.com/auth/firebase.messaging",
-        "aud": "https://oauth2.googleapis.com/token",
-        "iat": now.timestamp(),
-        "exp": exp.timestamp(),
-    });
-    let key = EncodingKey::from_rsa_pem(private_key_pem.as_bytes())
-        .map_err(|e| format!("Invalid private key: {}", e))?;
-    encode(&Header::new(jsonwebtoken::Algorithm::RS256), &claims, &key)
-        .map_err(|e| format!("JWT encoding error: {}", e))
-}
-
-async fn get_fcm_access_token() -> Result<String, String> {
-    let (_, private_key, client_email) = get_fcm_env()?;
-    let jwt = generate_fcm_jwt(&private_key, &client_email)?;
-    let client = Client::new();
-    let resp = client
-        .post("https://oauth2.googleapis.com/token")
-        .form(&[
-            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
-            ("assertion", &jwt),
-        ])
-        .send()
-        .await
-        .map_err(|e| format!("OAuth request error: {}", e))?;
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("OAuth response parse error: {}", e))?;
-    let token = json["access_token"]
-        .as_str()
-        .ok_or("No access_token in response")?
-        .to_string();
-    Ok(token)
-}
-
-#[derive(Debug, Serialize)]
-struct FcmMessage {
-    message: FcmMessageBody,
-}
-
-#[derive(Debug, Serialize)]
-struct FcmMessageBody {
-    token: String,
-    notification: Option<FcmNotification>,
-    data: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Serialize)]
-struct FcmNotification {
-    title: String,
-    body: String,
-}
-
+/// Отправляет push-уведомление через Python-модуль fcm_helper
 async fn send_fcm_push(
     fcm_token: &str,
     title: &str,
     body: &str,
     data: Option<serde_json::Value>,
 ) -> Result<(), String> {
-    let (project_id, _, _) = get_fcm_env()?;
-    let access_token = get_fcm_access_token().await?;
-    let url = format!(
-        "https://fcm.googleapis.com/v1/projects/{}/messages:send",
-        project_id
-    );
-    let payload = FcmMessage {
-        message: FcmMessageBody {
-            token: fcm_token.to_string(),
-            notification: Some(FcmNotification {
-                title: title.to_string(),
-                body: body.to_string(),
-            }),
-            data,
-        },
-    };
-    let client = Client::new();
-    let resp = client
-        .post(&url)
-        .bearer_auth(access_token)
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| format!("FCM send error: {}", e))?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        let err_text = resp.text().await.unwrap_or_default();
-        Err(format!("FCM error: {}", err_text))
-    }
+    // Преобразуем data в HashMap<String, String> (если есть)
+    let data_map: Option<HashMap<String, String>> = data.map(|v| {
+        v.as_object()
+            .unwrap_or(&serde_json::Map::new())
+            .iter()
+            .filter_map(|(k, v)| {
+                if let Some(s) = v.as_str() {
+                    Some((k.clone(), s.to_string()))
+                } else {
+                    // Если значение не строка, сериализуем в строку
+                    Some((k.clone(), v.to_string()))
+                }
+            })
+            .collect()
+    });
+
+    // Вызов Python-функции в блокирующем потоке
+    let token = fcm_token.to_string();
+    let title = title.to_string();
+    let body = body.to_string();
+
+    let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+        // Инициализируем интерпретатор Python (PyO3 сделает это автоматически, но можно явно)
+        Python::with_gil(|py| {
+            // Импортируем наш модуль
+            let helper = py.import("fcm_helper")
+                .map_err(|e| format!("Не удалось импортировать fcm_helper: {}", e))?;
+            let send_func = helper.getattr("send_fcm_push")
+                .map_err(|e| format!("Не удалось найти send_fcm_push: {}", e))?;
+
+            // Подготавливаем аргументы
+            let args = (token, title, body, data_map);
+            // Вызываем функцию
+            let result: bool = send_func.call1(args)
+                .map_err(|e| format!("Ошибка вызова send_fcm_push: {}", e))?
+                .extract()
+                .map_err(|e| format!("Ошибка извлечения результата: {}", e))?;
+
+            if result {
+                Ok(())
+            } else {
+                Err("FCM отправка вернула False".to_string())
+            }
+        })
+    }).await
+        .map_err(|e| format!("Ошибка выполнения Python-кода: {}", e))?
+        .map_err(|e| format!("Ошибка FCM: {}", e))?;
+
+    Ok(())
 }
 
 // ==================== Ключи сессии ====================
@@ -1945,13 +1901,13 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         // Отправка эха себе
                         let _ = send_encrypted_message(&tx, &keys, &my_username, &recipient, &plaintext, timestamp).await;
 
-                        // Отправка получателю, если онлайн
-                        let target_online = {
-                            let state_guard = state.lock().await;
-                            state_guard.online_users.contains_key(&recipient)
-                        };
+                            // Отправка получателю, если онлайн
+                            let target_online = {
+                                let state_guard = state.lock().await;
+                                state_guard.online_users.contains_key(&recipient)
+                            };
 
-                        
+
                             let target_tokens = {
                                 let state_guard = state.lock().await;
                                 state_guard
@@ -1981,8 +1937,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         .await;
                                 }
                             }
-                       
-                            // Отправляем FCM push
+
+                        // Отправляем FCM push
                             let db = state.lock().await.db.clone();
                             let target_user = recipient.clone();
                             let fcm_tokens = tokio::task::spawn_blocking(move || {
@@ -2000,9 +1956,12 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     "sender": my_username,
                                     "type": "private",
                                 });
-                                let _ = send_fcm_push(&fcm_tok, &title, &body, Some(data_payload)).await;
+
+                                if let Err(e) = send_fcm_push(&fcm_tok, &title, &body, Some(data_payload)).await {
+                                    error!("Не удалось отправить push для токена {}: {}", fcm_tok, e);
+                                }
                             }
-                        
+
                         continue;
                     }
 
