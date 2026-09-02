@@ -11,8 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install system dependencies (including deadsnakes PPA for Python 3.13)
         run: |
+          sudo apt-get update
+          sudo apt-get install -y software-properties-common
+          sudo add-apt-repository ppa:deadsnakes/ppa -y
           sudo apt-get update
           sudo apt-get install -y python3.13-dev python3.13-pip libpython3.13-dev pkg-config libssl-dev
 
@@ -35,7 +38,7 @@ jobs:
         run: cargo build --release
 
       - name: Copy Python helper
-        run: cp src/fcm_helper.py target/release/
+        run: cp fcm_helper.py target/release/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
