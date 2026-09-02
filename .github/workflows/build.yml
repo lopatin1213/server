@@ -35,7 +35,7 @@ jobs:
         run: cargo build --release
 
       - name: Copy Python helper
-        run: cp fcm_helper.py target/release/
+        run: cp src/fcm_helper.py target/release/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
