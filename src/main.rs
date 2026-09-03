@@ -43,7 +43,7 @@ const MSG_TYPE_AUTH: u8 = 0x04;
 const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64 KB
 const RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(1);
 const RATE_LIMIT_MAX: usize = 10; // сообщений в секунду
-const HISTORY_LIMIT: i64 = 100; // пагинация
+const HISTORY_LIMIT: i64 = 1000; // пагинация
 
 // ==================== FCM ====================
 /// Отправляет push-уведомление через Python-модуль fcm_helper
