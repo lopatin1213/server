@@ -17,7 +17,7 @@ jobs:
           sudo apt-get install -y software-properties-common
           sudo add-apt-repository ppa:deadsnakes/ppa -y
           sudo apt-get update
-          sudo apt-get install -y python3.13-dev libpython3.13-dev pkg-config libssl-dev curl
+          sudo apt-get install -y python3.13-dev libpython3.13-dev pkg-config libssl-dev curl sshpass
 
       - name: Install pip and firebase-admin
         run: |
@@ -41,10 +41,15 @@ jobs:
       - name: Copy Python helper
         run: cp src/fcm_helper.py target/release/
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: server-binary
-          path: |
-            target/release/start2
-            target/release/fcm_helper.py
+      - name: Deploy to server via SCP
+        env:
+          # Используйте секрет, а не пароль в открытом виде
+          SSH_PASS: ${{ secrets.SERVER_PASSWORD }}
+        run: |
+          # Отключаем проверку известных хостов для автоматизации (можно улучшить)
+          sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no \
+            target/release/start2 \
+            target/release/fcm_helper.py \
+            vartchat@ssh-vartchat.alwaysdata.net:~/
+          sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no vartchat@ssh-vartchat.alwaysdata.net \
+            "chmod +x ~/start2"
