@@ -1,1 +1,8 @@
 /target
+.idea/
+.gigacode/
+data.db
+groups.json
+users.txt
+server.key
+*-firebase-adminsdk-*.json

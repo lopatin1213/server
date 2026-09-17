@@ -1,22 +1,17 @@
 // ============================================================
 //  main.rs — Relay Server with E2EE, multi-device, FCM pushes
 // ============================================================
-use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyString};
 use aes_gcm::{
+    Aes256Gcm, Key,
     aead::{Aead, AeadCore, KeyInit, OsRng},
-    Aes256Gcm, Key, Nonce,
 };
-use bcrypt::{hash, verify, DEFAULT_COST};
-use chrono::{Duration, Utc};
+use bcrypt::{DEFAULT_COST, hash, verify};
 use futures_util::{SinkExt, StreamExt};
 use hkdf::Hkdf;
-use jsonwebtoken::{encode, EncodingKey, Header};
-use log::{error, info, warn, debug};
+use log::{debug, error, info, warn};
+use pyo3::prelude::*;
 //use rand::rngs::OsRng as RandOsRng; // переименовали, чтобы не конфликтовало
-use reqwest::Client;
-use rusqlite::{params, Connection};
-use serde::Serialize;
+use rusqlite::{Connection, params};
 use serde_json::json;
 use sha2::Sha256;
 use std::collections::HashMap;
@@ -25,7 +20,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration as StdDuration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
 use x25519_dalek::{EphemeralSecret, PublicKey};
@@ -45,24 +40,46 @@ const RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(1);
 const RATE_LIMIT_MAX: usize = 10; // сообщений в секунду
 const HISTORY_LIMIT: i64 = 1000; // пагинация
 
+
 // ==================== FCM ====================
-/// Отправляет push-уведомление через Python-модуль fcm_helper
+
+#[derive(Debug)]
+pub enum FcmError {
+    /// Не смогли связаться с FCM — токен оставляем.
+    Connection(String),
+    /// FCM отклонил отправку (в т.ч. невалидный токен) — токен удаляем.
+    SendFailed(String),
+}
+
+impl std::fmt::Display for FcmError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FcmError::Connection(s) => write!(f, "FCM недоступен: {}", s),
+            FcmError::SendFailed(s) => write!(f, "FCM отклонил отправку: {}", s),
+        }
+    }
+}
+
 async fn send_fcm_push(
     fcm_token: &str,
     title: &str,
     body: &str,
     data: Option<serde_json::Value>,
-) -> Result<(), String> {
+) -> Result<(), FcmError> {
+    if fcm_token.trim().is_empty() {
+        return Err(FcmError::SendFailed("пустой токен".to_string()));
+    }
+
     let data_map: Option<HashMap<String, String>> = data.map(|v| {
         v.as_object()
             .unwrap_or(&serde_json::Map::new())
             .iter()
-            .filter_map(|(k, v)| {
-                if let Some(s) = v.as_str() {
-                    Some((k.clone(), s.to_string()))
-                } else {
-                    Some((k.clone(), v.to_string()))
-                }
+            .map(|(k, v)| {
+                let s = v
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| v.to_string());
+                (k.clone(), s)
             })
             .collect()
     });
@@ -71,48 +88,78 @@ async fn send_fcm_push(
     let title = title.to_string();
     let body = body.to_string();
 
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
+    let joined = tokio::task::spawn_blocking(move || -> Result<(bool, bool), String> {
         Python::with_gil(|py| {
-            // Добавляем директорию, в которой лежит бинарник, в sys.path
-            let sys = py.import("sys")
-                .map_err(|e| format!("Ошибка импорта sys: {}", e))?;
-            let path = sys.getattr("path")
-                .map_err(|e| format!("Ошибка получения sys.path: {}", e))?;
+            let sys = py.import("sys").map_err(|e| format!("sys: {}", e))?;
+            let path = sys
+                .getattr("path")
+                .map_err(|e| format!("sys.path: {}", e))?;
 
             if let Ok(exe_path) = std::env::current_exe() {
                 if let Some(dir) = exe_path.parent() {
                     if let Some(dir_str) = dir.to_str() {
                         path.call_method1("insert", (0, dir_str))
-                            .map_err(|e| format!("Ошибка добавления пути в sys.path: {}", e))?;
+                            .map_err(|e| format!("sys.path.insert: {}", e))?;
                     }
                 }
             }
 
-            let helper = py.import("fcm_helper")
-                .map_err(|e| format!("Не удалось импортировать fcm_helper: {}", e))?;
-            let send_func = helper.getattr("send_fcm_push")
-                .map_err(|e| format!("Не удалось найти send_fcm_push: {}", e))?;
+            let helper = py
+                .import("fcm_helper")
+                .map_err(|e| format!("import fcm_helper: {}", e))?;
+            let send_func = helper
+                .getattr("send_fcm_push")
+                .map_err(|e| format!("getattr send_fcm_push: {}", e))?;
 
-            let args = (token, title, body, data_map);
-            let result: bool = send_func.call1(args)
-                .map_err(|e| format!("Ошибка вызова send_fcm_push: {}", e))?
+            let result = send_func
+                .call1((token, title, body, data_map))
+                .map_err(|e| format!("call send_fcm_push: {}", e))?;
+            let extracted: (bool, bool) = result
                 .extract()
-                .map_err(|e| format!("Ошибка извлечения результата: {}", e))?;
-
-            if result {
-                Ok(())
-            } else {
-                Err("FCM отправка вернула False".to_string())
-            }
+                .map_err(|e| format!("extract result: {}", e))?;
+            Ok(extracted)
         })
     })
-        .await
-        .map_err(|e| format!("Ошибка выполнения Python-кода: {}", e))?
-        .map_err(|e| format!("Ошибка FCM: {}", e))?;
+    .await
+    .map_err(|e| FcmError::Connection(format!("join: {}", e)))?
+    .map_err(FcmError::Connection)?;
 
-    Ok(())
+    let (success, connection_failed) = joined;
+    if success {
+        Ok(())
+    } else if connection_failed {
+        Err(FcmError::Connection(
+            "send_fcm_push вернул connection_failed".to_string(),
+        ))
+    } else {
+        Err(FcmError::SendFailed("FCM отклонил отправку".to_string()))
+    }
 }
 
+/// Обёртка: отправить push и при отказе FCM удалить токен из БД.
+async fn send_fcm_push_and_cleanup(
+    db: Arc<StdMutex<Connection>>,
+    fcm_token: &str,
+    title: &str,
+    body: &str,
+    data: Option<serde_json::Value>,
+) {
+    match send_fcm_push(fcm_token, title, body, data).await {
+        Ok(()) => {}
+        Err(FcmError::SendFailed(e)) => {
+            warn!("Удаляю недействительный FCM-токен {}: {}", fcm_token, e);
+            let tok = fcm_token.to_string();
+            let _ = tokio::task::spawn_blocking(move || {
+                let mut conn = db.lock().unwrap();
+                AppState::delete_fcm_token(&mut conn, &tok)
+            })
+            .await;
+        }
+        Err(FcmError::Connection(e)) => {
+            error!("FCM недоступен, токен {} сохранён: {}", fcm_token, e);
+        }
+    }
+}
 // ==================== Ключи сессии ====================
 #[derive(Clone)]
 struct SessionKeys {
@@ -200,7 +247,7 @@ impl AppState {
                 "ALTER TABLE messages ADD COLUMN sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
                 [],
             )
-                .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
             info!("Добавлен столбец sent_at в таблицу messages");
         }
 
@@ -223,7 +270,7 @@ impl AppState {
                 "ALTER TABLE group_messages ADD COLUMN sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
                 [],
             )
-                .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
             info!("Добавлен столбец sent_at в таблицу group_messages");
         }
 
@@ -276,7 +323,7 @@ impl AppState {
             )",
                 [],
             )
-                .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?;
             info!("Создана таблица fcm_tokens");
         }
 
@@ -285,17 +332,17 @@ impl AppState {
             "CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_username)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_username)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_channel_messages_channel ON channel_messages(channel_id)",
             [],
@@ -305,12 +352,12 @@ impl AppState {
             "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_fcm_user ON fcm_tokens(user_id)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
 
         Ok(())
     }
@@ -392,17 +439,17 @@ impl AppState {
             "CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_username)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_username)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_channel_messages_channel ON channel_messages(channel_id)",
             [],
@@ -412,12 +459,12 @@ impl AppState {
             "CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_fcm_user ON fcm_tokens(user_id)",
             [],
         )
-            .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())?;
 
         Ok(())
     }
@@ -433,7 +480,8 @@ impl AppState {
         first_name: Option<&str>,
         last_name: Option<&str>,
     ) -> Result<String, String> {
-        let password_hash = hash(password, DEFAULT_COST).map_err(|e| format!("Ошибка хеширования: {}", e))?;
+        let password_hash =
+            hash(password, DEFAULT_COST).map_err(|e| format!("Ошибка хеширования: {}", e))?;
         let user_id = Uuid::new_v4().to_string();
         let display_name = match (first_name, last_name) {
             (Some(f), Some(l)) => format!("{} {}", f, l),
@@ -449,22 +497,35 @@ impl AppState {
         Ok(user_id)
     }
 
-    fn login_user_by_phone(conn: &mut Connection, phone: &str, password: &str) -> Result<String, String> {
+    fn login_user_by_phone(
+        conn: &mut Connection,
+        phone: &str,
+        password: &str,
+    ) -> Result<String, String> {
         let mut stmt = conn
             .prepare("SELECT id, password_hash FROM users WHERE phone = ?")
             .map_err(|e| format!("Ошибка запроса: {}", e))?;
-        let mut rows = stmt.query([phone]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([phone])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let user_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
-            let hash: String = row.get(1).map_err(|e| format!("Ошибка чтения hash: {}", e))?;
-            if verify(password, &hash).map_err(|e| format!("Ошибка проверки пароля: {}", e))? {
+            let hash: String = row
+                .get(1)
+                .map_err(|e| format!("Ошибка чтения hash: {}", e))?;
+            if verify(password, &hash).map_err(|e| format!("Ошибка проверки пароля: {}", e))?
+            {
                 return Ok(user_id);
             }
         }
         Err("Неверный телефон или пароль".to_string())
     }
 
-    fn create_session(conn: &mut Connection, user_id: &str, device_name: &str) -> Result<String, String> {
+    fn create_session(
+        conn: &mut Connection,
+        user_id: &str,
+        device_name: &str,
+    ) -> Result<String, String> {
         let token = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO sessions (token, user_id, device_name, last_seen) VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
@@ -477,12 +538,21 @@ impl AppState {
         let mut stmt = conn
             .prepare("SELECT user_id, username FROM sessions JOIN users ON sessions.user_id = users.id WHERE sessions.token = ?")
             .map_err(|e| format!("Ошибка подготовки: {}", e))?;
-        let mut rows = stmt.query([token]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([token])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let user_id: String = row.get(0).map_err(|e| format!("Ошибка чтения user_id: {}", e))?;
-            let username: String = row.get(1).map_err(|e| format!("Ошибка чтения username: {}", e))?;
-            conn.execute("UPDATE sessions SET last_seen = CURRENT_TIMESTAMP WHERE token = ?", [token])
-                .map_err(|e| format!("Ошибка обновления last_seen: {}", e))?;
+            let user_id: String = row
+                .get(0)
+                .map_err(|e| format!("Ошибка чтения user_id: {}", e))?;
+            let username: String = row
+                .get(1)
+                .map_err(|e| format!("Ошибка чтения username: {}", e))?;
+            conn.execute(
+                "UPDATE sessions SET last_seen = CURRENT_TIMESTAMP WHERE token = ?",
+                [token],
+            )
+            .map_err(|e| format!("Ошибка обновления last_seen: {}", e))?;
             Ok((user_id, username))
         } else {
             Err("Недействительный токен".to_string())
@@ -499,34 +569,68 @@ impl AppState {
         let mut stmt = conn
             .prepare("SELECT 1 FROM users WHERE username = ?")
             .map_err(|e| format!("Ошибка запроса: {}", e))?;
-        let mut rows = stmt.query([username]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
-        Ok(rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?.is_some())
+        let mut rows = stmt
+            .query([username])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        Ok(rows
+            .next()
+            .map_err(|e| format!("Ошибка чтения: {}", e))?
+            .is_some())
     }
 
     // ---- Сохранение FCM-токена ----
-    fn save_fcm_token(conn: &mut Connection, user_id: &str, token: &str, device_name: &str) -> Result<(), String> {
+    fn save_fcm_token(
+        conn: &mut Connection,
+        user_id: &str,
+        token: &str,
+        device_name: &str,
+    ) -> Result<(), String> {
         conn.execute(
             "INSERT OR REPLACE INTO fcm_tokens (user_id, token, device_name) VALUES (?, ?, ?)",
             params![user_id, token, device_name],
-        ).map_err(|e| format!("Ошибка сохранения FCM-токена: {}", e))?;
+        )
+        .map_err(|e| format!("Ошибка сохранения FCM-токена: {}", e))?;
         Ok(())
     }
 
-    fn get_fcm_tokens_for_user(conn: &mut Connection, username: &str) -> Result<Vec<String>, String> {
+    fn get_fcm_tokens_for_user(
+        conn: &mut Connection,
+        username: &str,
+    ) -> Result<Vec<String>, String> {
         let mut stmt = conn
             .prepare("SELECT token FROM fcm_tokens WHERE user_id = (SELECT id FROM users WHERE username = ?)")
             .map_err(|e| format!("Ошибка запроса FCM: {}", e))?;
-        let mut rows = stmt.query([username]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([username])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         let mut tokens = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let token: String = row.get(0).map_err(|e| format!("Ошибка чтения токена: {}", e))?;
+        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?
+        {
+            let token: String = row
+                .get(0)
+                .map_err(|e| format!("Ошибка чтения токена: {}", e))?;
             tokens.push(token);
         }
         Ok(tokens)
     }
+    fn delete_fcm_token(conn: &mut Connection, token: &str) -> Result<(), String> {
+        let affected = conn
+            .execute("DELETE FROM fcm_tokens WHERE token = ?", [token])
+            .map_err(|e| format!("Ошибка удаления FCM-токена: {}", e))?;
+        if affected > 0 {
+            info!("FCM-токен удалён из БД: {}", token);
+        }
+        Ok(())
+    }
 
     // ---- Сообщения с пагинацией ----
-    fn store_message(conn: &mut Connection, sender: &str, recipient: &str, content: &str, timestamp: i64) -> Result<(), String> {
+    fn store_message(
+        conn: &mut Connection,
+        sender: &str,
+        recipient: &str,
+        content: &str,
+        timestamp: i64,
+    ) -> Result<(), String> {
         let msg_id = Uuid::new_v4().to_string();
         conn.execute(
             "INSERT INTO messages (id, sender_username, recipient_username, content, sent_at) VALUES (?, ?, ?, ?, datetime(?/1000, 'unixepoch'))",
@@ -548,14 +652,24 @@ impl AppState {
              ORDER BY sent_at ASC
              LIMIT ? OFFSET ?"
         ).map_err(|e| format!("Ошибка подготовки: {}", e))?;
-        let mut rows = stmt.query(params![username, username, limit, offset])
+        let mut rows = stmt
+            .query(params![username, username, limit, offset])
             .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         let mut result = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let sender: String = row.get(0).map_err(|e| format!("Ошибка чтения sender: {}", e))?;
-            let recipient: String = row.get(1).map_err(|e| format!("Ошибка чтения recipient: {}", e))?;
-            let content: String = row.get(2).map_err(|e| format!("Ошибка чтения content: {}", e))?;
-            let timestamp: i64 = row.get(3).map_err(|e| format!("Ошибка чтения timestamp: {}", e))?;
+        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?
+        {
+            let sender: String = row
+                .get(0)
+                .map_err(|e| format!("Ошибка чтения sender: {}", e))?;
+            let recipient: String = row
+                .get(1)
+                .map_err(|e| format!("Ошибка чтения recipient: {}", e))?;
+            let content: String = row
+                .get(2)
+                .map_err(|e| format!("Ошибка чтения content: {}", e))?;
+            let timestamp: i64 = row
+                .get(3)
+                .map_err(|e| format!("Ошибка чтения timestamp: {}", e))?;
             result.push((sender, recipient, content, timestamp));
         }
         Ok(result)
@@ -567,18 +681,23 @@ impl AppState {
         conn.execute(
             "INSERT INTO groups (id, name, creator_username) VALUES (?, ?, ?)",
             params![group_id, name, creator],
-        ).map_err(|e| format!("Ошибка создания группы: {}", e))?;
+        )
+        .map_err(|e| format!("Ошибка создания группы: {}", e))?;
         conn.execute(
             "INSERT INTO group_members (group_id, username, role) VALUES (?, ?, 'owner')",
             params![group_id, creator],
-        ).map_err(|e| format!("Ошибка добавления создателя в группу: {}", e))?;
+        )
+        .map_err(|e| format!("Ошибка добавления создателя в группу: {}", e))?;
         Ok(())
     }
 
     fn join_group(conn: &mut Connection, group_name: &str, username: &str) -> Result<(), String> {
-        let mut stmt = conn.prepare("SELECT id FROM groups WHERE name = ?")
+        let mut stmt = conn
+            .prepare("SELECT id FROM groups WHERE name = ?")
             .map_err(|e| format!("Ошибка запроса группы: {}", e))?;
-        let mut rows = stmt.query([group_name]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([group_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let group_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
             conn.execute(
@@ -592,15 +711,19 @@ impl AppState {
     }
 
     fn leave_group(conn: &mut Connection, group_name: &str, username: &str) -> Result<(), String> {
-        let mut stmt = conn.prepare("SELECT id FROM groups WHERE name = ?")
+        let mut stmt = conn
+            .prepare("SELECT id FROM groups WHERE name = ?")
             .map_err(|e| format!("Ошибка запроса группы: {}", e))?;
-        let mut rows = stmt.query([group_name]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([group_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let group_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
             conn.execute(
                 "DELETE FROM group_members WHERE group_id = ? AND username = ?",
                 params![group_id, username],
-            ).map_err(|e| format!("Ошибка выхода из группы: {}", e))?;
+            )
+            .map_err(|e| format!("Ошибка выхода из группы: {}", e))?;
             Ok(())
         } else {
             Err("Группа не найдена".to_string())
@@ -611,19 +734,33 @@ impl AppState {
         let mut stmt = conn.prepare(
             "SELECT gm.username FROM group_members gm JOIN groups g ON gm.group_id = g.id WHERE g.name = ?"
         ).map_err(|e| format!("Ошибка запроса участников: {}", e))?;
-        let mut rows = stmt.query([group_name]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([group_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         let mut members = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let username: String = row.get(0).map_err(|e| format!("Ошибка чтения username: {}", e))?;
+        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?
+        {
+            let username: String = row
+                .get(0)
+                .map_err(|e| format!("Ошибка чтения username: {}", e))?;
             members.push(username);
         }
         Ok(members)
     }
 
-    fn store_group_message(conn: &mut Connection, group_name: &str, sender: &str, content: &str, timestamp: i64) -> Result<(), String> {
-        let mut stmt = conn.prepare("SELECT id FROM groups WHERE name = ?")
+    fn store_group_message(
+        conn: &mut Connection,
+        group_name: &str,
+        sender: &str,
+        content: &str,
+        timestamp: i64,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM groups WHERE name = ?")
             .map_err(|e| format!("Ошибка запроса группы: {}", e))?;
-        let mut rows = stmt.query([group_name]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([group_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let group_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
             let msg_id = Uuid::new_v4().to_string();
@@ -643,20 +780,30 @@ impl AppState {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<(String, String, i64)>, String> {
-        let mut stmt = conn.prepare(
-            "SELECT gm.sender_username, gm.content, strftime('%s', gm.sent_at) * 1000
+        let mut stmt = conn
+            .prepare(
+                "SELECT gm.sender_username, gm.content, strftime('%s', gm.sent_at) * 1000
              FROM group_messages gm JOIN groups g ON gm.group_id = g.id
              WHERE g.name = ?
              ORDER BY gm.sent_at ASC
-             LIMIT ? OFFSET ?"
-        ).map_err(|e| format!("Ошибка подготовки: {}", e))?;
-        let mut rows = stmt.query(params![group_name, limit, offset])
+             LIMIT ? OFFSET ?",
+            )
+            .map_err(|e| format!("Ошибка подготовки: {}", e))?;
+        let mut rows = stmt
+            .query(params![group_name, limit, offset])
             .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         let mut result = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let sender: String = row.get(0).map_err(|e| format!("Ошибка чтения sender: {}", e))?;
-            let content: String = row.get(1).map_err(|e| format!("Ошибка чтения content: {}", e))?;
-            let timestamp: i64 = row.get(2).map_err(|e| format!("Ошибка чтения timestamp: {}", e))?;
+        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?
+        {
+            let sender: String = row
+                .get(0)
+                .map_err(|e| format!("Ошибка чтения sender: {}", e))?;
+            let content: String = row
+                .get(1)
+                .map_err(|e| format!("Ошибка чтения content: {}", e))?;
+            let timestamp: i64 = row
+                .get(2)
+                .map_err(|e| format!("Ошибка чтения timestamp: {}", e))?;
             result.push((sender, content, timestamp));
         }
         Ok(result)
@@ -668,63 +815,98 @@ impl AppState {
         conn.execute(
             "INSERT INTO channels (id, name, creator_username) VALUES (?, ?, ?)",
             params![channel_id, name, creator],
-        ).map_err(|e| format!("Ошибка создания канала: {}", e))?;
+        )
+        .map_err(|e| format!("Ошибка создания канала: {}", e))?;
         conn.execute(
             "INSERT INTO channel_subscribers (channel_id, username) VALUES (?, ?)",
             params![channel_id, creator],
-        ).map_err(|e| format!("Ошибка подписки создателя: {}", e))?;
+        )
+        .map_err(|e| format!("Ошибка подписки создателя: {}", e))?;
         Ok(())
     }
 
-    fn subscribe_channel(conn: &mut Connection, channel_name: &str, username: &str) -> Result<(), String> {
-        let mut stmt = conn.prepare("SELECT id FROM channels WHERE name = ?")
+    fn subscribe_channel(
+        conn: &mut Connection,
+        channel_name: &str,
+        username: &str,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM channels WHERE name = ?")
             .map_err(|e| format!("Ошибка запроса канала: {}", e))?;
-        let mut rows = stmt.query([channel_name]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([channel_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let channel_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
             conn.execute(
                 "INSERT OR IGNORE INTO channel_subscribers (channel_id, username) VALUES (?, ?)",
                 params![channel_id, username],
-            ).map_err(|e| format!("Ошибка подписки: {}", e))?;
+            )
+            .map_err(|e| format!("Ошибка подписки: {}", e))?;
             Ok(())
         } else {
             Err("Канал не найден".to_string())
         }
     }
 
-    fn unsubscribe_channel(conn: &mut Connection, channel_name: &str, username: &str) -> Result<(), String> {
-        let mut stmt = conn.prepare("SELECT id FROM channels WHERE name = ?")
+    fn unsubscribe_channel(
+        conn: &mut Connection,
+        channel_name: &str,
+        username: &str,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM channels WHERE name = ?")
             .map_err(|e| format!("Ошибка запроса канала: {}", e))?;
-        let mut rows = stmt.query([channel_name]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([channel_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let channel_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
             conn.execute(
                 "DELETE FROM channel_subscribers WHERE channel_id = ? AND username = ?",
                 params![channel_id, username],
-            ).map_err(|e| format!("Ошибка отписки: {}", e))?;
+            )
+            .map_err(|e| format!("Ошибка отписки: {}", e))?;
             Ok(())
         } else {
             Err("Канал не найден".to_string())
         }
     }
 
-    fn get_channel_subscribers(conn: &mut Connection, channel_name: &str) -> Result<Vec<String>, String> {
+    fn get_channel_subscribers(
+        conn: &mut Connection,
+        channel_name: &str,
+    ) -> Result<Vec<String>, String> {
         let mut stmt = conn.prepare(
             "SELECT cs.username FROM channel_subscribers cs JOIN channels c ON cs.channel_id = c.id WHERE c.name = ?"
         ).map_err(|e| format!("Ошибка запроса подписчиков: {}", e))?;
-        let mut rows = stmt.query([channel_name]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([channel_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         let mut subscribers = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let username: String = row.get(0).map_err(|e| format!("Ошибка чтения username: {}", e))?;
+        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?
+        {
+            let username: String = row
+                .get(0)
+                .map_err(|e| format!("Ошибка чтения username: {}", e))?;
             subscribers.push(username);
         }
         Ok(subscribers)
     }
 
-    fn store_channel_message(conn: &mut Connection, channel_name: &str, sender: &str, content: &str, timestamp: i64) -> Result<(), String> {
-        let mut stmt = conn.prepare("SELECT id FROM channels WHERE name = ?")
+    fn store_channel_message(
+        conn: &mut Connection,
+        channel_name: &str,
+        sender: &str,
+        content: &str,
+        timestamp: i64,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare("SELECT id FROM channels WHERE name = ?")
             .map_err(|e| format!("Ошибка запроса канала: {}", e))?;
-        let mut rows = stmt.query([channel_name]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
+        let mut rows = stmt
+            .query([channel_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let channel_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
             let msg_id = Uuid::new_v4().to_string();
@@ -744,43 +926,76 @@ impl AppState {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<(String, String, i64)>, String> {
-        let mut stmt = conn.prepare(
-            "SELECT cm.sender_username, cm.content, strftime('%s', cm.sent_at) * 1000
+        let mut stmt = conn
+            .prepare(
+                "SELECT cm.sender_username, cm.content, strftime('%s', cm.sent_at) * 1000
              FROM channel_messages cm JOIN channels c ON cm.channel_id = c.id
              WHERE c.name = ?
              ORDER BY cm.sent_at ASC
-             LIMIT ? OFFSET ?"
-        ).map_err(|e| format!("Ошибка подготовки: {}", e))?;
-        let mut rows = stmt.query(params![channel_name, limit, offset])
+             LIMIT ? OFFSET ?",
+            )
+            .map_err(|e| format!("Ошибка подготовки: {}", e))?;
+        let mut rows = stmt
+            .query(params![channel_name, limit, offset])
             .map_err(|e| format!("Ошибка выполнения: {}", e))?;
         let mut result = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let sender: String = row.get(0).map_err(|e| format!("Ошибка чтения sender: {}", e))?;
-            let content: String = row.get(1).map_err(|e| format!("Ошибка чтения content: {}", e))?;
-            let timestamp: i64 = row.get(2).map_err(|e| format!("Ошибка чтения timestamp: {}", e))?;
+        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?
+        {
+            let sender: String = row
+                .get(0)
+                .map_err(|e| format!("Ошибка чтения sender: {}", e))?;
+            let content: String = row
+                .get(1)
+                .map_err(|e| format!("Ошибка чтения content: {}", e))?;
+            let timestamp: i64 = row
+                .get(2)
+                .map_err(|e| format!("Ошибка чтения timestamp: {}", e))?;
             result.push((sender, content, timestamp));
         }
         Ok(result)
     }
 
     // ---- Профиль ----
-    fn get_profile(conn: &mut Connection, username: &str) -> Result<(String, String, String, String, String), String> {
+    fn get_profile(
+        conn: &mut Connection,
+        username: &str,
+    ) -> Result<(String, String, String, String, String), String> {
         let mut stmt = conn.prepare("SELECT username, phone, first_name, last_name, display_name FROM users WHERE username = ?")
             .map_err(|e| format!("Ошибка подготовки запроса: {}", e))?;
-        let mut rows = stmt.query([username]).map_err(|e| format!("Ошибка выполнения запроса: {}", e))?;
-        if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения результата: {}", e))? {
-            let username: String = row.get(0).map_err(|e| format!("Ошибка чтения username: {}", e))?;
-            let phone: String = row.get(1).map_err(|e| format!("Ошибка чтения phone: {}", e))?;
-            let first_name: String = row.get(2).map_err(|e| format!("Ошибка чтения first_name: {}", e))?;
-            let last_name: String = row.get(3).map_err(|e| format!("Ошибка чтения last_name: {}", e))?;
-            let display_name: String = row.get(4).map_err(|e| format!("Ошибка чтения display_name: {}", e))?;
+        let mut rows = stmt
+            .query([username])
+            .map_err(|e| format!("Ошибка выполнения запроса: {}", e))?;
+        if let Some(row) = rows
+            .next()
+            .map_err(|e| format!("Ошибка чтения результата: {}", e))?
+        {
+            let username: String = row
+                .get(0)
+                .map_err(|e| format!("Ошибка чтения username: {}", e))?;
+            let phone: String = row
+                .get(1)
+                .map_err(|e| format!("Ошибка чтения phone: {}", e))?;
+            let first_name: String = row
+                .get(2)
+                .map_err(|e| format!("Ошибка чтения first_name: {}", e))?;
+            let last_name: String = row
+                .get(3)
+                .map_err(|e| format!("Ошибка чтения last_name: {}", e))?;
+            let display_name: String = row
+                .get(4)
+                .map_err(|e| format!("Ошибка чтения display_name: {}", e))?;
             Ok((username, phone, first_name, last_name, display_name))
         } else {
             Err("Пользователь не найден".to_string())
         }
     }
 
-    fn set_name(conn: &mut Connection, username: &str, first_name: &str, last_name: &str) -> Result<(), String> {
+    fn set_name(
+        conn: &mut Connection,
+        username: &str,
+        first_name: &str,
+        last_name: &str,
+    ) -> Result<(), String> {
         let display_name = if last_name.is_empty() {
             first_name.to_string()
         } else {
@@ -789,41 +1004,68 @@ impl AppState {
         conn.execute(
             "UPDATE users SET first_name = ?, last_name = ?, display_name = ? WHERE username = ?",
             params![first_name, last_name, display_name, username],
-        ).map_err(|e| format!("Ошибка обновления имени: {}", e))?;
+        )
+        .map_err(|e| format!("Ошибка обновления имени: {}", e))?;
         Ok(())
     }
 
-    fn set_display_name(conn: &mut Connection, username: &str, display_name: &str) -> Result<(), String> {
+    fn set_display_name(
+        conn: &mut Connection,
+        username: &str,
+        display_name: &str,
+    ) -> Result<(), String> {
         conn.execute(
             "UPDATE users SET display_name = ? WHERE username = ?",
             params![display_name, username],
-        ).map_err(|e| format!("Ошибка обновления отображаемого имени: {}", e))?;
+        )
+        .map_err(|e| format!("Ошибка обновления отображаемого имени: {}", e))?;
         Ok(())
     }
 
-    fn set_username(conn: &mut Connection, old_username: &str, new_username: &str) -> Result<(), String> {
-        let mut stmt = conn.prepare("SELECT 1 FROM users WHERE username = ?")
+    fn set_username(
+        conn: &mut Connection,
+        old_username: &str,
+        new_username: &str,
+    ) -> Result<(), String> {
+        let mut stmt = conn
+            .prepare("SELECT 1 FROM users WHERE username = ?")
             .map_err(|e| format!("Ошибка подготовки запроса: {}", e))?;
-        let mut rows = stmt.query([new_username]).map_err(|e| format!("Ошибка выполнения запроса: {}", e))?;
-        if rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?.is_some() {
+        let mut rows = stmt
+            .query([new_username])
+            .map_err(|e| format!("Ошибка выполнения запроса: {}", e))?;
+        if rows
+            .next()
+            .map_err(|e| format!("Ошибка чтения: {}", e))?
+            .is_some()
+        {
             return Err("Username уже занят".to_string());
         }
-        let mut stmt2 = conn.prepare("SELECT 1 FROM users WHERE username = ?")
+        let mut stmt2 = conn
+            .prepare("SELECT 1 FROM users WHERE username = ?")
             .map_err(|e| format!("Ошибка подготовки запроса: {}", e))?;
-        let mut rows2 = stmt2.query([old_username]).map_err(|e| format!("Ошибка выполнения запроса: {}", e))?;
-        if rows2.next().map_err(|e| format!("Ошибка чтения: {}", e))?.is_none() {
+        let mut rows2 = stmt2
+            .query([old_username])
+            .map_err(|e| format!("Ошибка выполнения запроса: {}", e))?;
+        if rows2
+            .next()
+            .map_err(|e| format!("Ошибка чтения: {}", e))?
+            .is_none()
+        {
             return Err("Пользователь не найден".to_string());
         }
         conn.execute(
             "UPDATE users SET username = ? WHERE username = ?",
             params![new_username, old_username],
-        ).map_err(|e| format!("Ошибка обновления username: {}", e))?;
+        )
+        .map_err(|e| format!("Ошибка обновления username: {}", e))?;
         Ok(())
     }
 }
 
 // ==================== Handshake ====================
-async fn ws_handshake(stream: &mut tokio_tungstenite::WebSocketStream<TcpStream>) -> Result<SessionKeys, String> {
+async fn ws_handshake(
+    stream: &mut tokio_tungstenite::WebSocketStream<TcpStream>,
+) -> Result<SessionKeys, String> {
     info!("Handshake: ожидание первого сообщения");
     let msg = stream
         .next()
@@ -841,10 +1083,7 @@ async fn ws_handshake(stream: &mut tokio_tungstenite::WebSocketStream<TcpStream>
     if data.len() != 32 {
         return Err(format!("Invalid public key length: {}", data.len()));
     }
-    let client_key: [u8; 32] = data
-        .to_vec()
-        .try_into()
-        .map_err(|_| "Invalid key array")?;
+    let client_key: [u8; 32] = data.to_vec().try_into().map_err(|_| "Invalid key array")?;
     info!("Handshake: получен публичный ключ клиента");
 
     let secret = EphemeralSecret::random_from_rng(OsRng);
@@ -870,7 +1109,10 @@ async fn ws_handshake(stream: &mut tokio_tungstenite::WebSocketStream<TcpStream>
 }
 
 // ==================== Вспомогательные функции отправки ====================
-async fn send_system_message(tx: &mpsc::UnboundedSender<Message>, text: &str) -> Result<(), String> {
+async fn send_system_message(
+    tx: &mpsc::UnboundedSender<Message>,
+    text: &str,
+) -> Result<(), String> {
     let bytes = text.as_bytes();
     let mut data = Vec::with_capacity(1 + 4 + bytes.len());
     data.push(MSG_TYPE_SYSTEM);
@@ -916,16 +1158,16 @@ async fn send_encrypted_message(
         .map_err(|e| format!("send error: {}", e))
 }
 
-async fn broadcast_system_message(state: &Arc<Mutex<AppState>>, message: &str, exclude_username: Option<&str>) {
+async fn broadcast_system_message(
+    state: &Arc<Mutex<AppState>>,
+    message: &str,
+    exclude_username: Option<&str>,
+) {
     let state_guard = state.lock().await;
     for (_, session) in &state_guard.sessions {
         let (connected, tx, username) = {
             let guard = session.lock().await;
-            (
-                guard.connected,
-                guard.tx.clone(),
-                guard.username.clone(),
-            )
+            (guard.connected, guard.tx.clone(), guard.username.clone())
         };
         if connected {
             if let Some(uname) = username {
@@ -971,7 +1213,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
     {
         let mut state_guard = state.lock().await;
-        state_guard.sessions.insert(temp_id.clone(), session.clone());
+        state_guard
+            .sessions
+            .insert(temp_id.clone(), session.clone());
         info!("Временная сессия создана: {}", temp_id);
     }
 
@@ -1052,12 +1296,15 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                 let mut conn = db.lock().unwrap();
                 AppState::check_session(&mut conn, &token_str)
             })
-                .await
-                .unwrap();
+            .await
+            .unwrap();
 
             match result {
                 Ok((user_id, username)) => {
-                    info!("Восстановлена сессия: user_id={}, username={}", user_id, username);
+                    info!(
+                        "Восстановлена сессия: user_id={}, username={}",
+                        user_id, username
+                    );
                     let msg = format!("Успех|{}|{}|{}", user_id, token, username);
                     let _ = send_system_message(&tx, &msg).await;
 
@@ -1071,8 +1318,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let mut conn = db.lock().unwrap();
                             let _ = AppState::save_fcm_token(&mut conn, &uid, &fcm_tok, &dev);
                         })
-                            .await
-                            .unwrap();
+                        .await
+                        .unwrap();
                     }
 
                     // Обновляем сессию
@@ -1085,7 +1332,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     {
                         let mut state_guard = state.lock().await;
                         state_guard.sessions.remove(&temp_id);
-                        state_guard.sessions.insert(token.to_string(), session.clone());
+                        state_guard
+                            .sessions
+                            .insert(token.to_string(), session.clone());
                         state_guard
                             .online_users
                             .entry(username.clone())
@@ -1117,8 +1366,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                 let mut conn = db.lock().unwrap();
                 AppState::login_user_by_phone(&mut conn, &ph, &pwd)
             })
-                .await
-                .unwrap();
+            .await
+            .unwrap();
 
             match result {
                 Ok(user_id) => {
@@ -1127,7 +1376,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     let db3 = state.lock().await.db.clone();
                     let uid = user_id.clone();
                     let username_from_db = tokio::task::spawn_blocking(move || {
-                        let mut conn = db3.lock().unwrap();
+                        let conn = db3.lock().unwrap();
                         let mut stmt = conn
                             .prepare("SELECT username FROM users WHERE id = ?")
                             .map_err(|e| e.to_string())?;
@@ -1139,8 +1388,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             Err("Пользователь не найден".to_string())
                         }
                     })
-                        .await
-                        .unwrap();
+                    .await
+                    .unwrap();
                     let username = match username_from_db {
                         Ok(uname) => uname,
                         Err(_) => phone.clone(),
@@ -1154,8 +1403,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let mut conn = db2.lock().unwrap();
                         AppState::create_session(&mut conn, &uid2, &dev)
                     })
-                        .await
-                        .unwrap();
+                    .await
+                    .unwrap();
 
                     match token_result {
                         Ok(token) => {
@@ -1171,10 +1420,11 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let dev = device_name.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut conn = db.lock().unwrap();
-                                    let _ = AppState::save_fcm_token(&mut conn, &uid, &fcm_tok, &dev);
+                                    let _ =
+                                        AppState::save_fcm_token(&mut conn, &uid, &fcm_tok, &dev);
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                             }
 
                             {
@@ -1199,8 +1449,11 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         }
                         Err(e) => {
                             error!("Ошибка создания сессии: {}", e);
-                            let _ = send_system_message(&tx, &format!("[Система] Ошибка создания сессии: {}", e))
-                                .await;
+                            let _ = send_system_message(
+                                &tx,
+                                &format!("[Система] Ошибка создания сессии: {}", e),
+                            )
+                            .await;
                             Err(())
                         }
                     }
@@ -1213,8 +1466,16 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             }
         }
         "register" => {
-            let first_name = if parts.len() > 3 { Some(parts[3].trim()) } else { None };
-            let last_name = if parts.len() > 4 { Some(parts[4].trim()) } else { None };
+            let first_name = if parts.len() > 3 {
+                Some(parts[3].trim())
+            } else {
+                None
+            };
+            let last_name = if parts.len() > 4 {
+                Some(parts[4].trim())
+            } else {
+                None
+            };
             let username = if parts.len() > 5 && !parts[5].trim().is_empty() {
                 parts[5].trim().to_string()
             } else {
@@ -1245,8 +1506,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     ln_opt.as_deref(),
                 )
             })
-                .await
-                .unwrap();
+            .await
+            .unwrap();
 
             match result {
                 Ok(user_id) => {
@@ -1258,8 +1519,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let mut conn = db2.lock().unwrap();
                         AppState::create_session(&mut conn, &uid, &dev)
                     })
-                        .await
-                        .unwrap();
+                    .await
+                    .unwrap();
 
                     match token_result {
                         Ok(token) => {
@@ -1274,10 +1535,11 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let dev = device_name.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut conn = db.lock().unwrap();
-                                    let _ = AppState::save_fcm_token(&mut conn, &uid, &fcm_tok, &dev);
+                                    let _ =
+                                        AppState::save_fcm_token(&mut conn, &uid, &fcm_tok, &dev);
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                             }
 
                             {
@@ -1302,8 +1564,11 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         }
                         Err(e) => {
                             error!("Ошибка создания сессии: {}", e);
-                            let _ = send_system_message(&tx, &format!("[Система] Ошибка создания сессии: {}", e))
-                                .await;
+                            let _ = send_system_message(
+                                &tx,
+                                &format!("[Система] Ошибка создания сессии: {}", e),
+                            )
+                            .await;
                             Err(())
                         }
                     }
@@ -1317,13 +1582,17 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         }
         _ => {
             error!("Неизвестная команда: {}", command);
-            let _ = send_system_message(&tx, &format!("[Система] Ошибка: Неизвестная команда {}", command)).await;
+            let _ = send_system_message(
+                &tx,
+                &format!("[Система] Ошибка: Неизвестная команда {}", command),
+            )
+            .await;
             Err(())
         }
     };
 
     // Если аутентификация не удалась – завершаем
-    let (my_user_id, my_username) = match auth_result {
+    let (_my_user_id, my_username) = match auth_result {
         Ok((uid, uname)) => (uid, uname),
         Err(_) => {
             let _ = send_task.await;
@@ -1341,8 +1610,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             let mut conn = db.lock().unwrap();
             AppState::get_user_messages(&mut conn, &uname, HISTORY_LIMIT, 0)
         })
-            .await
-            .unwrap();
+        .await
+        .unwrap();
 
         if let Ok(msgs) = history {
             let tx = {
@@ -1355,7 +1624,15 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             };
             info!("Загружено {} личных сообщений", msgs.len());
             for (sender, recipient, content, timestamp) in msgs {
-                let _ = send_encrypted_message(&tx, &keys, &sender, &recipient, content.as_bytes(), timestamp).await;
+                let _ = send_encrypted_message(
+                    &tx,
+                    &keys,
+                    &sender,
+                    &recipient,
+                    content.as_bytes(),
+                    timestamp,
+                )
+                .await;
             }
         }
 
@@ -1399,7 +1676,15 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             info!("Загружено {} групповых сообщений", msgs.len());
             for (sender, content, gname, timestamp) in msgs {
                 let recipient = format!("#{}", gname);
-                let _ = send_encrypted_message(&tx, &keys, &sender, &recipient, content.as_bytes(), timestamp).await;
+                let _ = send_encrypted_message(
+                    &tx,
+                    &keys,
+                    &sender,
+                    &recipient,
+                    content.as_bytes(),
+                    timestamp,
+                )
+                .await;
             }
         }
 
@@ -1443,7 +1728,15 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             info!("Загружено {} канальных сообщений", msgs.len());
             for (sender, content, ch_name, timestamp) in msgs {
                 let recipient = format!("&{}", ch_name);
-                let _ = send_encrypted_message(&tx, &keys, &sender, &recipient, content.as_bytes(), timestamp).await;
+                let _ = send_encrypted_message(
+                    &tx,
+                    &keys,
+                    &sender,
+                    &recipient,
+                    content.as_bytes(),
+                    timestamp,
+                )
+                .await;
             }
         }
     }
@@ -1474,7 +1767,11 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             {
                 let mut guard = session.lock().await;
                 if !guard.check_rate_limit() {
-                    let _ = send_system_message(&guard.tx, "[Система] Слишком много сообщений, подождите").await;
+                    let _ = send_system_message(
+                        &guard.tx,
+                        "[Система] Слишком много сообщений, подождите",
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -1485,35 +1782,48 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             match msg_type {
                 MSG_TYPE_USER => {
                     let mut offset = 0;
-                    let sender_len = u32::from_be_bytes(rest[offset..offset+4].try_into().unwrap()) as usize;
+                    let sender_len =
+                        u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
-                    let sender = String::from_utf8(rest[offset..offset+sender_len].to_vec()).unwrap_or_default();
+                    let sender = String::from_utf8(rest[offset..offset + sender_len].to_vec())
+                        .unwrap_or_default();
                     offset += sender_len;
 
-                    let recipient_len = u32::from_be_bytes(rest[offset..offset+4].try_into().unwrap()) as usize;
+                    let recipient_len =
+                        u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
-                    let recipient = String::from_utf8(rest[offset..offset+recipient_len].to_vec()).unwrap_or_default();
+                    let recipient =
+                        String::from_utf8(rest[offset..offset + recipient_len].to_vec())
+                            .unwrap_or_default();
                     offset += recipient_len;
 
                     // Читаем nonce (12 байт)
-                    let nonce = &rest[offset..offset+12];
+                    let nonce = &rest[offset..offset + 12];
                     info!("nonce (hex) = {}", hex::encode(nonce));
                     offset += 12;
 
-                    let msg_len = u32::from_be_bytes(rest[offset..offset+4].try_into().unwrap()) as usize;
-                    info!("encrypted len = {}", msg_len-12);
+                    let msg_len =
+                        u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
+                    info!("encrypted len = {}", msg_len - 12);
                     offset += 4;
-                    debug!("{}", rest.len()-offset);
-                    debug!("offset: {:#?}, next 4 bytes: {:#?}", offset, hex::encode(&rest[offset..offset+4]));
-                    let encrypted = &rest[offset..offset+msg_len];
+                    debug!("{}", rest.len() - offset);
+                    debug!(
+                        "offset: {:#?}, next 4 bytes: {:#?}",
+                        offset,
+                        hex::encode(&rest[offset..offset + 4])
+                    );
+                    let encrypted = &rest[offset..offset + msg_len];
                     info!("encrypted (hex) = {}", hex::encode(encrypted));
                     offset += msg_len;
 
                     // timestamp
                     let timestamp = if rest.len() >= offset + 8 {
-                        i64::from_be_bytes(rest[offset..offset+8].try_into().unwrap())
+                        i64::from_be_bytes(rest[offset..offset + 8].try_into().unwrap())
                     } else {
-                        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_millis() as i64
                     };
 
                     // Расшифровка
@@ -1521,7 +1831,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     info!("Ключ для расшифровки (hex) = {}", hex::encode(key));
 
                     use aes_gcm::aead::{Aead, KeyInit};
-                    let cipher = aes_gcm::Aes256Gcm::new(Key::<aes_gcm::Aes256Gcm>::from_slice(key));
+                    let cipher =
+                        aes_gcm::Aes256Gcm::new(Key::<aes_gcm::Aes256Gcm>::from_slice(key));
                     let nonce = aes_gcm::Nonce::from_slice(nonce); // ← убедитесь, что Nonce из 12 байт
 
                     let plaintext = match cipher.decrypt(nonce, encrypted) {
@@ -1559,8 +1870,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::create_group(&mut conn, &gname, &uname)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
                                         Ok(_) => format!("[Система] Группа {} создана", group_name),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
@@ -1579,10 +1890,13 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::join_group(&mut conn, &gname, &uname)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
-                                        Ok(_) => format!("[Система] Вы присоединились к группе {}", group_name),
+                                        Ok(_) => format!(
+                                            "[Система] Вы присоединились к группе {}",
+                                            group_name
+                                        ),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
                                     }
                                 }
@@ -1599,10 +1913,12 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::leave_group(&mut conn, &gname, &uname)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
-                                        Ok(_) => format!("[Система] Вы покинули группу {}", group_name),
+                                        Ok(_) => {
+                                            format!("[Система] Вы покинули группу {}", group_name)
+                                        }
                                         Err(e) => format!("[Система] Ошибка: {}", e),
                                     }
                                 }
@@ -1618,14 +1934,21 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::get_group_members(&mut conn, &gname)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
                                         Ok(members) => {
                                             if members.is_empty() {
-                                                format!("[Система] В группе {} нет участников", group_name)
+                                                format!(
+                                                    "[Система] В группе {} нет участников",
+                                                    group_name
+                                                )
                                             } else {
-                                                format!("[Система] Участники группы {}: {}", group_name, members.join(", "))
+                                                format!(
+                                                    "[Система] Участники группы {}: {}",
+                                                    group_name,
+                                                    members.join(", ")
+                                                )
                                             }
                                         }
                                         Err(e) => format!("[Система] Ошибка: {}", e),
@@ -1636,7 +1959,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let db = state.lock().await.db.clone();
                                 let uname = my_username.clone();
                                 let result = tokio::task::spawn_blocking(move || {
-                                    let mut conn = db.lock().unwrap();
+                                    let conn = db.lock().unwrap();
                                     let mut stmt = conn
                                         .prepare("SELECT g.name FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.username = ?")
                                         .map_err(|e| e.to_string())?;
@@ -1673,8 +1996,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::create_channel(&mut conn, &ch, &uname)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
                                         Ok(_) => format!("[Система] Канал {} создан", channel_name),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
@@ -1693,10 +2016,13 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::subscribe_channel(&mut conn, &ch, &uname)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
-                                        Ok(_) => format!("[Система] Вы подписались на канал {}", channel_name),
+                                        Ok(_) => format!(
+                                            "[Система] Вы подписались на канал {}",
+                                            channel_name
+                                        ),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
                                     }
                                 }
@@ -1713,10 +2039,13 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::unsubscribe_channel(&mut conn, &ch, &uname)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
-                                        Ok(_) => format!("[Система] Вы отписались от канала {}", channel_name),
+                                        Ok(_) => format!(
+                                            "[Система] Вы отписались от канала {}",
+                                            channel_name
+                                        ),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
                                     }
                                 }
@@ -1725,7 +2054,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let db = state.lock().await.db.clone();
                                 let uname = my_username.clone();
                                 let result = tokio::task::spawn_blocking(move || {
-                                    let mut conn = db.lock().unwrap();
+                                    let conn = db.lock().unwrap();
                                     let mut stmt = conn
                                         .prepare("SELECT c.name, c.creator_username FROM channels c JOIN channel_subscribers cs ON c.id = cs.channel_id WHERE cs.username = ?")
                                         .map_err(|e| e.to_string())?;
@@ -1745,7 +2074,10 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         if channels.is_empty() {
                                             "[Система] Вы не подписаны ни на один канал".to_string()
                                         } else {
-                                            format!("[Система] Ваши каналы: {}", channels.join(", "))
+                                            format!(
+                                                "[Система] Ваши каналы: {}",
+                                                channels.join(", ")
+                                            )
                                         }
                                     }
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -1754,7 +2086,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             "/listusers" => {
                                 let db = state.lock().await.db.clone();
                                 let result = tokio::task::spawn_blocking(move || {
-                                    let mut conn = db.lock().unwrap();
+                                    let conn = db.lock().unwrap();
                                     let mut stmt = conn
                                         .prepare("SELECT username, first_name, last_name FROM users ORDER BY username")
                                         .map_err(|e| e.to_string())?;
@@ -1778,7 +2110,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 match result {
                                     Ok(users) => {
                                         if users.is_empty() {
-                                            "[Система] Нет зарегистрированных пользователей".to_string()
+                                            "[Система] Нет зарегистрированных пользователей"
+                                                .to_string()
                                         } else {
                                             format!("[Система] Пользователи: {}", users.join(", "))
                                         }
@@ -1793,12 +2126,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::get_profile(&mut conn, &uname)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
                                     Ok((username, phone, first_name, last_name, display_name)) => {
-                                        format!("[Система] Профиль: username={}, phone={}, name={} {}, display_name={}",
-                                                username, phone, first_name, last_name, display_name)
+                                        format!(
+                                            "[Система] Профиль: username={}, phone={}, name={} {}, display_name={}",
+                                            username, phone, first_name, last_name, display_name
+                                        )
                                     }
                                     Err(e) => format!("[Система] Ошибка: {}", e),
                                 }
@@ -1808,7 +2143,11 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     "[Система] Использование: /setname <имя> [фамилия]".to_string()
                                 } else {
                                     let first_name = args[0];
-                                    let last_name = if args.len() > 1 { args[1..].join(" ") } else { "".to_string() };
+                                    let last_name = if args.len() > 1 {
+                                        args[1..].join(" ")
+                                    } else {
+                                        "".to_string()
+                                    };
                                     let db = state.lock().await.db.clone();
                                     let uname = my_username.clone();
                                     let fn_ = first_name.to_string();
@@ -1817,17 +2156,21 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::set_name(&mut conn, &uname, &fn_, &ln_)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
-                                        Ok(_) => format!("[Система] Имя обновлено: {} {}", first_name, last_name),
+                                        Ok(_) => format!(
+                                            "[Система] Имя обновлено: {} {}",
+                                            first_name, last_name
+                                        ),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
                                     }
                                 }
                             }
                             "/setdisplayname" => {
                                 if args.is_empty() {
-                                    "[Система] Использование: /setdisplayname <отображаемое имя>".to_string()
+                                    "[Система] Использование: /setdisplayname <отображаемое имя>"
+                                        .to_string()
                                 } else {
                                     let display_name = args.join(" ");
                                     let db = state.lock().await.db.clone();
@@ -1837,17 +2180,21 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::set_display_name(&mut conn, &uname, &dn)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
-                                        Ok(_) => format!("[Система] Отображаемое имя обновлено: {}", display_name),
+                                        Ok(_) => format!(
+                                            "[Система] Отображаемое имя обновлено: {}",
+                                            display_name
+                                        ),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
                                     }
                                 }
                             }
                             "/setusername" => {
                                 if args.is_empty() {
-                                    "[Система] Использование: /setusername <новый_username>".to_string()
+                                    "[Система] Использование: /setusername <новый_username>"
+                                        .to_string()
                                 } else {
                                     let new_username = args[0];
                                     let db = state.lock().await.db.clone();
@@ -1857,14 +2204,17 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::set_username(&mut conn, &uname, &nu)
                                     })
-                                        .await
-                                        .unwrap();
+                                    .await
+                                    .unwrap();
                                     match result {
                                         Ok(_) => {
                                             // Обновляем username в сессии
                                             let mut guard = session.lock().await;
                                             guard.username = Some(new_username.to_string());
-                                            format!("[Система] Username изменён на {}", new_username)
+                                            format!(
+                                                "[Система] Username изменён на {}",
+                                                new_username
+                                            )
                                         }
                                         Err(e) => format!("[Система] Ошибка: {}", e),
                                     }
@@ -1885,12 +2235,16 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let mut conn = db.lock().unwrap();
                             AppState::user_exists_by_username(&mut conn, &target_clone)
                         })
-                            .await
-                            .unwrap()
-                            .unwrap_or(false);
+                        .await
+                        .unwrap()
+                        .unwrap_or(false);
 
                         if !exists {
-                            let _ = send_system_message(&tx, &format!("[Система] Пользователь {} не найден", recipient)).await;
+                            let _ = send_system_message(
+                                &tx,
+                                &format!("[Система] Пользователь {} не найден", recipient),
+                            )
+                            .await;
                             continue;
                         }
 
@@ -1902,20 +2256,34 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let ts = timestamp;
                         tokio::task::spawn_blocking(move || {
                             let mut conn = db.lock().unwrap();
-                            let _ = AppState::store_message(&mut conn, &sender, &recipient_clone, &content_clone, ts);
+                            let _ = AppState::store_message(
+                                &mut conn,
+                                &sender,
+                                &recipient_clone,
+                                &content_clone,
+                                ts,
+                            );
                         })
-                            .await
-                            .unwrap();
+                        .await
+                        .unwrap();
 
                         // Отправка эха себе
-                        let _ = send_encrypted_message(&tx, &keys, &my_username, &recipient, &plaintext, timestamp).await;
+                        let _ = send_encrypted_message(
+                            &tx,
+                            &keys,
+                            &my_username,
+                            &recipient,
+                            &plaintext,
+                            timestamp,
+                        )
+                        .await;
+                        if recipient != my_username {
 
                             // Отправка получателю, если онлайн
-                            let target_online = {
+                            let _target_online = {
                                 let state_guard = state.lock().await;
                                 state_guard.online_users.contains_key(&recipient)
                             };
-
 
                             let target_tokens = {
                                 let state_guard = state.lock().await;
@@ -1947,7 +2315,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 }
                             }
 
-                        // Отправляем FCM push
+
+                            // Отправляем FCM push
                             let db = state.lock().await.db.clone();
                             let target_user = recipient.clone();
                             let fcm_tokens = tokio::task::spawn_blocking(move || {
@@ -1958,6 +2327,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 .unwrap()
                                 .unwrap_or_default();
 
+                            let db_fcm = state.lock().await.db.clone();
                             for fcm_tok in fcm_tokens {
                                 let title = format!("Новое сообщение от {}", my_username);
                                 let body = content.chars().take(100).collect::<String>();
@@ -1965,11 +2335,19 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     "sender": my_username,
                                     "type": "private",
                                 });
-
-                                if let Err(e) = send_fcm_push(&fcm_tok, &title, &body, Some(data_payload)).await {
-                                    error!("Не удалось отправить push для токена {}: {}", fcm_tok, e);
-                                }
+                                let db_clone = db_fcm.clone();
+                                tokio::spawn(async move {
+                                    send_fcm_push_and_cleanup(
+                                        db_clone,
+                                        &fcm_tok,
+                                        &title,
+                                        &body,
+                                        Some(data_payload),
+                                    )
+                                        .await;
+                                });
                             }
+                        }
 
                         continue;
                     }
@@ -1982,7 +2360,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let uname = my_username.clone();
                         let gname = group_name.to_string();
                         let is_member = tokio::task::spawn_blocking(move || {
-                            let mut conn = db.lock().unwrap();
+                            let conn = db.lock().unwrap();
                             let mut stmt = conn
                                 .prepare("SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id WHERE g.name = ? AND gm.username = ?")
                                 .map_err(|e| format!("Ошибка запроса: {}", e))?;
@@ -1994,7 +2372,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             .unwrap_or(false);
 
                         if !is_member {
-                            let _ = send_system_message(&tx, "[Система] Вы не состоите в этой группе").await;
+                            let _ =
+                                send_system_message(&tx, "[Система] Вы не состоите в этой группе")
+                                    .await;
                             continue;
                         }
 
@@ -2006,10 +2386,16 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let ts = timestamp;
                         tokio::task::spawn_blocking(move || {
                             let mut conn = db.lock().unwrap();
-                            let _ = AppState::store_group_message(&mut conn, &recip_group, &sender, &cnt, ts);
+                            let _ = AppState::store_group_message(
+                                &mut conn,
+                                &recip_group,
+                                &sender,
+                                &cnt,
+                                ts,
+                            );
                         })
-                            .await
-                            .unwrap();
+                        .await
+                        .unwrap();
 
                         // Получаем участников
                         let db = state.lock().await.db.clone();
@@ -2018,13 +2404,21 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let mut conn = db.lock().unwrap();
                             AppState::get_group_members(&mut conn, &gname)
                         })
-                            .await
-                            .unwrap()
-                            .unwrap_or_default();
+                        .await
+                        .unwrap()
+                        .unwrap_or_default();
 
                         // Отправляем эхо себе
                         let recip_with_hash = format!("#{}", group_name);
-                        let _ = send_encrypted_message(&tx, &keys, &my_username, &recip_with_hash, &plaintext, timestamp).await;
+                        let _ = send_encrypted_message(
+                            &tx,
+                            &keys,
+                            &my_username,
+                            &recip_with_hash,
+                            &plaintext,
+                            timestamp,
+                        )
+                        .await;
 
                         // Отправка всем участникам (кроме себя)
                         for member in members {
@@ -2062,7 +2456,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &plaintext,
                                             timestamp,
                                         )
-                                            .await;
+                                        .await;
                                     }
                                 }
                             } else {
@@ -2073,19 +2467,34 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::get_fcm_tokens_for_user(&mut conn, &target_user)
                                 })
-                                    .await
-                                    .unwrap()
-                                    .unwrap_or_default();
+                                .await
+                                .unwrap()
+                                .unwrap_or_default();
 
+                                let db_fcm = state.lock().await.db.clone();
                                 for fcm_tok in fcm_tokens {
                                     let title = format!("Новое сообщение в группе {}", group_name);
-                                    let body = format!("{}: {}", my_username, content.chars().take(100).collect::<String>());
+                                    let body = format!(
+                                        "{}: {}",
+                                        my_username,
+                                        content.chars().take(100).collect::<String>()
+                                    );
                                     let data_payload = json!({
                                         "sender": my_username,
                                         "group": group_name,
                                         "type": "group",
                                     });
-                                    let _ = send_fcm_push(&fcm_tok, &title, &body, Some(data_payload)).await;
+                                    let db_clone = db_fcm.clone();
+                                    tokio::spawn(async move {
+                                        send_fcm_push_and_cleanup(
+                                            db_clone,
+                                            &fcm_tok,
+                                            &title,
+                                            &body,
+                                            Some(data_payload),
+                                        )
+                                        .await;
+                                    });
                                 }
                             }
                         }
@@ -2100,7 +2509,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let uname = my_username.clone();
                         let ch = channel_name.to_string();
                         let is_subscribed = tokio::task::spawn_blocking(move || {
-                            let mut conn = db.lock().unwrap();
+                            let conn = db.lock().unwrap();
                             let mut stmt = conn
                                 .prepare("SELECT 1 FROM channel_subscribers cs JOIN channels c ON cs.channel_id = c.id WHERE c.name = ? AND cs.username = ?")
                                 .map_err(|e| format!("Ошибка запроса: {}", e))?;
@@ -2112,7 +2521,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             .unwrap_or(false);
 
                         if !is_subscribed {
-                            let _ = send_system_message(&tx, "[Система] Вы не подписаны на этот канал").await;
+                            let _ =
+                                send_system_message(&tx, "[Система] Вы не подписаны на этот канал")
+                                    .await;
                             continue;
                         }
 
@@ -2122,7 +2533,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let ch = channel_name.to_string();
                             let uname = my_username.clone();
                             tokio::task::spawn_blocking(move || {
-                                let mut conn = db.lock().unwrap();
+                                let conn = db.lock().unwrap();
                                 let mut stmt = conn
                                     .prepare("SELECT 1 FROM channels WHERE name = ? AND creator_username = ?")
                                     .map_err(|e| e.to_string())?;
@@ -2135,7 +2546,11 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         };
 
                         if !is_owner {
-                            let _ = send_system_message(&tx, "[Система] Только владелец канала может отправлять сообщения").await;
+                            let _ = send_system_message(
+                                &tx,
+                                "[Система] Только владелец канала может отправлять сообщения",
+                            )
+                            .await;
                             continue;
                         }
 
@@ -2147,10 +2562,12 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let ts = timestamp;
                         tokio::task::spawn_blocking(move || {
                             let mut conn = db.lock().unwrap();
-                            let _ = AppState::store_channel_message(&mut conn, &ch_name, &sender, &cnt, ts);
+                            let _ = AppState::store_channel_message(
+                                &mut conn, &ch_name, &sender, &cnt, ts,
+                            );
                         })
-                            .await
-                            .unwrap();
+                        .await
+                        .unwrap();
 
                         // Получаем подписчиков
                         let db = state.lock().await.db.clone();
@@ -2159,12 +2576,20 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let mut conn = db.lock().unwrap();
                             AppState::get_channel_subscribers(&mut conn, &ch_name2)
                         })
-                            .await
-                            .unwrap()
-                            .unwrap_or_default();
+                        .await
+                        .unwrap()
+                        .unwrap_or_default();
 
                         let recip_with_amp = format!("&{}", channel_name);
-                        let _ = send_encrypted_message(&tx, &keys, &my_username, &recip_with_amp, &plaintext, timestamp).await;
+                        let _ = send_encrypted_message(
+                            &tx,
+                            &keys,
+                            &my_username,
+                            &recip_with_amp,
+                            &plaintext,
+                            timestamp,
+                        )
+                        .await;
 
                         for subscriber in subscribers {
                             if subscriber == my_username {
@@ -2201,7 +2626,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &plaintext,
                                             timestamp,
                                         )
-                                            .await;
+                                        .await;
                                     }
                                 }
                             } else {
@@ -2212,19 +2637,35 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::get_fcm_tokens_for_user(&mut conn, &target_user)
                                 })
-                                    .await
-                                    .unwrap()
-                                    .unwrap_or_default();
+                                .await
+                                .unwrap()
+                                .unwrap_or_default();
 
+                                let db_fcm = state.lock().await.db.clone();
                                 for fcm_tok in fcm_tokens {
-                                    let title = format!("Новое сообщение в канале {}", channel_name);
-                                    let body = format!("{}: {}", my_username, content.chars().take(100).collect::<String>());
+                                    let title =
+                                        format!("Новое сообщение в канале {}", channel_name);
+                                    let body = format!(
+                                        "{}: {}",
+                                        my_username,
+                                        content.chars().take(100).collect::<String>()
+                                    );
                                     let data_payload = json!({
                                         "sender": my_username,
                                         "channel": channel_name,
                                         "type": "channel",
                                     });
-                                    let _ = send_fcm_push(&fcm_tok, &title, &body, Some(data_payload)).await;
+                                    let db_clone = db_fcm.clone();
+                                    tokio::spawn(async move {
+                                        send_fcm_push_and_cleanup(
+                                            db_clone,
+                                            &fcm_tok,
+                                            &title,
+                                            &body,
+                                            Some(data_payload),
+                                        )
+                                        .await;
+                                    });
                                 }
                             }
                         }
@@ -2260,8 +2701,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::create_group(&mut conn, &gname, &uname)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
                                     Ok(_) => format!("[Система] Группа {} создана", group_name),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -2280,10 +2721,13 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::join_group(&mut conn, &gname, &uname)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
-                                    Ok(_) => format!("[Система] Вы присоединились к группе {}", group_name),
+                                    Ok(_) => format!(
+                                        "[Система] Вы присоединились к группе {}",
+                                        group_name
+                                    ),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
                                 }
                             }
@@ -2300,8 +2744,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::leave_group(&mut conn, &gname, &uname)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
                                     Ok(_) => format!("[Система] Вы покинули группу {}", group_name),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -2319,14 +2763,21 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::get_group_members(&mut conn, &gname)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
                                     Ok(members) => {
                                         if members.is_empty() {
-                                            format!("[Система] В группе {} нет участников", group_name)
+                                            format!(
+                                                "[Система] В группе {} нет участников",
+                                                group_name
+                                            )
                                         } else {
-                                            format!("[Система] Участники группы {}: {}", group_name, members.join(", "))
+                                            format!(
+                                                "[Система] Участники группы {}: {}",
+                                                group_name,
+                                                members.join(", ")
+                                            )
                                         }
                                     }
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -2337,7 +2788,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let db = state.lock().await.db.clone();
                             let uname = my_username.clone();
                             let result = tokio::task::spawn_blocking(move || {
-                                let mut conn = db.lock().unwrap();
+                                let conn = db.lock().unwrap();
                                 let mut stmt = conn
                                     .prepare("SELECT g.name FROM groups g JOIN group_members gm ON g.id = gm.group_id WHERE gm.username = ?")
                                     .map_err(|e| e.to_string())?;
@@ -2374,8 +2825,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::create_channel(&mut conn, &ch, &uname)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
                                     Ok(_) => format!("[Система] Канал {} создан", channel_name),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -2394,10 +2845,13 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::subscribe_channel(&mut conn, &ch, &uname)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
-                                    Ok(_) => format!("[Система] Вы подписались на канал {}", channel_name),
+                                    Ok(_) => format!(
+                                        "[Система] Вы подписались на канал {}",
+                                        channel_name
+                                    ),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
                                 }
                             }
@@ -2414,10 +2868,13 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::unsubscribe_channel(&mut conn, &ch, &uname)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
-                                    Ok(_) => format!("[Система] Вы отписались от канала {}", channel_name),
+                                    Ok(_) => format!(
+                                        "[Система] Вы отписались от канала {}",
+                                        channel_name
+                                    ),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
                                 }
                             }
@@ -2426,7 +2883,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let db = state.lock().await.db.clone();
                             let uname = my_username.clone();
                             let result = tokio::task::spawn_blocking(move || {
-                                let mut conn = db.lock().unwrap();
+                                let conn = db.lock().unwrap();
                                 let mut stmt = conn
                                     .prepare("SELECT c.name, c.creator_username FROM channels c JOIN channel_subscribers cs ON c.id = cs.channel_id WHERE cs.username = ?")
                                     .map_err(|e| e.to_string())?;
@@ -2455,7 +2912,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         "/listusers" => {
                             let db = state.lock().await.db.clone();
                             let result = tokio::task::spawn_blocking(move || {
-                                let mut conn = db.lock().unwrap();
+                                let conn = db.lock().unwrap();
                                 let mut stmt = conn
                                     .prepare("SELECT username, first_name, last_name FROM users ORDER BY username")
                                     .map_err(|e| e.to_string())?;
@@ -2494,12 +2951,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let mut conn = db.lock().unwrap();
                                 AppState::get_profile(&mut conn, &uname)
                             })
-                                .await
-                                .unwrap();
+                            .await
+                            .unwrap();
                             match result {
                                 Ok((username, phone, first_name, last_name, display_name)) => {
-                                    format!("[Система] Профиль: username={}, phone={}, name={} {}, display_name={}",
-                                            username, phone, first_name, last_name, display_name)
+                                    format!(
+                                        "[Система] Профиль: username={}, phone={}, name={} {}, display_name={}",
+                                        username, phone, first_name, last_name, display_name
+                                    )
                                 }
                                 Err(e) => format!("[Система] Ошибка: {}", e),
                             }
@@ -2509,7 +2968,11 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 "[Система] Использование: /setname <имя> [фамилия]".to_string()
                             } else {
                                 let first_name = args[0];
-                                let last_name = if args.len() > 1 { args[1..].join(" ") } else { "".to_string() };
+                                let last_name = if args.len() > 1 {
+                                    args[1..].join(" ")
+                                } else {
+                                    "".to_string()
+                                };
                                 let db = state.lock().await.db.clone();
                                 let uname = my_username.clone();
                                 let fn_ = first_name.to_string();
@@ -2518,17 +2981,21 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::set_name(&mut conn, &uname, &fn_, &ln_)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
-                                    Ok(_) => format!("[Система] Имя обновлено: {} {}", first_name, last_name),
+                                    Ok(_) => format!(
+                                        "[Система] Имя обновлено: {} {}",
+                                        first_name, last_name
+                                    ),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
                                 }
                             }
                         }
                         "/setdisplayname" => {
                             if args.is_empty() {
-                                "[Система] Использование: /setdisplayname <отображаемое имя>".to_string()
+                                "[Система] Использование: /setdisplayname <отображаемое имя>"
+                                    .to_string()
                             } else {
                                 let display_name = args.join(" ");
                                 let db = state.lock().await.db.clone();
@@ -2538,10 +3005,13 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::set_display_name(&mut conn, &uname, &dn)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
-                                    Ok(_) => format!("[Система] Отображаемое имя обновлено: {}", display_name),
+                                    Ok(_) => format!(
+                                        "[Система] Отображаемое имя обновлено: {}",
+                                        display_name
+                                    ),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
                                 }
                             }
@@ -2558,8 +3028,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::set_username(&mut conn, &uname, &nu)
                                 })
-                                    .await
-                                    .unwrap();
+                                .await
+                                .unwrap();
                                 match result {
                                     Ok(_) => {
                                         // Обновляем username в сессии
@@ -2574,7 +3044,6 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         _ => format!("[Система] Неизвестная команда: {}", cmd),
                     };
                     let _ = send_system_message(&tx, &response).await;
-
                 }
 
                 _ => {
@@ -2614,12 +3083,19 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         broadcast_system_message(&state, &msg, Some(&username)).await;
     }
 
-    info!("Клиент {} отключён, время сессии: {:?}", my_username, start_time.elapsed());
+    info!(
+        "Клиент {} отключён, время сессии: {:?}",
+        my_username,
+        start_time.elapsed()
+    );
     let _ = send_task.await;
 }
 
 // ==================== Функция запуска сервера ====================
-async fn run_server(listener: TcpListener, state: Arc<Mutex<AppState>>) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server(
+    listener: TcpListener,
+    state: Arc<Mutex<AppState>>,
+) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
         let state_clone = state.clone();
