@@ -1256,7 +1256,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
     }
 
     let auth_str = String::from_utf8(auth_data[5..].to_vec()).unwrap_or_default();
-    debug!("Auth string: {}", auth_str);
+    info!("Auth string: {}", auth_str);
     let parts: Vec<&str> = auth_str.split('|').collect();
     if parts.len() < 3 {
         error!("Неверный формат аутентификации");
