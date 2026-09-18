@@ -1256,7 +1256,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
     }
 
     let auth_str = String::from_utf8(auth_data[5..].to_vec()).unwrap_or_default();
-    info!("Auth string: {}", auth_str);
+    debug!("Auth string: {}", auth_str);
     let parts: Vec<&str> = auth_str.split('|').collect();
     if parts.len() < 3 {
         error!("Неверный формат аутентификации");
@@ -1301,7 +1301,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
             match result {
                 Ok((user_id, username)) => {
-                    info!(
+                    debug!(
                         "Восстановлена сессия: user_id={}, username={}",
                         user_id, username
                     );
@@ -1371,7 +1371,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
             match result {
                 Ok(user_id) => {
-                    info!("Аутентификация успешна для user_id={}", user_id);
+                    debug!("Аутентификация успешна для user_id={}", user_id);
                     // Получаем username
                     let db3 = state.lock().await.db.clone();
                     let uid = user_id.clone();
@@ -1408,7 +1408,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     match token_result {
                         Ok(token) => {
-                            info!("Сессия создана, токен: {}", token);
+                            debug!("Сессия создана, токен: {}", token);
                             let msg = format!("Успех|{}|{}|{}", user_id, token, username);
                             let _ = send_system_message(&tx, &msg).await;
 
@@ -1511,7 +1511,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
             match result {
                 Ok(user_id) => {
-                    info!("Регистрация успешна для user_id={}", user_id);
+                    debug!("Регистрация успешна для user_id={}", user_id);
                     let db2 = state.lock().await.db.clone();
                     let uid = user_id.clone();
                     let dev = device_name.clone();
@@ -1524,7 +1524,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     match token_result {
                         Ok(token) => {
-                            info!("Сессия создана, токен: {}", token);
+                            debug!("Сессия создана, токен: {}", token);
                             let msg = format!("Успех|{}|{}|{}", user_id, token, username);
                             let _ = send_system_message(&tx, &msg).await;
 
@@ -1799,12 +1799,12 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     // Читаем nonce (12 байт)
                     let nonce = &rest[offset..offset + 12];
-                    info!("nonce (hex) = {}", hex::encode(nonce));
+                    debug!("nonce (hex) = {}", hex::encode(nonce));
                     offset += 12;
 
                     let msg_len =
                         u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
-                    info!("encrypted len = {}", msg_len - 12);
+                    debug!("encrypted len = {}", msg_len - 12);
                     offset += 4;
                     debug!("{}", rest.len() - offset);
                     debug!(
@@ -1813,7 +1813,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         hex::encode(&rest[offset..offset + 4])
                     );
                     let encrypted = &rest[offset..offset + msg_len];
-                    info!("encrypted (hex) = {}", hex::encode(encrypted));
+                    debug!("encrypted (hex) = {}", hex::encode(encrypted));
                     offset += msg_len;
 
                     // timestamp
@@ -1828,7 +1828,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     // Расшифровка
                     let key = &keys.key;
-                    info!("Ключ для расшифровки (hex) = {}", hex::encode(key));
+                    debug!("Ключ для расшифровки (hex) = {}", hex::encode(key));
 
                     use aes_gcm::aead::{Aead, KeyInit};
                     let cipher =
@@ -1847,7 +1847,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         }
                     };
                     let content = String::from_utf8_lossy(&plaintext).to_string();
-                    info!("Сообщение от {} для {}: {}", sender, recipient, content);
+                    debug!("Сообщение от {} для {}: {}", sender, recipient, content);
 
                     // ---- Обработка команд ----
                     if content.starts_with('/') {
