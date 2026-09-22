@@ -2099,20 +2099,15 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let result = tokio::task::spawn_blocking(move || {
                                     let conn = db.lock().unwrap();
                                     let mut stmt = conn
-                                        .prepare("SELECT username, first_name, last_name FROM users ORDER BY username")
+                                        .prepare("SELECT phone, username, display_name FROM users ORDER BY username")
                                         .map_err(|e| e.to_string())?;
                                     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
                                     let mut users = Vec::new();
                                     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                                        let username: String = row.get(0).map_err(|e| e.to_string())?;
-                                        let first_name: Option<String> = row.get(1).ok();
-                                        let last_name: Option<String> = row.get(2).ok();
-                                        let display_name = match (first_name, last_name) {
-                                            (Some(f), Some(l)) => format!("{} {}", f, l),
-                                            (Some(f), None) => f,
-                                            _ => username.clone(),
-                                        };
-                                        users.push(format!("{}|{}", username, display_name));
+                                        let phone: String = row.get(0).map_err(|e| e.to_string())?;
+                                        let username: String = row.get(1).map_err(|e| e.to_string())?;
+                                        let display_name: String = row.get(2).unwrap_or_default();
+                                        users.push(format!("{}|{}|{}", phone, username, display_name));
                                     }
                                     Ok::<_, String>(users)
                                 })
@@ -2121,8 +2116,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 match result {
                                     Ok(users) => {
                                         if users.is_empty() {
-                                            "[Система] Нет зарегистрированных пользователей"
-                                                .to_string()
+                                            "[Система] Нет зарегистрированных пользователей".to_string()
                                         } else {
                                             format!("[Система] Пользователи: {}", users.join(", "))
                                         }
@@ -2957,20 +2951,15 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let result = tokio::task::spawn_blocking(move || {
                                 let conn = db.lock().unwrap();
                                 let mut stmt = conn
-                                    .prepare("SELECT username, first_name, last_name FROM users ORDER BY username")
+                                    .prepare("SELECT phone, username, display_name FROM users ORDER BY username")
                                     .map_err(|e| e.to_string())?;
                                 let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
                                 let mut users = Vec::new();
                                 while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                                    let username: String = row.get(0).map_err(|e| e.to_string())?;
-                                    let first_name: Option<String> = row.get(1).ok();
-                                    let last_name: Option<String> = row.get(2).ok();
-                                    let display_name = match (first_name, last_name) {
-                                        (Some(f), Some(l)) => format!("{} {}", f, l),
-                                        (Some(f), None) => f,
-                                        _ => username.clone(),
-                                    };
-                                    users.push(format!("{}|{}", username, display_name));
+                                    let phone: String = row.get(0).map_err(|e| e.to_string())?;
+                                    let username: String = row.get(1).map_err(|e| e.to_string())?;
+                                    let display_name: String = row.get(2).unwrap_or_default();
+                                    users.push(format!("{}|{}|{}", phone, username, display_name));
                                 }
                                 Ok::<_, String>(users)
                             })
