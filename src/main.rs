@@ -222,103 +222,29 @@ impl AppState {
 
     // ---- Миграция (добавление sent_at и создание fcm_tokens) ----
     fn migrate_db(conn: &mut Connection) -> Result<(), String> {
-        // ---- Проверяем messages ----
-        let mut stmt = conn
-            .prepare("PRAGMA table_info(messages)")
-            .map_err(|e| e.to_string())?;
-        let mut has_sent_at = false;
-        let rows = stmt
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| e.to_string())?;
-        for name in rows {
-            if name.map_err(|e| e.to_string())? == "sent_at" {
-                has_sent_at = true;
-                break;
-            }
-        }
-        if !has_sent_at {
-            conn.execute(
-                "ALTER TABLE messages ADD COLUMN sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-            info!("Добавлен столбец sent_at в таблицу messages");
-        }
-
-        // ---- Проверяем group_messages ----
-        let mut stmt2 = conn
-            .prepare("PRAGMA table_info(group_messages)")
-            .map_err(|e| e.to_string())?;
-        let mut has_sent_at2 = false;
-        let rows2 = stmt2
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| e.to_string())?;
-        for name in rows2 {
-            if name.map_err(|e| e.to_string())? == "sent_at" {
-                has_sent_at2 = true;
-                break;
-            }
-        }
-        if !has_sent_at2 {
-            conn.execute(
-                "ALTER TABLE group_messages ADD COLUMN sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-            info!("Добавлен столбец sent_at в таблицу group_messages");
-        }
-
-        // ---- Проверяем channel_messages ----
-        let mut stmt3 = conn
-            .prepare("PRAGMA table_info(channel_messages)")
-            .map_err(|e| e.to_string())?;
-        let mut has_sent_at3 = false;
-        let rows3 = stmt3
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| e.to_string())?;
-        for name in rows3 {
-            if name.map_err(|e| e.to_string())? == "sent_at" {
-                has_sent_at3 = true;
-                break;
-            }
-        }
-        if !has_sent_at3 {
-            conn.execute(
-                "ALTER TABLE channel_messages ADD COLUMN sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
-                [],
-            )
+        // ---- Проверяем users.last_seen ----
+        {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(users)")
                 .map_err(|e| e.to_string())?;
-            info!("Добавлен столбец sent_at в таблицу channel_messages");
-        }
-
-        // ---- Проверяем fcm_tokens (таблица) ----
-        let mut stmt4 = conn
-            .prepare("PRAGMA table_info(fcm_tokens)")
-            .map_err(|e| e.to_string())?;
-        let mut has_fcm = false;
-        let rows4 = stmt4
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|e| e.to_string())?;
-        for name in rows4 {
-            if name.map_err(|e| e.to_string())? == "token" {
-                has_fcm = true;
-                break;
+            let mut has_last_seen = false;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            for name in rows {
+                if name.map_err(|e| e.to_string())? == "last_seen" {
+                    has_last_seen = true;
+                    break;
+                }
             }
-        }
-        if !has_fcm {
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS fcm_tokens (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                token TEXT NOT NULL,
-                device_name TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(user_id, token)
-            )",
-                [],
-            )
-            .map_err(|e| e.to_string())?;
-            info!("Создана таблица fcm_tokens");
+            if !has_last_seen {
+                conn.execute(
+                    "ALTER TABLE users ADD COLUMN last_seen INTEGER DEFAULT 0",
+                    [],
+                )
+                    .map_err(|e| e.to_string())?;
+                info!("Добавлен столбец last_seen в таблицу users");
+            }
         }
 
         // ---- Индексы (добавляем для производительности) ----
@@ -401,6 +327,14 @@ impl AppState {
                 sender_username TEXT NOT NULL,
                 content TEXT NOT NULL,
                 sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS fcm_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            token TEXT NOT NULL,
+            device_name TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, token)
             );
             CREATE TABLE IF NOT EXISTS channels (
                 id TEXT PRIMARY KEY,
@@ -1054,6 +988,18 @@ impl AppState {
         .map_err(|e| format!("Ошибка обновления username: {}", e))?;
         Ok(())
     }
+    fn update_last_seen(conn: &mut Connection, username: &str) -> Result<(), String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_millis() as i64;
+        conn.execute(
+            "UPDATE users SET last_seen = ? WHERE username = ?",
+            params![now, username],
+        )
+            .map_err(|e| format!("Ошибка обновления last_seen: {}", e))?;
+        Ok(())
+    }
 }
 
 // ==================== Handshake ====================
@@ -1175,6 +1121,7 @@ async fn broadcast_system_message(
 }
 
 // ==================== Обработчик клиента ====================
+// ==================== Обработчик клиента ====================
 async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
     let start_time = Instant::now();
     info!("Принято TCP-соединение от {:?}", stream.peer_addr().ok());
@@ -1290,8 +1237,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                 let mut conn = db.lock().unwrap();
                 AppState::check_session(&mut conn, &token_str)
             })
-            .await
-            .unwrap();
+                .await
+                .unwrap();
 
             match result {
                 Ok((user_id, username)) => {
@@ -1312,8 +1259,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let mut conn = db.lock().unwrap();
                             let _ = AppState::save_fcm_token(&mut conn, &uid, &fcm_tok, &dev);
                         })
-                        .await
-                        .unwrap();
+                            .await
+                            .unwrap();
                     }
 
                     // Обновляем сессию
@@ -1335,6 +1282,19 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             .or_insert_with(Vec::new)
                             .push(token.to_string());
                     }
+
+                    // Обновляем last_seen при подключении
+                    {
+                        let db_ls = state.lock().await.db.clone();
+                        let uname_ls = username.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let mut conn = db_ls.lock().unwrap();
+                            let _ = AppState::update_last_seen(&mut conn, &uname_ls);
+                        })
+                            .await
+                            .unwrap();
+                    }
+
                     let msg = format!("[Система] Пользователь {} подключился", username);
                     broadcast_system_message(&state, &msg, Some(&username)).await;
                     Ok((user_id, username))
@@ -1360,8 +1320,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                 let mut conn = db.lock().unwrap();
                 AppState::login_user_by_phone(&mut conn, &ph, &pwd)
             })
-            .await
-            .unwrap();
+                .await
+                .unwrap();
 
             match result {
                 Ok(user_id) => {
@@ -1382,8 +1342,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             Err("Пользователь не найден".to_string())
                         }
                     })
-                    .await
-                    .unwrap();
+                        .await
+                        .unwrap();
                     let username = match username_from_db {
                         Ok(uname) => uname,
                         Err(_) => phone.clone(),
@@ -1397,8 +1357,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let mut conn = db2.lock().unwrap();
                         AppState::create_session(&mut conn, &uid2, &dev)
                     })
-                    .await
-                    .unwrap();
+                        .await
+                        .unwrap();
 
                     match token_result {
                         Ok(token) => {
@@ -1417,8 +1377,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let _ =
                                         AppState::save_fcm_token(&mut conn, &uid, &fcm_tok, &dev);
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                             }
 
                             {
@@ -1437,6 +1397,19 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     .or_insert_with(Vec::new)
                                     .push(token.clone());
                             }
+
+                            // Обновляем last_seen при подключении
+                            {
+                                let db_ls = state.lock().await.db.clone();
+                                let uname_ls = username.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let mut conn = db_ls.lock().unwrap();
+                                    let _ = AppState::update_last_seen(&mut conn, &uname_ls);
+                                })
+                                    .await
+                                    .unwrap();
+                            }
+
                             let msg = format!("[Система] Пользователь {} подключился", username);
                             broadcast_system_message(&state, &msg, Some(&username)).await;
                             Ok((user_id, username))
@@ -1447,7 +1420,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 &tx,
                                 &format!("[Система] Ошибка создания сессии: {}", e),
                             )
-                            .await;
+                                .await;
                             Err(())
                         }
                     }
@@ -1500,8 +1473,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     ln_opt.as_deref(),
                 )
             })
-            .await
-            .unwrap();
+                .await
+                .unwrap();
 
             match result {
                 Ok(user_id) => {
@@ -1513,8 +1486,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let mut conn = db2.lock().unwrap();
                         AppState::create_session(&mut conn, &uid, &dev)
                     })
-                    .await
-                    .unwrap();
+                        .await
+                        .unwrap();
 
                     match token_result {
                         Ok(token) => {
@@ -1532,8 +1505,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let _ =
                                         AppState::save_fcm_token(&mut conn, &uid, &fcm_tok, &dev);
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                             }
 
                             {
@@ -1552,6 +1525,19 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     .or_insert_with(Vec::new)
                                     .push(token.clone());
                             }
+
+                            // Обновляем last_seen при подключении
+                            {
+                                let db_ls = state.lock().await.db.clone();
+                                let uname_ls = username.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let mut conn = db_ls.lock().unwrap();
+                                    let _ = AppState::update_last_seen(&mut conn, &uname_ls);
+                                })
+                                    .await
+                                    .unwrap();
+                            }
+
                             let msg = format!("[Система] Пользователь {} подключился", username);
                             broadcast_system_message(&state, &msg, Some(&username)).await;
                             Ok((user_id, username))
@@ -1562,7 +1548,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 &tx,
                                 &format!("[Система] Ошибка создания сессии: {}", e),
                             )
-                            .await;
+                                .await;
                             Err(())
                         }
                     }
@@ -1580,7 +1566,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                 &tx,
                 &format!("[Система] Ошибка: Неизвестная команда {}", command),
             )
-            .await;
+                .await;
             Err(())
         }
     };
@@ -1604,8 +1590,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             let mut conn = db.lock().unwrap();
             AppState::get_user_messages(&mut conn, &uname, HISTORY_LIMIT, 0)
         })
-        .await
-        .unwrap();
+            .await
+            .unwrap();
 
         if let Ok(msgs) = history {
             let tx = {
@@ -1626,7 +1612,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     content.as_bytes(),
                     timestamp,
                 )
-                .await;
+                    .await;
             }
         }
 
@@ -1678,7 +1664,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     content.as_bytes(),
                     timestamp,
                 )
-                .await;
+                    .await;
             }
         }
 
@@ -1730,7 +1716,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     content.as_bytes(),
                     timestamp,
                 )
-                .await;
+                    .await;
             }
         }
     }
@@ -1765,7 +1751,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         &guard.tx,
                         "[Система] Слишком много сообщений, подождите",
                     )
-                    .await;
+                        .await;
                     continue;
                 }
             }
@@ -1864,8 +1850,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::create_group(&mut conn, &gname, &uname)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(_) => format!("[Система] Группа {} создана", group_name),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
@@ -1884,8 +1870,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::join_group(&mut conn, &gname, &uname)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(_) => format!(
                                             "[Система] Вы присоединились к группе {}",
@@ -1907,8 +1893,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::leave_group(&mut conn, &gname, &uname)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(_) => {
                                             format!("[Система] Вы покинули группу {}", group_name)
@@ -1928,8 +1914,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::get_group_members(&mut conn, &gname)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(members) => {
                                             if members.is_empty() {
@@ -1996,8 +1982,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::create_channel(&mut conn, &ch, &uname)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(_) => format!("[Система] Канал {} создан", channel_name),
                                         Err(e) => format!("[Система] Ошибка: {}", e),
@@ -2016,8 +2002,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::subscribe_channel(&mut conn, &ch, &uname)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(_) => format!(
                                             "[Система] Вы подписались на канал {}",
@@ -2039,8 +2025,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::unsubscribe_channel(&mut conn, &ch, &uname)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(_) => format!(
                                             "[Система] Вы отписались от канала {}",
@@ -2058,27 +2044,25 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut stmt = conn
                                         .prepare(
                                             "SELECT c.name, c.creator_username,
-                                            (SELECT 1 FROM channel_subscribers cs
-                                             WHERE cs.channel_id = c.id AND cs.username = ?) AS subscribed
+                                                    (SELECT 1 FROM channel_subscribers cs
+                                                     WHERE cs.channel_id = c.id AND cs.username = ?) AS subscribed
                                              FROM channels c
-                                             ORDER BY c.name",
+                                             ORDER BY c.name"
                                         )
                                         .map_err(|e| e.to_string())?;
-                                    let mut rows =
-                                        stmt.query([&uname]).map_err(|e| e.to_string())?;
+                                    let mut rows = stmt.query([&uname]).map_err(|e| e.to_string())?;
                                     let mut channels = Vec::new();
                                     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
                                         let name: String = row.get(0).map_err(|e| e.to_string())?;
-                                        let creator: String =
-                                            row.get(1).map_err(|e| e.to_string())?;
+                                        let creator: String = row.get(1).map_err(|e| e.to_string())?;
                                         let subscribed: Option<i64> = row.get(2).ok();
                                         let sub_flag = if subscribed.is_some() { "1" } else { "0" };
                                         channels.push(format!("{}|{}|{}", name, creator, sub_flag));
                                     }
                                     Ok::<_, String>(channels)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(channels) => {
                                         if channels.is_empty() {
@@ -2099,7 +2083,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let result = tokio::task::spawn_blocking(move || {
                                     let conn = db.lock().unwrap();
                                     let mut stmt = conn
-                                        .prepare("SELECT phone, username, display_name FROM users ORDER BY username")
+                                        .prepare("SELECT phone, username, display_name, last_seen FROM users ORDER BY username")
                                         .map_err(|e| e.to_string())?;
                                     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
                                     let mut users = Vec::new();
@@ -2107,7 +2091,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let phone: String = row.get(0).map_err(|e| e.to_string())?;
                                         let username: String = row.get(1).map_err(|e| e.to_string())?;
                                         let display_name: String = row.get(2).unwrap_or_default();
-                                        users.push(format!("{}|{}|{}", phone, username, display_name));
+                                        let last_seen: i64 = row.get(3).unwrap_or(0);
+                                        users.push(format!("{}|{}|{}|{}", phone, username, display_name, last_seen));
                                     }
                                     Ok::<_, String>(users)
                                 })
@@ -2147,8 +2132,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::get_profile(&mut conn, &uname)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok((username, phone, first_name, last_name, display_name)) => {
                                         format!(
@@ -2177,8 +2162,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::set_name(&mut conn, &uname, &fn_, &ln_)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(_) => format!(
                                             "[Система] Имя обновлено: {} {}",
@@ -2201,8 +2186,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::set_display_name(&mut conn, &uname, &dn)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(_) => format!(
                                             "[Система] Отображаемое имя обновлено: {}",
@@ -2225,8 +2210,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let mut conn = db.lock().unwrap();
                                         AppState::set_username(&mut conn, &uname, &nu)
                                     })
-                                    .await
-                                    .unwrap();
+                                        .await
+                                        .unwrap();
                                     match result {
                                         Ok(_) => {
                                             // Обновляем username в сессии
@@ -2256,16 +2241,16 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let mut conn = db.lock().unwrap();
                             AppState::user_exists_by_username(&mut conn, &target_clone)
                         })
-                        .await
-                        .unwrap()
-                        .unwrap_or(false);
+                            .await
+                            .unwrap()
+                            .unwrap_or(false);
 
                         if !exists {
                             let _ = send_system_message(
                                 &tx,
                                 &format!("[Система] Пользователь {} не найден", recipient),
                             )
-                            .await;
+                                .await;
                             continue;
                         }
 
@@ -2285,8 +2270,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 ts,
                             );
                         })
-                        .await
-                        .unwrap();
+                            .await
+                            .unwrap();
 
                         // Отправка эха себе
                         let _ = send_encrypted_message(
@@ -2297,8 +2282,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             &plaintext,
                             timestamp,
                         )
-                        .await;
+                            .await;
                         if recipient != my_username {
+
                             // Отправка получателю, если онлайн
                             let _target_online = {
                                 let state_guard = state.lock().await;
@@ -2331,9 +2317,10 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         &plaintext,
                                         timestamp,
                                     )
-                                    .await;
+                                        .await;
                                 }
                             }
+
 
                             // Отправляем FCM push
                             let db = state.lock().await.db.clone();
@@ -2342,9 +2329,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let mut conn = db.lock().unwrap();
                                 AppState::get_fcm_tokens_for_user(&mut conn, &target_user)
                             })
-                            .await
-                            .unwrap()
-                            .unwrap_or_default();
+                                .await
+                                .unwrap()
+                                .unwrap_or_default();
 
                             let db_fcm = state.lock().await.db.clone();
                             for fcm_tok in fcm_tokens {
@@ -2363,7 +2350,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         &body,
                                         Some(data_payload),
                                     )
-                                    .await;
+                                        .await;
                                 });
                             }
                         }
@@ -2413,8 +2400,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 ts,
                             );
                         })
-                        .await
-                        .unwrap();
+                            .await
+                            .unwrap();
 
                         // Получаем участников
                         let db = state.lock().await.db.clone();
@@ -2423,9 +2410,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let mut conn = db.lock().unwrap();
                             AppState::get_group_members(&mut conn, &gname)
                         })
-                        .await
-                        .unwrap()
-                        .unwrap_or_default();
+                            .await
+                            .unwrap()
+                            .unwrap_or_default();
 
                         // Отправляем эхо себе
                         let recip_with_hash = format!("#{}", group_name);
@@ -2437,7 +2424,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             &plaintext,
                             timestamp,
                         )
-                        .await;
+                            .await;
 
                         // Отправка всем участникам (кроме себя)
                         for member in members {
@@ -2475,7 +2462,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &plaintext,
                                             timestamp,
                                         )
-                                        .await;
+                                            .await;
                                     }
                                 }
                             } else {
@@ -2486,9 +2473,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::get_fcm_tokens_for_user(&mut conn, &target_user)
                                 })
-                                .await
-                                .unwrap()
-                                .unwrap_or_default();
+                                    .await
+                                    .unwrap()
+                                    .unwrap_or_default();
 
                                 let db_fcm = state.lock().await.db.clone();
                                 for fcm_tok in fcm_tokens {
@@ -2512,7 +2499,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &body,
                                             Some(data_payload),
                                         )
-                                        .await;
+                                            .await;
                                     });
                                 }
                             }
@@ -2569,7 +2556,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 &tx,
                                 "[Система] Только владелец канала может отправлять сообщения",
                             )
-                            .await;
+                                .await;
                             continue;
                         }
 
@@ -2585,8 +2572,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 &mut conn, &ch_name, &sender, &cnt, ts,
                             );
                         })
-                        .await
-                        .unwrap();
+                            .await
+                            .unwrap();
 
                         // Получаем подписчиков
                         let db = state.lock().await.db.clone();
@@ -2595,9 +2582,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let mut conn = db.lock().unwrap();
                             AppState::get_channel_subscribers(&mut conn, &ch_name2)
                         })
-                        .await
-                        .unwrap()
-                        .unwrap_or_default();
+                            .await
+                            .unwrap()
+                            .unwrap_or_default();
 
                         let recip_with_amp = format!("&{}", channel_name);
                         let _ = send_encrypted_message(
@@ -2608,7 +2595,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             &plaintext,
                             timestamp,
                         )
-                        .await;
+                            .await;
 
                         for subscriber in subscribers {
                             if subscriber == my_username {
@@ -2645,7 +2632,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &plaintext,
                                             timestamp,
                                         )
-                                        .await;
+                                            .await;
                                     }
                                 }
                             } else {
@@ -2656,9 +2643,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::get_fcm_tokens_for_user(&mut conn, &target_user)
                                 })
-                                .await
-                                .unwrap()
-                                .unwrap_or_default();
+                                    .await
+                                    .unwrap()
+                                    .unwrap_or_default();
 
                                 let db_fcm = state.lock().await.db.clone();
                                 for fcm_tok in fcm_tokens {
@@ -2683,7 +2670,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &body,
                                             Some(data_payload),
                                         )
-                                        .await;
+                                            .await;
                                     });
                                 }
                             }
@@ -2720,8 +2707,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::create_group(&mut conn, &gname, &uname)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(_) => format!("[Система] Группа {} создана", group_name),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -2740,8 +2727,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::join_group(&mut conn, &gname, &uname)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(_) => format!(
                                         "[Система] Вы присоединились к группе {}",
@@ -2763,8 +2750,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::leave_group(&mut conn, &gname, &uname)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(_) => format!("[Система] Вы покинули группу {}", group_name),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -2782,8 +2769,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::get_group_members(&mut conn, &gname)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(members) => {
                                         if members.is_empty() {
@@ -2808,9 +2795,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let result = tokio::task::spawn_blocking(move || {
                                 let conn = db.lock().unwrap();
                                 let mut stmt = conn
-                                    .prepare(
-                                        "SELECT name, creator_username FROM groups ORDER BY name",
-                                    )
+                                    .prepare("SELECT name, creator_username FROM groups ORDER BY name")
                                     .map_err(|e| e.to_string())?;
                                 let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
                                 let mut groups = Vec::new();
@@ -2821,8 +2806,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 }
                                 Ok::<_, String>(groups)
                             })
-                            .await
-                            .unwrap();
+                                .await
+                                .unwrap();
                             match result {
                                 Ok(groups) => {
                                     if groups.is_empty() {
@@ -2850,8 +2835,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::create_channel(&mut conn, &ch, &uname)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(_) => format!("[Система] Канал {} создан", channel_name),
                                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -2870,8 +2855,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::subscribe_channel(&mut conn, &ch, &uname)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(_) => format!(
                                         "[Система] Вы подписались на канал {}",
@@ -2893,8 +2878,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::unsubscribe_channel(&mut conn, &ch, &uname)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(_) => format!(
                                         "[Система] Вы отписались от канала {}",
@@ -2912,10 +2897,10 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let mut stmt = conn
                                     .prepare(
                                         "SELECT c.name, c.creator_username,
-                        (SELECT 1 FROM channel_subscribers cs
-                         WHERE cs.channel_id = c.id AND cs.username = ?) AS subscribed
-                 FROM channels c
-                 ORDER BY c.name"
+                                                (SELECT 1 FROM channel_subscribers cs
+                                                 WHERE cs.channel_id = c.id AND cs.username = ?) AS subscribed
+                                         FROM channels c
+                                         ORDER BY c.name"
                                     )
                                     .map_err(|e| e.to_string())?;
                                 let mut rows = stmt.query([&uname]).map_err(|e| e.to_string())?;
@@ -2951,7 +2936,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let result = tokio::task::spawn_blocking(move || {
                                 let conn = db.lock().unwrap();
                                 let mut stmt = conn
-                                    .prepare("SELECT phone, username, display_name FROM users ORDER BY username")
+                                    .prepare("SELECT phone, username, display_name, last_seen FROM users ORDER BY username")
                                     .map_err(|e| e.to_string())?;
                                 let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
                                 let mut users = Vec::new();
@@ -2959,7 +2944,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let phone: String = row.get(0).map_err(|e| e.to_string())?;
                                     let username: String = row.get(1).map_err(|e| e.to_string())?;
                                     let display_name: String = row.get(2).unwrap_or_default();
-                                    users.push(format!("{}|{}|{}", phone, username, display_name));
+                                    let last_seen: i64 = row.get(3).unwrap_or(0);
+                                    users.push(format!("{}|{}|{}|{}", phone, username, display_name, last_seen));
                                 }
                                 Ok::<_, String>(users)
                             })
@@ -2999,8 +2985,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 let mut conn = db.lock().unwrap();
                                 AppState::get_profile(&mut conn, &uname)
                             })
-                            .await
-                            .unwrap();
+                                .await
+                                .unwrap();
                             match result {
                                 Ok((username, phone, first_name, last_name, display_name)) => {
                                     format!(
@@ -3029,8 +3015,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::set_name(&mut conn, &uname, &fn_, &ln_)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(_) => format!(
                                         "[Система] Имя обновлено: {} {}",
@@ -3053,8 +3039,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::set_display_name(&mut conn, &uname, &dn)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(_) => format!(
                                         "[Система] Отображаемое имя обновлено: {}",
@@ -3076,8 +3062,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let mut conn = db.lock().unwrap();
                                     AppState::set_username(&mut conn, &uname, &nu)
                                 })
-                                .await
-                                .unwrap();
+                                    .await
+                                    .unwrap();
                                 match result {
                                     Ok(_) => {
                                         // Обновляем username в сессии
@@ -3128,6 +3114,19 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         }
         let msg = format!("[Система] Пользователь {} отключился", username);
         drop(state_guard);
+
+        // Обновляем last_seen при отключении
+        if !username.is_empty() {
+            let db_ls = state.lock().await.db.clone();
+            let uname_ls = username.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut conn = db_ls.lock().unwrap();
+                let _ = AppState::update_last_seen(&mut conn, &uname_ls);
+            })
+                .await
+                .unwrap();
+        }
+
         broadcast_system_message(&state, &msg, Some(&username)).await;
     }
 
@@ -3165,6 +3164,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_path = "data.db";
     let db = Connection::open(db_path)?;
+    db.execute("PRAGMA foreign_keys = ON", [])?;
+
+    // Проверка (можно временно, чтобы убедиться):
+    let fk_enabled: i32 = db.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+    if fk_enabled != 1 {
+        eprintln!("ВНИМАНИЕ: foreign_keys не включены!");
+    }
     let mut db = db;
     AppState::init_db(&mut db)?;
     let state = Arc::new(Mutex::new(AppState::new(db)));
