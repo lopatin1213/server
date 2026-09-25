@@ -35,6 +35,9 @@ const RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(1);
 const RATE_LIMIT_MAX: usize = 10; // сообщений в секунду
 const HISTORY_LIMIT: i64 = 1000; // пагинация
 
+const PING_INTERVAL: StdDuration = StdDuration::from_secs(30);
+const PONG_TIMEOUT: StdDuration = StdDuration::from_secs(90);
+
 // ==================== FCM ====================
 
 #[derive(Debug)]
@@ -1121,7 +1124,7 @@ async fn broadcast_system_message(
 }
 
 // ==================== Обработчик клиента ====================
-// ==================== Обработчик клиента ====================
+
 async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
     let start_time = Instant::now();
     info!("Принято TCP-соединение от {:?}", stream.peer_addr().ok());
@@ -1168,6 +1171,19 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             }
         }
         info!("Задача отправки завершена");
+    });
+    // Периодически шлём Ping: держим соединение «живым» в NAT/прокси
+    // и detect'им мёртвых клиентов по отсутствию Pong.
+    let tx_ping = tx.clone();
+    let ping_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(PING_INTERVAL);
+        interval.tick().await; // первый tick срабатывает сразу, пропускаем
+        loop {
+            interval.tick().await;
+            if tx_ping.send(Message::Ping(Vec::new().into())).is_err() {
+                break;
+            }
+        }
     });
 
     // ---- Аутентификация ----
@@ -1729,13 +1745,17 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             break;
         }
 
-        let msg = match stream.next().await {
-            Some(Ok(msg)) => msg,
-            Some(Err(e)) => {
+        let msg = match tokio::time::timeout(PONG_TIMEOUT, stream.next()).await {
+            Ok(Some(Ok(msg))) => msg,
+            Ok(Some(Err(e))) => {
                 error!("Ошибка чтения: {}", e);
                 break;
             }
-            None => break,
+            Ok(None) => break,
+            Err(_) => {
+                error!("Таймаут: нет активности от клиента, отключаем");
+                break;
+            }
         };
 
         if let Message::Binary(data) = msg {
@@ -3084,8 +3104,17 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     warn!("Неизвестный тип сообщения: {}", msg_type);
                 }
             }
-        } else {
-            // Небинарное сообщение – игнорируем
+        }
+        else if let Message::Pong(_) = msg {
+        // Соединение живо, ничего не делаем.
+        // Главное — мы получили Pong, поэтому таймаут на stream.next() обновился.
+    } else if let Message::Ping(_) = msg {
+        // tungstenite автоматически отвечает Pong — ничего не делаем.
+    } else if let Message::Close(_) = msg {
+        info!("Клиент прислал Close");
+        break;
+    } else{
+    // Небинарное сообщение – игнорируем
             warn!("Получено небинарное сообщение, игнорируем");
         }
     }
@@ -3135,6 +3164,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         my_username,
         start_time.elapsed()
     );
+    ping_task.abort();
     let _ = send_task.await;
 }
 // ==================== Функция запуска сервера ====================
