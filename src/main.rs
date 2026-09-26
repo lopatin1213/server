@@ -1,5 +1,5 @@
 // ============================================================
-//  main.rs — Relay Server with E2EE, multi-device, FCM pushes
+//  main.rs — Relay Server, multi-device, FCM pushes
 // ============================================================
 use aes_gcm::{
     Aes256Gcm, Key,
