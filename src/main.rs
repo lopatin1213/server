@@ -42,8 +42,8 @@ const MSG_DELETE_FOR_ME: u8 = 1;
 const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(1);
 const RATE_LIMIT_MAX: usize = 10;
-const HISTORY_PAGE_SIZE: i64 = 1000; // сколько отдаём на /history
-const LOGIN_PER_CHAT: i64 = 5; // сколько шлём на логине на каждый чат
+const HISTORY_PAGE_SIZE: i64 = 1000;
+const LOGIN_PER_CHAT: i64 = 5;
 
 const PING_INTERVAL: StdDuration = StdDuration::from_secs(30);
 const PONG_TIMEOUT: StdDuration = StdDuration::from_secs(90);
@@ -651,6 +651,36 @@ impl AppState {
         result
     }
 
+    // ---- Миграция: reply_to_id в трёх таблицах сообщений ----
+    fn migrate_reply_to_id(conn: &mut Connection) -> Result<(), String> {
+        let has_reply_col = |conn: &Connection, table: &str| -> Result<bool, String> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({})", table))
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            for name in rows {
+                if name.map_err(|e| e.to_string())? == "reply_to_id" {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+
+        for table in ["messages", "group_messages", "channel_messages"] {
+            if !has_reply_col(conn, table)? {
+                conn.execute(
+                    &format!("ALTER TABLE {} ADD COLUMN reply_to_id INTEGER", table),
+                    [],
+                )
+                .map_err(|e| format!("{}: {}", table, e))?;
+                info!("Добавлен столбец reply_to_id в {}", table);
+            }
+        }
+        Ok(())
+    }
+
     fn init_db(conn: &mut Connection) -> Result<(), String> {
         let sql = r#"
             CREATE TABLE IF NOT EXISTS users (
@@ -741,6 +771,7 @@ impl AppState {
         Self::migrate_fcm_tokens(conn)?;
         Self::migrate_msg_ids(conn)?;
         Self::migrate_user_ids(conn)?;
+        Self::migrate_reply_to_id(conn)?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)",
@@ -944,25 +975,30 @@ impl AppState {
         recipient_id: &str,
         content: &str,
         timestamp: i64,
+        reply_to_id: Option<i64>,
     ) -> Result<i64, String> {
         conn.execute(
-            "INSERT INTO messages (sender_id, recipient_id, content, sent_at) VALUES (?, ?, ?, datetime(?/1000, 'unixepoch'))",
-            params![sender_id, recipient_id, content, &timestamp],
-        ).map_err(|e| format!("Ошибка сохранения сообщения: {}", e))?;
+            "INSERT INTO messages (sender_id, recipient_id, content, sent_at, reply_to_id) \
+             VALUES (?, ?, ?, datetime(?/1000, 'unixepoch'), ?)",
+            params![sender_id, recipient_id, content, &timestamp, reply_to_id],
+        )
+        .map_err(|e| format!("Ошибка сохранения сообщения: {}", e))?;
         Ok(conn.last_insert_rowid())
     }
 
     /// 5 последних сообщений на каждый личный чат (для логина).
+    /// Возвращает (msg_id, sender_id, recipient_id, content, ts, reply_to_id).
     fn get_recent_personal(
         conn: &mut Connection,
         user_id: &str,
         per_chat: i64,
-    ) -> Result<Vec<(i64, String, String, String, i64)>, String> {
+    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>)>, String> {
         let mut stmt = conn
             .prepare(
                 "WITH ranked AS (
                     SELECT m.id, m.sender_id, m.recipient_id, m.content,
                            strftime('%s', m.sent_at) * 1000 AS ts,
+                           m.reply_to_id,
                            ROW_NUMBER() OVER (
                                PARTITION BY CASE WHEN m.sender_id = ?1 THEN m.recipient_id
                                                  ELSE m.sender_id END
@@ -974,7 +1010,7 @@ impl AppState {
                     WHERE (m.sender_id = ?1 OR m.recipient_id = ?1)
                       AND h.msg_id IS NULL
                 )
-                SELECT id, sender_id, recipient_id, content, ts
+                SELECT id, sender_id, recipient_id, content, ts, reply_to_id
                 FROM ranked
                 WHERE rn <= ?2
                 ORDER BY id ASC",
@@ -988,6 +1024,7 @@ impl AppState {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -999,17 +1036,19 @@ impl AppState {
     }
 
     /// 5 последних сообщений на каждую группу пользователя.
+    /// Возвращает (msg_id, group_name, sender_id, content, ts, reply_to_id).
     fn get_recent_groups(
         conn: &mut Connection,
         user_id: &str,
         per_chat: i64,
-    ) -> Result<Vec<(i64, String, String, String, i64)>, String> {
+    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>)>, String> {
         let mut stmt = conn
             .prepare(
                 "WITH ranked AS (
                     SELECT gm.id, g.name AS group_name,
                            gm.sender_id, gm.content,
                            strftime('%s', gm.sent_at) * 1000 AS ts,
+                           gm.reply_to_id,
                            ROW_NUMBER() OVER (
                                PARTITION BY gm.group_id ORDER BY gm.id DESC
                            ) AS rn
@@ -1020,7 +1059,7 @@ impl AppState {
                            ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
                     WHERE h.msg_id IS NULL
                 )
-                SELECT id, group_name, sender_id, content, ts
+                SELECT id, group_name, sender_id, content, ts, reply_to_id
                 FROM ranked
                 WHERE rn <= ?2
                 ORDER BY id ASC",
@@ -1034,6 +1073,7 @@ impl AppState {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -1045,17 +1085,19 @@ impl AppState {
     }
 
     /// 5 последних сообщений на каждый канал пользователя.
+    /// Возвращает (msg_id, channel_name, sender_id, content, ts, reply_to_id).
     fn get_recent_channels(
         conn: &mut Connection,
         user_id: &str,
         per_chat: i64,
-    ) -> Result<Vec<(i64, String, String, String, i64)>, String> {
+    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>)>, String> {
         let mut stmt = conn
             .prepare(
                 "WITH ranked AS (
                     SELECT cm.id, c.name AS channel_name,
                            cm.sender_id, cm.content,
                            strftime('%s', cm.sent_at) * 1000 AS ts,
+                           cm.reply_to_id,
                            ROW_NUMBER() OVER (
                                PARTITION BY cm.channel_id ORDER BY cm.id DESC
                            ) AS rn
@@ -1066,7 +1108,7 @@ impl AppState {
                            ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
                     WHERE h.msg_id IS NULL
                 )
-                SELECT id, channel_name, sender_id, content, ts
+                SELECT id, channel_name, sender_id, content, ts, reply_to_id
                 FROM ranked
                 WHERE rn <= ?2
                 ORDER BY id ASC",
@@ -1080,6 +1122,7 @@ impl AppState {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -1169,6 +1212,7 @@ impl AppState {
         sender_id: &str,
         content: &str,
         timestamp: i64,
+        reply_to_id: Option<i64>,
     ) -> Result<i64, String> {
         let mut stmt = conn
             .prepare("SELECT id FROM groups WHERE name = ?")
@@ -1179,9 +1223,11 @@ impl AppState {
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let group_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
             conn.execute(
-                "INSERT INTO group_messages (group_id, sender_id, content, sent_at) VALUES (?, ?, ?, datetime(?/1000, 'unixepoch'))",
-                params![group_id, sender_id, content, &timestamp],
-            ).map_err(|e| format!("Ошибка сохранения группового сообщения: {}", e))?;
+                "INSERT INTO group_messages (group_id, sender_id, content, sent_at, reply_to_id) \
+                 VALUES (?, ?, ?, datetime(?/1000, 'unixepoch'), ?)",
+                params![group_id, sender_id, content, &timestamp, reply_to_id],
+            )
+            .map_err(|e| format!("Ошибка сохранения группового сообщения: {}", e))?;
             Ok(conn.last_insert_rowid())
         } else {
             Err("Группа не найдена".to_string())
@@ -1279,6 +1325,7 @@ impl AppState {
         sender_id: &str,
         content: &str,
         timestamp: i64,
+        reply_to_id: Option<i64>,
     ) -> Result<i64, String> {
         let mut stmt = conn
             .prepare("SELECT id FROM channels WHERE name = ?")
@@ -1289,9 +1336,11 @@ impl AppState {
         if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
             let channel_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
             conn.execute(
-                "INSERT INTO channel_messages (channel_id, sender_id, content, sent_at) VALUES (?, ?, ?, datetime(?/1000, 'unixepoch'))",
-                params![channel_id, sender_id, content, &timestamp],
-            ).map_err(|e| format!("Ошибка сохранения сообщения канала: {}", e))?;
+                "INSERT INTO channel_messages (channel_id, sender_id, content, sent_at, reply_to_id) \
+                 VALUES (?, ?, ?, datetime(?/1000, 'unixepoch'), ?)",
+                params![channel_id, sender_id, content, &timestamp, reply_to_id],
+            )
+                .map_err(|e| format!("Ошибка сохранения сообщения канала: {}", e))?;
             Ok(conn.last_insert_rowid())
         } else {
             Err("Канал не найден".to_string())
@@ -1571,6 +1620,7 @@ async fn send_encrypted_message(
     plaintext: &[u8],
     timestamp: i64,
     msg_id: i64,
+    reply_to_id: i64,
 ) -> Result<(), String> {
     if plaintext.len() > MAX_MESSAGE_SIZE {
         return Err("Message too large".to_string());
@@ -1596,6 +1646,7 @@ async fn send_encrypted_message(
     data.extend_from_slice(&encrypted);
     data.extend_from_slice(&timestamp.to_be_bytes());
     data.extend_from_slice(&msg_id.to_be_bytes());
+    data.extend_from_slice(&reply_to_id.to_be_bytes());
     tx.send(Message::Binary(data.into()))
         .map_err(|e| format!("send error: {}", e))
 }
@@ -1616,131 +1667,135 @@ async fn send_chat_history(
     let me = my_user_id.to_string();
     let chat_owned = chat.to_string();
 
-    let result: Result<Vec<(i64, String, String, String, i64)>, String> =
+    let result: Result<Vec<(i64, String, String, String, i64, Option<i64>)>, String> =
         tokio::task::spawn_blocking(move || {
             let mut st = db.lock().unwrap();
 
-            let raw: Vec<(i64, String, String, String, i64)> = if chat_owned.starts_with('#') {
-                let gname = chat_owned.trim_start_matches('#').to_string();
-                let rows: Vec<(i64, String, String, i64)> = {
-                    let mut stmt = st
-                        .conn
-                        .prepare(
-                            "SELECT gm.id, gm.sender_id, gm.content,
-                                strftime('%s', gm.sent_at) * 1000
-                         FROM group_messages gm
-                         JOIN groups g ON gm.group_id = g.id
-                         LEFT JOIN hidden_messages h
-                                ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
-                         WHERE g.name = ?2 AND gm.id < ?3 AND h.msg_id IS NULL
-                         ORDER BY gm.id DESC LIMIT ?4",
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let iter = stmt
-                        .query_map(params![me, gname, cursor, limit], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, i64>(3)?,
-                            ))
-                        })
-                        .map_err(|e| e.to_string())?;
-                    let mut v = Vec::new();
-                    for r in iter {
-                        v.push(r.map_err(|e| e.to_string())?);
+            let raw: Vec<(i64, String, String, String, i64, Option<i64>)> =
+                if chat_owned.starts_with('#') {
+                    let gname = chat_owned.trim_start_matches('#').to_string();
+                    let rows: Vec<(i64, String, String, i64, Option<i64>)> = {
+                        let mut stmt = st
+                            .conn
+                            .prepare(
+                                "SELECT gm.id, gm.sender_id, gm.content,
+                                    strftime('%s', gm.sent_at) * 1000, gm.reply_to_id
+                             FROM group_messages gm
+                             JOIN groups g ON gm.group_id = g.id
+                             LEFT JOIN hidden_messages h
+                                    ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
+                             WHERE g.name = ?2 AND gm.id < ?3 AND h.msg_id IS NULL
+                             ORDER BY gm.id DESC LIMIT ?4",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let iter = stmt
+                            .query_map(params![me, gname, cursor, limit], |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, i64>(3)?,
+                                    row.get::<_, Option<i64>>(4)?,
+                                ))
+                            })
+                            .map_err(|e| e.to_string())?;
+                        let mut v = Vec::new();
+                        for r in iter {
+                            v.push(r.map_err(|e| e.to_string())?);
+                        }
+                        v
+                    };
+                    let mut out = Vec::with_capacity(rows.len());
+                    for (id, sender_id, content, ts, reply_id) in rows {
+                        let sender = st.resolve_username(&sender_id);
+                        out.push((id, sender, chat_owned.clone(), content, ts, reply_id));
                     }
-                    v
-                };
-                let mut out = Vec::with_capacity(rows.len());
-                for (id, sender_id, content, ts) in rows {
-                    let sender = st.resolve_username(&sender_id);
-                    out.push((id, sender, chat_owned.clone(), content, ts));
-                }
-                out
-            } else if chat_owned.starts_with('&') {
-                let cname = chat_owned.trim_start_matches('&').to_string();
-                let rows: Vec<(i64, String, String, i64)> = {
-                    let mut stmt = st
-                        .conn
-                        .prepare(
-                            "SELECT cm.id, cm.sender_id, cm.content,
-                                strftime('%s', cm.sent_at) * 1000
-                         FROM channel_messages cm
-                         JOIN channels c ON cm.channel_id = c.id
-                         LEFT JOIN hidden_messages h
-                                ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
-                         WHERE c.name = ?2 AND cm.id < ?3 AND h.msg_id IS NULL
-                         ORDER BY cm.id DESC LIMIT ?4",
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let iter = stmt
-                        .query_map(params![me, cname, cursor, limit], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, i64>(3)?,
-                            ))
-                        })
-                        .map_err(|e| e.to_string())?;
-                    let mut v = Vec::new();
-                    for r in iter {
-                        v.push(r.map_err(|e| e.to_string())?);
+                    out
+                } else if chat_owned.starts_with('&') {
+                    let cname = chat_owned.trim_start_matches('&').to_string();
+                    let rows: Vec<(i64, String, String, i64, Option<i64>)> = {
+                        let mut stmt = st
+                            .conn
+                            .prepare(
+                                "SELECT cm.id, cm.sender_id, cm.content,
+                                    strftime('%s', cm.sent_at) * 1000, cm.reply_to_id
+                             FROM channel_messages cm
+                             JOIN channels c ON cm.channel_id = c.id
+                             LEFT JOIN hidden_messages h
+                                    ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
+                             WHERE c.name = ?2 AND cm.id < ?3 AND h.msg_id IS NULL
+                             ORDER BY cm.id DESC LIMIT ?4",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let iter = stmt
+                            .query_map(params![me, cname, cursor, limit], |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, i64>(3)?,
+                                    row.get::<_, Option<i64>>(4)?,
+                                ))
+                            })
+                            .map_err(|e| e.to_string())?;
+                        let mut v = Vec::new();
+                        for r in iter {
+                            v.push(r.map_err(|e| e.to_string())?);
+                        }
+                        v
+                    };
+                    let mut out = Vec::with_capacity(rows.len());
+                    for (id, sender_id, content, ts, reply_id) in rows {
+                        let sender = st.resolve_username(&sender_id);
+                        out.push((id, sender, chat_owned.clone(), content, ts, reply_id));
                     }
-                    v
-                };
-                let mut out = Vec::with_capacity(rows.len());
-                for (id, sender_id, content, ts) in rows {
-                    let sender = st.resolve_username(&sender_id);
-                    out.push((id, sender, chat_owned.clone(), content, ts));
-                }
-                out
-            } else {
-                let peer_id = match st.resolve_id(&chat_owned) {
-                    Some(id) => id,
-                    None => return Ok(Vec::new()),
-                };
-                let rows: Vec<(i64, String, String, String, i64)> = {
-                    let mut stmt = st
-                        .conn
-                        .prepare(
-                            "SELECT m.id, m.sender_id, m.recipient_id, m.content,
-                                strftime('%s', m.sent_at) * 1000
-                         FROM messages m
-                         LEFT JOIN hidden_messages h
-                                ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ?1
-                         WHERE ((m.sender_id = ?1 AND m.recipient_id = ?2) OR
-                                (m.sender_id = ?2 AND m.recipient_id = ?1))
-                           AND m.id < ?3 AND h.msg_id IS NULL
-                         ORDER BY m.id DESC LIMIT ?4",
-                        )
-                        .map_err(|e| e.to_string())?;
-                    let iter = stmt
-                        .query_map(params![me, peer_id, cursor, limit], |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, String>(3)?,
-                                row.get::<_, i64>(4)?,
-                            ))
-                        })
-                        .map_err(|e| e.to_string())?;
-                    let mut v = Vec::new();
-                    for r in iter {
-                        v.push(r.map_err(|e| e.to_string())?);
+                    out
+                } else {
+                    let peer_id = match st.resolve_id(&chat_owned) {
+                        Some(id) => id,
+                        None => return Ok(Vec::new()),
+                    };
+                    let rows: Vec<(i64, String, String, String, i64, Option<i64>)> = {
+                        let mut stmt = st
+                            .conn
+                            .prepare(
+                                "SELECT m.id, m.sender_id, m.recipient_id, m.content,
+                                    strftime('%s', m.sent_at) * 1000, m.reply_to_id
+                             FROM messages m
+                             LEFT JOIN hidden_messages h
+                                    ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ?1
+                             WHERE ((m.sender_id = ?1 AND m.recipient_id = ?2) OR
+                                    (m.sender_id = ?2 AND m.recipient_id = ?1))
+                               AND m.id < ?3 AND h.msg_id IS NULL
+                             ORDER BY m.id DESC LIMIT ?4",
+                            )
+                            .map_err(|e| e.to_string())?;
+                        let iter = stmt
+                            .query_map(params![me, peer_id, cursor, limit], |row| {
+                                Ok((
+                                    row.get::<_, i64>(0)?,
+                                    row.get::<_, String>(1)?,
+                                    row.get::<_, String>(2)?,
+                                    row.get::<_, String>(3)?,
+                                    row.get::<_, i64>(4)?,
+                                    row.get::<_, Option<i64>>(5)?,
+                                ))
+                            })
+                            .map_err(|e| e.to_string())?;
+                        let mut v = Vec::new();
+                        for r in iter {
+                            v.push(r.map_err(|e| e.to_string())?);
+                        }
+                        v
+                    };
+                    let mut out = Vec::with_capacity(rows.len());
+                    for (id, sender_id, recipient_id, content, ts, reply_id) in rows {
+                        let sender = st.resolve_username(&sender_id);
+                        let recipient = st.resolve_username(&recipient_id);
+                        out.push((id, sender, recipient, content, ts, reply_id));
                     }
-                    v
+                    out
                 };
-                let mut out = Vec::with_capacity(rows.len());
-                for (id, sender_id, recipient_id, content, ts) in rows {
-                    let sender = st.resolve_username(&sender_id);
-                    let recipient = st.resolve_username(&recipient_id);
-                    out.push((id, sender, recipient, content, ts));
-                }
-                out
-            };
 
             let mut v = raw;
             v.reverse();
@@ -1760,7 +1815,7 @@ async fn send_chat_history(
 
     let count = msgs.len();
     info!("История {}: отдано {} сообщений", chat, count);
-    for (msg_id, sender, recipient, content, ts) in msgs {
+    for (msg_id, sender, recipient, content, ts, reply_id) in msgs {
         let _ = send_encrypted_message(
             tx,
             keys,
@@ -1769,6 +1824,7 @@ async fn send_chat_history(
             content.as_bytes(),
             ts,
             msg_id,
+            reply_id.unwrap_or(0),
         )
         .await;
     }
@@ -1805,6 +1861,7 @@ async fn resolve_display_name(
     .await
     .unwrap()
 }
+
 async fn broadcast_system_message(
     state: &Arc<Mutex<AppState>>,
     message: &str,
@@ -2720,7 +2777,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .unwrap();
         if let Ok(msgs) = personal {
             let count = msgs.len();
-            for (msg_id, sender_id, recipient_id, content, ts) in msgs {
+            for (msg_id, sender_id, recipient_id, content, ts, reply_id) in msgs {
                 let db = state_h.lock().await.db.clone();
                 let sid = sender_id.clone();
                 let rid = recipient_id.clone();
@@ -2738,6 +2795,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     content.as_bytes(),
                     ts,
                     msg_id,
+                    reply_id.unwrap_or(0),
                 )
                 .await;
             }
@@ -2755,7 +2813,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .unwrap();
         if let Ok(msgs) = groups {
             let count = msgs.len();
-            for (msg_id, gname, sender_id, content, ts) in msgs {
+            for (msg_id, gname, sender_id, content, ts, reply_id) in msgs {
                 let db = state_h.lock().await.db.clone();
                 let sid = sender_id.clone();
                 let sender = tokio::task::spawn_blocking(move || {
@@ -2773,6 +2831,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     content.as_bytes(),
                     ts,
                     msg_id,
+                    reply_id.unwrap_or(0),
                 )
                 .await;
             }
@@ -2793,7 +2852,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .unwrap();
         if let Ok(msgs) = channels {
             let count = msgs.len();
-            for (msg_id, cname, sender_id, content, ts) in msgs {
+            for (msg_id, cname, sender_id, content, ts, reply_id) in msgs {
                 let db = state_h.lock().await.db.clone();
                 let sid = sender_id.clone();
                 let sender = tokio::task::spawn_blocking(move || {
@@ -2811,6 +2870,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     content.as_bytes(),
                     ts,
                     msg_id,
+                    reply_id.unwrap_or(0),
                 )
                 .await;
             }
@@ -2886,14 +2946,22 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     let encrypted = &rest[offset..offset + msg_len];
                     offset += msg_len;
 
-                    let (timestamp, _client_msg_id) = if rest.len() >= offset + 16 {
+                    // [timestamp 8][msg_id 8][reply_to_id 8?]
+                    let (timestamp, _client_msg_id, reply_to_id) = if rest.len() >= offset + 24 {
                         let ts = i64::from_be_bytes(rest[offset..offset + 8].try_into().unwrap());
                         let id =
                             i64::from_be_bytes(rest[offset + 8..offset + 16].try_into().unwrap());
-                        (ts, id)
+                        let rt =
+                            i64::from_be_bytes(rest[offset + 16..offset + 24].try_into().unwrap());
+                        (ts, id, rt)
+                    } else if rest.len() >= offset + 16 {
+                        let ts = i64::from_be_bytes(rest[offset..offset + 8].try_into().unwrap());
+                        let id =
+                            i64::from_be_bytes(rest[offset + 8..offset + 16].try_into().unwrap());
+                        (ts, id, 0)
                     } else if rest.len() >= offset + 8 {
                         let ts = i64::from_be_bytes(rest[offset..offset + 8].try_into().unwrap());
-                        (ts, 0)
+                        (ts, 0, 0)
                     } else {
                         (
                             SystemTime::now()
@@ -2901,7 +2969,15 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 .unwrap()
                                 .as_millis() as i64,
                             0,
+                            0,
                         )
+                    };
+
+                    // reply_to_id == 0 → нет reply.
+                    let reply_opt: Option<i64> = if reply_to_id == 0 {
+                        None
+                    } else {
+                        Some(reply_to_id)
                     };
 
                     let key = &keys.key;
@@ -2990,6 +3066,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let rec_id = recipient_id.clone();
                         let content_clone = content.clone();
                         let ts = timestamp;
+                        let reply_for_store = reply_opt;
                         let stored_id: i64 = tokio::task::spawn_blocking(move || {
                             let mut st = db.lock().unwrap();
                             AppState::store_message(
@@ -2998,6 +3075,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 &rec_id,
                                 &content_clone,
                                 ts,
+                                reply_for_store,
                             )
                         })
                         .await
@@ -3012,6 +3090,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             &plaintext,
                             timestamp,
                             stored_id,
+                            reply_to_id,
                         )
                         .await;
 
@@ -3042,6 +3121,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         &plaintext,
                                         timestamp,
                                         stored_id,
+                                        reply_to_id,
                                     )
                                     .await;
                                 }
@@ -3116,6 +3196,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let gname = group_name.clone();
                         let cnt = content.clone();
                         let ts = timestamp;
+                        let reply_for_store = reply_opt;
                         let stored_id: i64 = tokio::task::spawn_blocking(move || {
                             let mut st = db.lock().unwrap();
                             AppState::store_group_message(
@@ -3124,6 +3205,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 &sender_id,
                                 &cnt,
                                 ts,
+                                reply_for_store,
                             )
                         })
                         .await
@@ -3149,6 +3231,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             &plaintext,
                             timestamp,
                             stored_id,
+                            reply_to_id,
                         )
                         .await;
 
@@ -3206,6 +3289,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &plaintext,
                                             timestamp,
                                             stored_id,
+                                            reply_to_id,
                                         )
                                         .await;
                                     }
@@ -3314,6 +3398,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let ch_name = channel_name.clone();
                         let cnt = content.clone();
                         let ts = timestamp;
+                        let reply_for_store = reply_opt;
                         let stored_id: i64 = tokio::task::spawn_blocking(move || {
                             let mut st = db.lock().unwrap();
                             AppState::store_channel_message(
@@ -3322,6 +3407,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 &sender_id,
                                 &cnt,
                                 ts,
+                                reply_for_store,
                             )
                         })
                         .await
@@ -3347,6 +3433,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             &plaintext,
                             timestamp,
                             stored_id,
+                            reply_to_id,
                         )
                         .await;
 
@@ -3404,6 +3491,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &plaintext,
                                             timestamp,
                                             stored_id,
+                                            reply_to_id,
                                         )
                                         .await;
                                     }
