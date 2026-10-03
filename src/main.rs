@@ -31,6 +31,7 @@ const MSG_TYPE_COMMAND: u8 = 0x03;
 const MSG_TYPE_AUTH: u8 = 0x04;
 const MSG_TYPE_DELETE: u8 = 0x05;
 const MSG_TYPE_LOGOUT: u8 = 0x06;
+const MSG_TYPE_READ: u8 = 0x07;
 
 const MSG_KIND_PERSONAL: u8 = 1;
 const MSG_KIND_GROUP: u8 = 2;
@@ -50,8 +51,17 @@ const PONG_TIMEOUT: StdDuration = StdDuration::from_secs(90);
 
 const DELETED_LABEL: &str = "deleted";
 
-// ==================== FCM ====================
+#[derive(Clone, Copy, Debug)]
+struct MsgFields {
+    timestamp: i64,
+    msg_id: i64,
+    reply_to_id: i64,
+    flag_me: bool,
+    flag_any: bool,
+    views: Option<u32>,
+}
 
+// ==================== FCM ====================
 #[derive(Debug)]
 pub enum FcmError {
     Connection(String),
@@ -101,7 +111,6 @@ async fn send_fcm_push(
             let path = sys
                 .getattr("path")
                 .map_err(|e| format!("sys.path: {}", e))?;
-
             if let Ok(exe_path) = std::env::current_exe() {
                 if let Some(dir) = exe_path.parent() {
                     if let Some(dir_str) = dir.to_str() {
@@ -110,20 +119,17 @@ async fn send_fcm_push(
                     }
                 }
             }
-
             let helper = py
                 .import("fcm_helper")
-                .map_err(|e| format!("import fcm_helper: {}", e))?;
+                .map_err(|e| format!("import: {}", e))?;
             let send_func = helper
                 .getattr("send_fcm_push")
-                .map_err(|e| format!("getattr send_fcm_push: {}", e))?;
-
+                .map_err(|e| format!("getattr: {}", e))?;
             let result = send_func
                 .call1((token, title, body, data_map))
-                .map_err(|e| format!("call send_fcm_push: {}", e))?;
-            let extracted: (bool, bool) = result
-                .extract()
-                .map_err(|e| format!("extract result: {}", e))?;
+                .map_err(|e| format!("call: {}", e))?;
+            let extracted: (bool, bool) =
+                result.extract().map_err(|e| format!("extract: {}", e))?;
             Ok(extracted)
         })
     })
@@ -136,7 +142,7 @@ async fn send_fcm_push(
         Ok(())
     } else if connection_failed {
         Err(FcmError::Connection(
-            "send_fcm_push вернул connection_failed".to_string(),
+            "send_fcm_push connection_failed".to_string(),
         ))
     } else {
         Err(FcmError::SendFailed("FCM отклонил отправку".to_string()))
@@ -207,16 +213,12 @@ impl Session {
             true
         } else {
             self.msg_count += 1;
-            if self.msg_count > RATE_LIMIT_MAX {
-                false
-            } else {
-                true
-            }
+            self.msg_count <= RATE_LIMIT_MAX
         }
     }
 }
 
-// ==================== DbState (Conn + кэш) ====================
+// ==================== DbState ====================
 struct DbState {
     conn: Connection,
     username_to_id: HashMap<String, String>,
@@ -263,7 +265,7 @@ impl DbState {
     }
 }
 
-// ==================== Состояние приложения ====================
+// ==================== AppState ====================
 struct AppState {
     db: Arc<StdMutex<DbState>>,
     sessions: HashMap<String, Arc<Mutex<Session>>>,
@@ -279,7 +281,6 @@ impl AppState {
         }
     }
 
-    // ---- Миграция: last_seen + индексы ----
     fn migrate_db(conn: &mut Connection) -> Result<(), String> {
         {
             let mut stmt = conn
@@ -324,7 +325,6 @@ impl AppState {
         Ok(())
     }
 
-    // ---- Миграция: messages/group_messages/channel_messages к id ----
     fn migrate_msg_ids(conn: &mut Connection) -> Result<(), String> {
         let is_int_id = |conn: &Connection, table: &str| -> Result<bool, String> {
             let mut stmt = conn
@@ -352,7 +352,6 @@ impl AppState {
         }
 
         info!("Миграция: конвертирую id в INTEGER AUTOINCREMENT");
-
         conn.execute("PRAGMA foreign_keys = OFF", [])
             .map_err(|e| e.to_string())?;
 
@@ -422,7 +421,6 @@ impl AppState {
         result
     }
 
-    // ---- Миграция: fcm_tokens к сессии ----
     fn migrate_fcm_tokens(conn: &mut Connection) -> Result<(), String> {
         let mut has_session_token = false;
         {
@@ -444,7 +442,6 @@ impl AppState {
         }
 
         info!("Миграция: пересоздаю fcm_tokens с привязкой к сессии");
-
         conn.execute("PRAGMA foreign_keys = OFF", [])
             .map_err(|e| e.to_string())?;
 
@@ -485,7 +482,6 @@ impl AppState {
         result
     }
 
-    // ---- Миграция: username → user_id во всех таблицах ----
     fn migrate_user_ids(conn: &mut Connection) -> Result<(), String> {
         let has_user_id = |conn: &Connection, table: &str, col: &str| -> Result<bool, String> {
             let mut stmt = conn
@@ -507,7 +503,6 @@ impl AppState {
         }
 
         info!("Миграция: привязка сообщений к user_id");
-
         conn.execute("PRAGMA foreign_keys = OFF", [])
             .map_err(|e| e.to_string())?;
 
@@ -651,7 +646,6 @@ impl AppState {
         result
     }
 
-    // ---- Миграция: reply_to_id в трёх таблицах сообщений ----
     fn migrate_reply_to_id(conn: &mut Connection) -> Result<(), String> {
         let has_reply_col = |conn: &Connection, table: &str| -> Result<bool, String> {
             let mut stmt = conn
@@ -678,6 +672,55 @@ impl AppState {
                 info!("Добавлен столбец reply_to_id в {}", table);
             }
         }
+        Ok(())
+    }
+
+    fn migrate_read_status(conn: &mut Connection) -> Result<(), String> {
+        let has_col = |conn: &Connection, table: &str, col: &str| -> Result<bool, String> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({})", table))
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            for name in rows {
+                if name.map_err(|e| e.to_string())? == col {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+
+        if !has_col(conn, "messages", "read_at")? {
+            conn.execute("ALTER TABLE messages ADD COLUMN read_at TIMESTAMP", [])
+                .map_err(|e| e.to_string())?;
+            info!("Добавлен столбец read_at в messages");
+        }
+        if !has_col(conn, "group_messages", "first_read_at")? {
+            conn.execute(
+                "ALTER TABLE group_messages ADD COLUMN first_read_at TIMESTAMP",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+            info!("Добавлен столбец first_read_at в group_messages");
+        }
+
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS channel_message_views (
+                channel_msg_id INTEGER NOT NULL,
+                user_id TEXT NOT NULL,
+                viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (channel_msg_id, user_id)
+            )",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_channel_views_msg ON channel_message_views(channel_msg_id)",
+            [],
+        )
+            .map_err(|e| e.to_string())?;
+
         Ok(())
     }
 
@@ -772,6 +815,7 @@ impl AppState {
         Self::migrate_msg_ids(conn)?;
         Self::migrate_user_ids(conn)?;
         Self::migrate_reply_to_id(conn)?;
+        Self::migrate_read_status(conn)?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)",
@@ -816,8 +860,6 @@ impl AppState {
 
         Ok(())
     }
-
-    // ==================== Методы работы с БД ====================
 
     // ---- Users ----
     fn register_user(
@@ -932,8 +974,7 @@ impl AppState {
         conn.execute(
             "INSERT INTO fcm_tokens (user_id, session_token, token, device_name) VALUES (?, ?, ?, ?)",
             params![user_id, session_token, token, device_name],
-        )
-            .map_err(|e| format!("Ошибка сохранения FCM-токена: {}", e))?;
+        ).map_err(|e| format!("Ошибка сохранения FCM-токена: {}", e))?;
         Ok(())
     }
 
@@ -963,7 +1004,7 @@ impl AppState {
             .execute("DELETE FROM fcm_tokens WHERE token = ?", [token])
             .map_err(|e| format!("Ошибка удаления FCM-токена: {}", e))?;
         if affected > 0 {
-            info!("FCM-токен удалён из БД: {}", token);
+            warn!("FCM-токен удалён из БД: {}", token);
         }
         Ok(())
     }
@@ -986,19 +1027,18 @@ impl AppState {
         Ok(conn.last_insert_rowid())
     }
 
-    /// 5 последних сообщений на каждый личный чат (для логина).
-    /// Возвращает (msg_id, sender_id, recipient_id, content, ts, reply_to_id).
+    /// (msg_id, sender_id, recipient_id, content, ts, reply_to_id, flag_me, flag_any).
     fn get_recent_personal(
         conn: &mut Connection,
         user_id: &str,
         per_chat: i64,
-    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>)>, String> {
+    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>, bool, bool)>, String> {
         let mut stmt = conn
             .prepare(
                 "WITH ranked AS (
                     SELECT m.id, m.sender_id, m.recipient_id, m.content,
                            strftime('%s', m.sent_at) * 1000 AS ts,
-                           m.reply_to_id,
+                           m.reply_to_id, m.read_at,
                            ROW_NUMBER() OVER (
                                PARTITION BY CASE WHEN m.sender_id = ?1 THEN m.recipient_id
                                                  ELSE m.sender_id END
@@ -1010,7 +1050,7 @@ impl AppState {
                     WHERE (m.sender_id = ?1 OR m.recipient_id = ?1)
                       AND h.msg_id IS NULL
                 )
-                SELECT id, sender_id, recipient_id, content, ts, reply_to_id
+                SELECT id, sender_id, recipient_id, content, ts, reply_to_id, read_at
                 FROM ranked
                 WHERE rn <= ?2
                 ORDER BY id ASC",
@@ -1018,13 +1058,21 @@ impl AppState {
             .map_err(|e| e.to_string())?;
         let iter = stmt
             .query_map(params![user_id, per_chat], |row| {
+                let sender_id: String = row.get(1)?;
+                let read_at: Option<String> = row.get(6)?;
+                let is_sender = sender_id == user_id;
+                let read_flag = read_at.is_some();
+                let flag_me = if is_sender { true } else { read_flag };
+                let flag_any = if is_sender { read_flag } else { true };
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
+                    sender_id,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
+                    flag_me,
+                    flag_any,
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -1035,20 +1083,18 @@ impl AppState {
         Ok(out)
     }
 
-    /// 5 последних сообщений на каждую группу пользователя.
-    /// Возвращает (msg_id, group_name, sender_id, content, ts, reply_to_id).
     fn get_recent_groups(
         conn: &mut Connection,
         user_id: &str,
         per_chat: i64,
-    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>)>, String> {
+    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>, bool, bool)>, String> {
         let mut stmt = conn
             .prepare(
                 "WITH ranked AS (
                     SELECT gm.id, g.name AS group_name,
                            gm.sender_id, gm.content,
                            strftime('%s', gm.sent_at) * 1000 AS ts,
-                           gm.reply_to_id,
+                           gm.reply_to_id, gm.first_read_at,
                            ROW_NUMBER() OVER (
                                PARTITION BY gm.group_id ORDER BY gm.id DESC
                            ) AS rn
@@ -1059,7 +1105,7 @@ impl AppState {
                            ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
                     WHERE h.msg_id IS NULL
                 )
-                SELECT id, group_name, sender_id, content, ts, reply_to_id
+                SELECT id, group_name, sender_id, content, ts, reply_to_id, first_read_at
                 FROM ranked
                 WHERE rn <= ?2
                 ORDER BY id ASC",
@@ -1067,13 +1113,21 @@ impl AppState {
             .map_err(|e| e.to_string())?;
         let iter = stmt
             .query_map(params![user_id, per_chat], |row| {
+                let sender_id: String = row.get(2)?;
+                let first_read_at: Option<String> = row.get(6)?;
+                let is_sender = sender_id == user_id;
+                let read_flag = first_read_at.is_some();
+                let flag_me = if is_sender { true } else { false };
+                let flag_any = read_flag;
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    sender_id,
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
+                    flag_me,
+                    flag_any,
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -1084,13 +1138,25 @@ impl AppState {
         Ok(out)
     }
 
-    /// 5 последних сообщений на каждый канал пользователя.
-    /// Возвращает (msg_id, channel_name, sender_id, content, ts, reply_to_id).
+    /// (msg_id, channel_name, sender_id, content, ts, reply_to_id, flag_me, flag_any, views).
     fn get_recent_channels(
         conn: &mut Connection,
         user_id: &str,
         per_chat: i64,
-    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>)>, String> {
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            bool,
+            bool,
+            u32,
+        )>,
+        String,
+    > {
         let mut stmt = conn
             .prepare(
                 "WITH ranked AS (
@@ -1098,6 +1164,8 @@ impl AppState {
                            cm.sender_id, cm.content,
                            strftime('%s', cm.sent_at) * 1000 AS ts,
                            cm.reply_to_id,
+                           (SELECT COUNT(*) FROM channel_message_views v
+                            WHERE v.channel_msg_id = cm.id) AS views,
                            ROW_NUMBER() OVER (
                                PARTITION BY cm.channel_id ORDER BY cm.id DESC
                            ) AS rn
@@ -1108,7 +1176,7 @@ impl AppState {
                            ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
                     WHERE h.msg_id IS NULL
                 )
-                SELECT id, channel_name, sender_id, content, ts, reply_to_id
+                SELECT id, channel_name, sender_id, content, ts, reply_to_id, views
                 FROM ranked
                 WHERE rn <= ?2
                 ORDER BY id ASC",
@@ -1116,6 +1184,8 @@ impl AppState {
             .map_err(|e| e.to_string())?;
         let iter = stmt
             .query_map(params![user_id, per_chat], |row| {
+                let views: i64 = row.get(6).unwrap_or(0);
+                let v = views as u32;
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, String>(1)?,
@@ -1123,6 +1193,9 @@ impl AppState {
                     row.get::<_, String>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, Option<i64>>(5)?,
+                    true,
+                    v > 0,
+                    v,
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -1347,7 +1420,7 @@ impl AppState {
         }
     }
 
-    // ---- Хелперы для удаления/скрытия ----
+    // ---- Хелперы ----
     fn lookup_personal_message(
         conn: &mut Connection,
         msg_id: i64,
@@ -1429,12 +1502,13 @@ impl AppState {
             .next()
             .map_err(|e| format!("Ошибка чтения результата: {}", e))?
         {
-            let username: String = row.get(0).map_err(|e| e.to_string())?;
-            let phone: String = row.get(1).map_err(|e| e.to_string())?;
-            let first_name: String = row.get(2).map_err(|e| e.to_string())?;
-            let last_name: String = row.get(3).map_err(|e| e.to_string())?;
-            let display_name: String = row.get(4).map_err(|e| e.to_string())?;
-            Ok((username, phone, first_name, last_name, display_name))
+            Ok((
+                row.get(0).map_err(|e| e.to_string())?,
+                row.get(1).map_err(|e| e.to_string())?,
+                row.get(2).map_err(|e| e.to_string())?,
+                row.get(3).map_err(|e| e.to_string())?,
+                row.get(4).map_err(|e| e.to_string())?,
+            ))
         } else {
             Err("Пользователь не найден".to_string())
         }
@@ -1534,6 +1608,224 @@ impl AppState {
         )
         .map_err(|e| e.to_string())
     }
+
+    /// Точечная выборка сообщений по списку id (для /getmsg).
+    /// Точечная выборка сообщений по списку id (для /getmsg).
+    fn get_messages_by_ids(
+        st: &mut DbState,
+        kind: u8,
+        ids: &[i64],
+        user_id: &str,
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            bool,
+            bool,
+            Option<u32>,
+        )>,
+        String,
+    > {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let mut out = Vec::new();
+
+        match kind {
+            1 => {
+                let sql = format!(
+                    "SELECT m.id, m.sender_id, m.recipient_id, m.content, \
+                            strftime('%s', m.sent_at) * 1000, m.reply_to_id, m.read_at \
+                     FROM messages m \
+                     LEFT JOIN hidden_messages h \
+                            ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ? \
+                     WHERE m.id IN ({}) \
+                       AND (m.sender_id = ? OR m.recipient_id = ?) \
+                       AND h.msg_id IS NULL",
+                    placeholders
+                );
+
+                // Сначала — только сырые данные, без обращения к st.resolve_username,
+                // чтобы не держать `stmt` живым во время mutable-заимствования st.
+                let raw: Vec<(
+                    i64,
+                    String,
+                    String,
+                    String,
+                    i64,
+                    Option<i64>,
+                    Option<String>,
+                )> = {
+                    let mut stmt = st.conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+                    params_vec.push(rusqlite::types::Value::Text(user_id.to_string()));
+                    for id in ids {
+                        params_vec.push(rusqlite::types::Value::Integer(*id));
+                    }
+                    params_vec.push(rusqlite::types::Value::Text(user_id.to_string()));
+                    params_vec.push(rusqlite::types::Value::Text(user_id.to_string()));
+                    let iter = stmt
+                        .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, Option<i64>>(5)?,
+                                row.get::<_, Option<String>>(6)?,
+                            ))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let mut v = Vec::new();
+                    for r in iter {
+                        v.push(r.map_err(|e| e.to_string())?);
+                    }
+                    v
+                }; // stmt уходит из области видимости здесь
+
+                for (id, sender_id, recipient_id, content, ts, reply_id, read_at) in raw {
+                    let sender = st.resolve_username(&sender_id);
+                    let recipient = st.resolve_username(&recipient_id);
+                    let is_sender = sender_id == user_id;
+                    let read_flag = read_at.is_some();
+                    let flag_me = if is_sender { true } else { read_flag };
+                    let flag_any = if is_sender { read_flag } else { true };
+                    out.push((
+                        id, sender, recipient, content, ts, reply_id, flag_me, flag_any, None,
+                    ));
+                }
+            }
+            2 => {
+                let sql = format!(
+                    "SELECT gm.id, g.name, gm.sender_id, gm.content, \
+                            strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, gm.first_read_at \
+                     FROM group_messages gm \
+                     JOIN groups g ON gm.group_id = g.id \
+                     JOIN group_members gmem ON gmem.group_id = g.id AND gmem.user_id = ? \
+                     LEFT JOIN hidden_messages h \
+                            ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ? \
+                     WHERE gm.id IN ({}) AND h.msg_id IS NULL",
+                    placeholders
+                );
+
+                let raw: Vec<(
+                    i64,
+                    String,
+                    String,
+                    String,
+                    i64,
+                    Option<i64>,
+                    Option<String>,
+                )> = {
+                    let mut stmt = st.conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+                    params_vec.push(rusqlite::types::Value::Text(user_id.to_string()));
+                    params_vec.push(rusqlite::types::Value::Text(user_id.to_string()));
+                    for id in ids {
+                        params_vec.push(rusqlite::types::Value::Integer(*id));
+                    }
+                    let iter = stmt
+                        .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, Option<i64>>(5)?,
+                                row.get::<_, Option<String>>(6)?,
+                            ))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let mut v = Vec::new();
+                    for r in iter {
+                        v.push(r.map_err(|e| e.to_string())?);
+                    }
+                    v
+                };
+
+                for (id, gname, sender_id, content, ts, reply_id, first_read_at) in raw {
+                    let sender = st.resolve_username(&sender_id);
+                    let recipient = format!("#{}", gname);
+                    let is_sender = sender_id == user_id;
+                    let flag_me = is_sender;
+                    let flag_any = first_read_at.is_some();
+                    out.push((
+                        id, sender, recipient, content, ts, reply_id, flag_me, flag_any, None,
+                    ));
+                }
+            }
+            3 => {
+                let sql = format!(
+                    "SELECT cm.id, c.name, cm.sender_id, cm.content, \
+                            strftime('%s', cm.sent_at) * 1000, cm.reply_to_id, \
+                            (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id) \
+                     FROM channel_messages cm \
+                     JOIN channels c ON cm.channel_id = c.id \
+                     JOIN channel_subscribers cs ON cs.channel_id = c.id AND cs.user_id = ? \
+                     LEFT JOIN hidden_messages h \
+                            ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ? \
+                     WHERE cm.id IN ({}) AND h.msg_id IS NULL",
+                    placeholders
+                );
+
+                let raw: Vec<(i64, String, String, String, i64, Option<i64>, i64)> = {
+                    let mut stmt = st.conn.prepare(&sql).map_err(|e| e.to_string())?;
+                    let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+                    params_vec.push(rusqlite::types::Value::Text(user_id.to_string()));
+                    params_vec.push(rusqlite::types::Value::Text(user_id.to_string()));
+                    for id in ids {
+                        params_vec.push(rusqlite::types::Value::Integer(*id));
+                    }
+                    let iter = stmt
+                        .query_map(rusqlite::params_from_iter(params_vec.iter()), |row| {
+                            Ok((
+                                row.get::<_, i64>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, String>(3)?,
+                                row.get::<_, i64>(4)?,
+                                row.get::<_, Option<i64>>(5)?,
+                                row.get::<_, i64>(6).unwrap_or(0),
+                            ))
+                        })
+                        .map_err(|e| e.to_string())?;
+                    let mut v = Vec::new();
+                    for r in iter {
+                        v.push(r.map_err(|e| e.to_string())?);
+                    }
+                    v
+                };
+
+                for (id, cname, sender_id, content, ts, reply_id, views) in raw {
+                    let sender = st.resolve_username(&sender_id);
+                    let recipient = format!("&{}", cname);
+                    let v = views as u32;
+                    out.push((
+                        id,
+                        sender,
+                        recipient,
+                        content,
+                        ts,
+                        reply_id,
+                        true,
+                        v > 0,
+                        Some(v),
+                    ));
+                }
+            }
+            _ => return Err(format!("Неизвестный kind: {}", kind)),
+        }
+
+        Ok(out)
+    }
 }
 
 // ==================== Handshake ====================
@@ -1581,7 +1873,7 @@ async fn ws_handshake(
     Ok(SessionKeys { key })
 }
 
-// ==================== Вспомогательные функции ====================
+// ==================== Вспомогательные ====================
 async fn send_system_message(
     tx: &mpsc::UnboundedSender<Message>,
     text: &str,
@@ -1612,15 +1904,25 @@ fn build_delete_packet(msg_id: i64, kind: u8, dtype: u8) -> Vec<u8> {
     }
 }
 
+fn build_read_packet(items: &[(u8, i64)]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(3 + items.len() * 9);
+    data.push(MSG_TYPE_READ);
+    let count = items.len() as u16;
+    data.extend_from_slice(&count.to_be_bytes());
+    for (kind, msg_id) in items {
+        data.push(*kind);
+        data.extend_from_slice(&msg_id.to_be_bytes());
+    }
+    data
+}
+
 async fn send_encrypted_message(
     tx: &mpsc::UnboundedSender<Message>,
     keys: &SessionKeys,
     sender_name: &str,
     recipient_name: &str,
     plaintext: &[u8],
-    timestamp: i64,
-    msg_id: i64,
-    reply_to_id: i64,
+    fields: MsgFields,
 ) -> Result<(), String> {
     if plaintext.len() > MAX_MESSAGE_SIZE {
         return Err("Message too large".to_string());
@@ -1644,15 +1946,18 @@ async fn send_encrypted_message(
     data.extend_from_slice(&nonce);
     data.extend_from_slice(&(encrypted.len() as u32).to_be_bytes());
     data.extend_from_slice(&encrypted);
-    data.extend_from_slice(&timestamp.to_be_bytes());
-    data.extend_from_slice(&msg_id.to_be_bytes());
-    data.extend_from_slice(&reply_to_id.to_be_bytes());
+    data.extend_from_slice(&fields.timestamp.to_be_bytes());
+    data.extend_from_slice(&fields.msg_id.to_be_bytes());
+    data.extend_from_slice(&fields.reply_to_id.to_be_bytes());
+    data.push(if fields.flag_me { 1 } else { 0 });
+    data.push(if fields.flag_any { 1 } else { 0 });
+    if let Some(v) = fields.views {
+        data.extend_from_slice(&v.to_be_bytes());
+    }
     tx.send(Message::Binary(data.into()))
         .map_err(|e| format!("send error: {}", e))
 }
 
-/// Отдаёт историю одного чата пачкой MSG_TYPE_USER, затем шлёт terminator
-/// `[Система] history_done|<chat>|<count>`.
 async fn send_chat_history(
     tx: &mpsc::UnboundedSender<Message>,
     keys: &SessionKeys,
@@ -1667,142 +1972,195 @@ async fn send_chat_history(
     let me = my_user_id.to_string();
     let chat_owned = chat.to_string();
 
-    let result: Result<Vec<(i64, String, String, String, i64, Option<i64>)>, String> =
-        tokio::task::spawn_blocking(move || {
-            let mut st = db.lock().unwrap();
+    type HistRow = (
+        i64,
+        String,
+        String,
+        String,
+        i64,
+        Option<i64>,
+        bool,
+        bool,
+        Option<u32>,
+    );
 
-            let raw: Vec<(i64, String, String, String, i64, Option<i64>)> =
-                if chat_owned.starts_with('#') {
-                    let gname = chat_owned.trim_start_matches('#').to_string();
-                    let rows: Vec<(i64, String, String, i64, Option<i64>)> = {
-                        let mut stmt = st
-                            .conn
-                            .prepare(
-                                "SELECT gm.id, gm.sender_id, gm.content,
-                                    strftime('%s', gm.sent_at) * 1000, gm.reply_to_id
-                             FROM group_messages gm
-                             JOIN groups g ON gm.group_id = g.id
-                             LEFT JOIN hidden_messages h
-                                    ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
-                             WHERE g.name = ?2 AND gm.id < ?3 AND h.msg_id IS NULL
-                             ORDER BY gm.id DESC LIMIT ?4",
-                            )
-                            .map_err(|e| e.to_string())?;
-                        let iter = stmt
-                            .query_map(params![me, gname, cursor, limit], |row| {
-                                Ok((
-                                    row.get::<_, i64>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, String>(2)?,
-                                    row.get::<_, i64>(3)?,
-                                    row.get::<_, Option<i64>>(4)?,
-                                ))
-                            })
-                            .map_err(|e| e.to_string())?;
-                        let mut v = Vec::new();
-                        for r in iter {
-                            v.push(r.map_err(|e| e.to_string())?);
-                        }
-                        v
-                    };
-                    let mut out = Vec::with_capacity(rows.len());
-                    for (id, sender_id, content, ts, reply_id) in rows {
-                        let sender = st.resolve_username(&sender_id);
-                        out.push((id, sender, chat_owned.clone(), content, ts, reply_id));
-                    }
-                    out
-                } else if chat_owned.starts_with('&') {
-                    let cname = chat_owned.trim_start_matches('&').to_string();
-                    let rows: Vec<(i64, String, String, i64, Option<i64>)> = {
-                        let mut stmt = st
-                            .conn
-                            .prepare(
-                                "SELECT cm.id, cm.sender_id, cm.content,
-                                    strftime('%s', cm.sent_at) * 1000, cm.reply_to_id
-                             FROM channel_messages cm
-                             JOIN channels c ON cm.channel_id = c.id
-                             LEFT JOIN hidden_messages h
-                                    ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
-                             WHERE c.name = ?2 AND cm.id < ?3 AND h.msg_id IS NULL
-                             ORDER BY cm.id DESC LIMIT ?4",
-                            )
-                            .map_err(|e| e.to_string())?;
-                        let iter = stmt
-                            .query_map(params![me, cname, cursor, limit], |row| {
-                                Ok((
-                                    row.get::<_, i64>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, String>(2)?,
-                                    row.get::<_, i64>(3)?,
-                                    row.get::<_, Option<i64>>(4)?,
-                                ))
-                            })
-                            .map_err(|e| e.to_string())?;
-                        let mut v = Vec::new();
-                        for r in iter {
-                            v.push(r.map_err(|e| e.to_string())?);
-                        }
-                        v
-                    };
-                    let mut out = Vec::with_capacity(rows.len());
-                    for (id, sender_id, content, ts, reply_id) in rows {
-                        let sender = st.resolve_username(&sender_id);
-                        out.push((id, sender, chat_owned.clone(), content, ts, reply_id));
-                    }
-                    out
-                } else {
-                    let peer_id = match st.resolve_id(&chat_owned) {
-                        Some(id) => id,
-                        None => return Ok(Vec::new()),
-                    };
-                    let rows: Vec<(i64, String, String, String, i64, Option<i64>)> = {
-                        let mut stmt = st
-                            .conn
-                            .prepare(
-                                "SELECT m.id, m.sender_id, m.recipient_id, m.content,
-                                    strftime('%s', m.sent_at) * 1000, m.reply_to_id
-                             FROM messages m
-                             LEFT JOIN hidden_messages h
-                                    ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ?1
-                             WHERE ((m.sender_id = ?1 AND m.recipient_id = ?2) OR
-                                    (m.sender_id = ?2 AND m.recipient_id = ?1))
-                               AND m.id < ?3 AND h.msg_id IS NULL
-                             ORDER BY m.id DESC LIMIT ?4",
-                            )
-                            .map_err(|e| e.to_string())?;
-                        let iter = stmt
-                            .query_map(params![me, peer_id, cursor, limit], |row| {
-                                Ok((
-                                    row.get::<_, i64>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, String>(2)?,
-                                    row.get::<_, String>(3)?,
-                                    row.get::<_, i64>(4)?,
-                                    row.get::<_, Option<i64>>(5)?,
-                                ))
-                            })
-                            .map_err(|e| e.to_string())?;
-                        let mut v = Vec::new();
-                        for r in iter {
-                            v.push(r.map_err(|e| e.to_string())?);
-                        }
-                        v
-                    };
-                    let mut out = Vec::with_capacity(rows.len());
-                    for (id, sender_id, recipient_id, content, ts, reply_id) in rows {
-                        let sender = st.resolve_username(&sender_id);
-                        let recipient = st.resolve_username(&recipient_id);
-                        out.push((id, sender, recipient, content, ts, reply_id));
-                    }
-                    out
-                };
+    let result: Result<Vec<HistRow>, String> = tokio::task::spawn_blocking(move || {
+        let mut st = db.lock().unwrap();
 
-            let mut v = raw;
-            v.reverse();
-            Ok(v)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("join: {}", e)));
+        let raw: Vec<HistRow> = if chat_owned.starts_with('#') {
+            let gname = chat_owned.trim_start_matches('#').to_string();
+            let rows: Vec<(i64, String, String, i64, Option<i64>, Option<String>)> = {
+                let mut stmt = st
+                    .conn
+                    .prepare(
+                        "SELECT gm.id, gm.sender_id, gm.content,
+                            strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, gm.first_read_at
+                     FROM group_messages gm
+                     JOIN groups g ON gm.group_id = g.id
+                     LEFT JOIN hidden_messages h
+                            ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
+                     WHERE g.name = ?2 AND gm.id < ?3 AND h.msg_id IS NULL
+                     ORDER BY gm.id DESC LIMIT ?4",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let iter = stmt
+                    .query_map(params![me, gname, cursor, limit], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+                let mut v = Vec::new();
+                for r in iter {
+                    v.push(r.map_err(|e| e.to_string())?);
+                }
+                v
+            };
+            let mut out = Vec::with_capacity(rows.len());
+            for (id, sender_id, content, ts, reply_id, first_read_at) in rows {
+                let sender = st.resolve_username(&sender_id);
+                let is_sender = sender_id == me;
+                let flag_me = is_sender;
+                let flag_any = first_read_at.is_some();
+                out.push((
+                    id,
+                    sender,
+                    chat_owned.clone(),
+                    content,
+                    ts,
+                    reply_id,
+                    flag_me,
+                    flag_any,
+                    None,
+                ));
+            }
+            out
+        } else if chat_owned.starts_with('&') {
+            let cname = chat_owned.trim_start_matches('&').to_string();
+            let rows: Vec<(i64, String, String, i64, Option<i64>, i64)> = {
+                let mut stmt = st
+                    .conn
+                    .prepare(
+                        "SELECT cm.id, cm.sender_id, cm.content,
+                            strftime('%s', cm.sent_at) * 1000, cm.reply_to_id,
+                            (SELECT COUNT(*) FROM channel_message_views v
+                             WHERE v.channel_msg_id = cm.id)
+                     FROM channel_messages cm
+                     JOIN channels c ON cm.channel_id = c.id
+                     LEFT JOIN hidden_messages h
+                            ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
+                     WHERE c.name = ?2 AND cm.id < ?3 AND h.msg_id IS NULL
+                     ORDER BY cm.id DESC LIMIT ?4",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let iter = stmt
+                    .query_map(params![me, cname, cursor, limit], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, Option<i64>>(4)?,
+                            row.get::<_, i64>(5).unwrap_or(0),
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+                let mut v = Vec::new();
+                for r in iter {
+                    v.push(r.map_err(|e| e.to_string())?);
+                }
+                v
+            };
+            let mut out = Vec::with_capacity(rows.len());
+            for (id, sender_id, content, ts, reply_id, views) in rows {
+                let sender = st.resolve_username(&sender_id);
+                let v = views as u32;
+                out.push((
+                    id,
+                    sender,
+                    chat_owned.clone(),
+                    content,
+                    ts,
+                    reply_id,
+                    true,
+                    v > 0,
+                    Some(v),
+                ));
+            }
+            out
+        } else {
+            let peer_id = match st.resolve_id(&chat_owned) {
+                Some(id) => id,
+                None => return Ok(Vec::new()),
+            };
+            let rows: Vec<(
+                i64,
+                String,
+                String,
+                String,
+                i64,
+                Option<i64>,
+                Option<String>,
+            )> = {
+                let mut stmt = st
+                    .conn
+                    .prepare(
+                        "SELECT m.id, m.sender_id, m.recipient_id, m.content,
+                            strftime('%s', m.sent_at) * 1000, m.reply_to_id, m.read_at
+                     FROM messages m
+                     LEFT JOIN hidden_messages h
+                            ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ?1
+                     WHERE ((m.sender_id = ?1 AND m.recipient_id = ?2) OR
+                            (m.sender_id = ?2 AND m.recipient_id = ?1))
+                       AND m.id < ?3 AND h.msg_id IS NULL
+                     ORDER BY m.id DESC LIMIT ?4",
+                    )
+                    .map_err(|e| e.to_string())?;
+                let iter = stmt
+                    .query_map(params![me, peer_id, cursor, limit], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, Option<i64>>(5)?,
+                            row.get::<_, Option<String>>(6)?,
+                        ))
+                    })
+                    .map_err(|e| e.to_string())?;
+                let mut v = Vec::new();
+                for r in iter {
+                    v.push(r.map_err(|e| e.to_string())?);
+                }
+                v
+            };
+            let mut out = Vec::with_capacity(rows.len());
+            for (id, sender_id, recipient_id, content, ts, reply_id, read_at) in rows {
+                let sender = st.resolve_username(&sender_id);
+                let recipient = st.resolve_username(&recipient_id);
+                let is_sender = sender_id == me;
+                let read_flag = read_at.is_some();
+                let flag_me = if is_sender { true } else { read_flag };
+                let flag_any = if is_sender { read_flag } else { true };
+                out.push((
+                    id, sender, recipient, content, ts, reply_id, flag_me, flag_any, None,
+                ));
+            }
+            out
+        };
+
+        let mut v = raw;
+        v.reverse();
+        Ok(v)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("join: {}", e)));
 
     let msgs = match result {
         Ok(v) => v,
@@ -1815,21 +2173,82 @@ async fn send_chat_history(
 
     let count = msgs.len();
     info!("История {}: отдано {} сообщений", chat, count);
-    for (msg_id, sender, recipient, content, ts, reply_id) in msgs {
+    for (msg_id, sender, recipient, content, ts, reply_id, flag_me, flag_any, views) in msgs {
         let _ = send_encrypted_message(
             tx,
             keys,
             &sender,
             &recipient,
             content.as_bytes(),
-            ts,
-            msg_id,
-            reply_id.unwrap_or(0),
+            MsgFields {
+                timestamp: ts,
+                msg_id,
+                reply_to_id: reply_id.unwrap_or(0),
+                flag_me,
+                flag_any,
+                views,
+            },
         )
         .await;
     }
 
     let _ = send_system_message(tx, &format!("[Система] history_done|{}|{}", chat, count)).await;
+}
+
+async fn send_messages_by_ids(
+    tx: &mpsc::UnboundedSender<Message>,
+    keys: &SessionKeys,
+    my_user_id: &str,
+    kind: u8,
+    ids: Vec<i64>,
+    state: &Arc<Mutex<AppState>>,
+) {
+    if ids.is_empty() {
+        return;
+    }
+    let requested = ids.len();
+    let db = state.lock().await.db.clone();
+    let me = my_user_id.to_string();
+
+    let result = tokio::task::spawn_blocking(move || {
+        let mut st = db.lock().unwrap();
+        AppState::get_messages_by_ids(&mut st, kind, &ids, &me)
+    })
+    .await
+    .unwrap_or_else(|e| Err(format!("join: {}", e)));
+
+    let msgs = match result {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("/getmsg ошибка: {}", e);
+            return;
+        }
+    };
+
+    debug!(
+        "/getmsg kind={} запрошено={} найдено={}",
+        kind,
+        requested,
+        msgs.len()
+    );
+    for (msg_id, sender, recipient, content, ts, reply_id, flag_me, flag_any, views) in msgs {
+        let _ = send_encrypted_message(
+            tx,
+            keys,
+            &sender,
+            &recipient,
+            content.as_bytes(),
+            MsgFields {
+                timestamp: ts,
+                msg_id,
+                reply_to_id: reply_id.unwrap_or(0),
+                flag_me,
+                flag_any,
+                views,
+            },
+        )
+        .await;
+    }
 }
 
 async fn resolve_display_name(
@@ -2314,7 +2733,6 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
     };
 
     let (mut sink, mut stream) = ws_stream.split();
-
     let (tx, mut rx) = mpsc::unbounded_channel();
     let session = Arc::new(Mutex::new(Session::new(tx.clone(), keys.clone())));
     let temp_id = Uuid::new_v4().to_string();
@@ -2324,7 +2742,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         state_guard
             .sessions
             .insert(temp_id.clone(), session.clone());
-        info!("Временная сессия создана: {}", temp_id);
+        debug!("Временная сессия создана: {}", temp_id);
     }
 
     let send_task = tokio::spawn(async move {
@@ -2353,7 +2771,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
     let auth_data = match stream.next().await {
         Some(Ok(Message::Binary(data))) => data,
         Some(Ok(_)) => {
-            error!("Ожидался бинарный пакет аутентификации, получен другой тип");
+            error!("Ожидался бинарный пакет аутентификации");
             let _ = send_task.await;
             return;
         }
@@ -2396,11 +2814,6 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
     let auth_result = match command {
         "token" => {
-            if parts.len() < 3 {
-                error!("Неверный формат token");
-                let _ = send_task.await;
-                return;
-            }
             let token = parts[1].trim();
             let device_name = if parts.len() > 3 {
                 parts[2].trim().to_string()
@@ -2512,18 +2925,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             .map_err(|e| e.to_string())?;
                         let mut rows = stmt.query([&uid]).map_err(|e| e.to_string())?;
                         if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                            let username: String = row.get(0).map_err(|e| e.to_string())?;
-                            Ok(username)
+                            Ok(row.get::<_, String>(0).map_err(|e| e.to_string())?)
                         } else {
                             Err("Пользователь не найден".to_string())
                         }
                     })
                     .await
                     .unwrap();
-                    let username = match username_from_db {
-                        Ok(uname) => uname,
-                        Err(_) => phone.clone(),
-                    };
+                    let username = username_from_db.unwrap_or_else(|_| phone.clone());
 
                     let db2 = state.lock().await.db.clone();
                     let uid2 = user_id.clone();
@@ -2759,7 +3168,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         }
     };
 
-    // ---- Загрузка истории при логине: только 5 последних на чат ----
+    // ---- Загрузка истории при логине ----
     if !my_user_id.is_empty() {
         let tx_h = tx.clone();
         let keys_h = keys.clone();
@@ -2777,7 +3186,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .unwrap();
         if let Ok(msgs) = personal {
             let count = msgs.len();
-            for (msg_id, sender_id, recipient_id, content, ts, reply_id) in msgs {
+            for (msg_id, sender_id, recipient_id, content, ts, reply_id, flag_me, flag_any) in msgs
+            {
                 let db = state_h.lock().await.db.clone();
                 let sid = sender_id.clone();
                 let rid = recipient_id.clone();
@@ -2793,9 +3203,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     &sender,
                     &recipient,
                     content.as_bytes(),
-                    ts,
-                    msg_id,
-                    reply_id.unwrap_or(0),
+                    MsgFields {
+                        timestamp: ts,
+                        msg_id,
+                        reply_to_id: reply_id.unwrap_or(0),
+                        flag_me,
+                        flag_any,
+                        views: None,
+                    },
                 )
                 .await;
             }
@@ -2813,7 +3228,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .unwrap();
         if let Ok(msgs) = groups {
             let count = msgs.len();
-            for (msg_id, gname, sender_id, content, ts, reply_id) in msgs {
+            for (msg_id, gname, sender_id, content, ts, reply_id, flag_me, flag_any) in msgs {
                 let db = state_h.lock().await.db.clone();
                 let sid = sender_id.clone();
                 let sender = tokio::task::spawn_blocking(move || {
@@ -2829,9 +3244,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     &sender,
                     &recipient,
                     content.as_bytes(),
-                    ts,
-                    msg_id,
-                    reply_id.unwrap_or(0),
+                    MsgFields {
+                        timestamp: ts,
+                        msg_id,
+                        reply_to_id: reply_id.unwrap_or(0),
+                        flag_me,
+                        flag_any,
+                        views: None,
+                    },
                 )
                 .await;
             }
@@ -2852,7 +3272,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .unwrap();
         if let Ok(msgs) = channels {
             let count = msgs.len();
-            for (msg_id, cname, sender_id, content, ts, reply_id) in msgs {
+            for (msg_id, cname, sender_id, content, ts, reply_id, flag_me, flag_any, views) in msgs
+            {
                 let db = state_h.lock().await.db.clone();
                 let sid = sender_id.clone();
                 let sender = tokio::task::spawn_blocking(move || {
@@ -2868,9 +3289,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     &sender,
                     &recipient,
                     content.as_bytes(),
-                    ts,
-                    msg_id,
-                    reply_id.unwrap_or(0),
+                    MsgFields {
+                        timestamp: ts,
+                        msg_id,
+                        reply_to_id: reply_id.unwrap_or(0),
+                        flag_me,
+                        flag_any,
+                        views: Some(views),
+                    },
                 )
                 .await;
             }
@@ -2946,7 +3372,6 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     let encrypted = &rest[offset..offset + msg_len];
                     offset += msg_len;
 
-                    // [timestamp 8][msg_id 8][reply_to_id 8?]
                     let (timestamp, _client_msg_id, reply_to_id) = if rest.len() >= offset + 24 {
                         let ts = i64::from_be_bytes(rest[offset..offset + 8].try_into().unwrap());
                         let id =
@@ -2973,7 +3398,6 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         )
                     };
 
-                    // reply_to_id == 0 → нет reply.
                     let reply_opt: Option<i64> = if reply_to_id == 0 {
                         None
                     } else {
@@ -2999,7 +3423,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         my_user_id, recipient_name, content
                     );
 
-                    // ВРЕМЕННО: команды от самого себя через MSG_TYPE_USER.
+                    // Временный канал команд через MSG_TYPE_USER.
                     if content.starts_with('/') {
                         if content.starts_with("/history") {
                             let parts: Vec<&str> = content.split_whitespace().collect();
@@ -3026,6 +3450,23 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     &state,
                                 )
                                 .await;
+                            }
+                            continue;
+                        }
+                        if content.starts_with("/getmsg") {
+                            let parts: Vec<&str> = content.split_whitespace().collect();
+                            if parts.len() < 3 {
+                                let _ = send_system_message(
+                                    &tx,
+                                    "[Система] Использование: /getmsg <kind> <id1> [<id2> ...]",
+                                )
+                                .await;
+                            } else {
+                                let kind: u8 = parts[1].parse().unwrap_or(0);
+                                let ids: Vec<i64> =
+                                    parts[2..].iter().filter_map(|s| s.parse().ok()).collect();
+                                send_messages_by_ids(&tx, &keys, &my_user_id, kind, ids, &state)
+                                    .await;
                             }
                             continue;
                         }
@@ -3088,9 +3529,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             &my_username,
                             &recipient_name,
                             &plaintext,
-                            timestamp,
-                            stored_id,
-                            reply_to_id,
+                            MsgFields {
+                                timestamp,
+                                msg_id: stored_id,
+                                reply_to_id,
+                                flag_me: true,
+                                flag_any: false,
+                                views: None,
+                            },
                         )
                         .await;
 
@@ -3119,9 +3565,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         &my_username,
                                         &recipient_name,
                                         &plaintext,
-                                        timestamp,
-                                        stored_id,
-                                        reply_to_id,
+                                        MsgFields {
+                                            timestamp,
+                                            msg_id: stored_id,
+                                            reply_to_id,
+                                            flag_me: false,
+                                            flag_any: false,
+                                            views: None,
+                                        },
                                     )
                                     .await;
                                 }
@@ -3148,7 +3599,6 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     "type": "private",
                                 });
                                 let db_clone = db_fcm.clone();
-                                debug!("{}", title);
                                 tokio::spawn(async move {
                                     send_fcm_push_and_cleanup(
                                         db_clone,
@@ -3165,7 +3615,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         continue;
                     }
 
-                    // ---- Группа (#) ----
+                    // ---- Группа ----
                     if recipient_name.starts_with('#') {
                         let group_name = recipient_name.trim_start_matches('#').to_string();
 
@@ -3177,8 +3627,8 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let mut stmt = st.conn
                                 .prepare("SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id WHERE g.name = ? AND gm.user_id = ?")
                                 .map_err(|e| format!("Ошибка запроса: {}", e))?;
-                            let mut rows = stmt.query(params![gname, uid]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
-                            Ok::<_, String>(rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?.is_some())
+                            let mut rows = stmt.query(params![gname, uid]).map_err(|e| format!("Ошибка: {}", e))?;
+                            Ok::<_, String>(rows.next().map_err(|e| format!("Ошибка: {}", e))?.is_some())
                         })
                             .await
                             .unwrap()
@@ -3229,9 +3679,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             &my_username,
                             &recip_with_hash,
                             &plaintext,
-                            timestamp,
-                            stored_id,
-                            reply_to_id,
+                            MsgFields {
+                                timestamp,
+                                msg_id: stored_id,
+                                reply_to_id,
+                                flag_me: true,
+                                flag_any: false,
+                                views: None,
+                            },
                         )
                         .await;
 
@@ -3287,9 +3742,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &my_username,
                                             &recip_with_hash,
                                             &plaintext,
-                                            timestamp,
-                                            stored_id,
-                                            reply_to_id,
+                                            MsgFields {
+                                                timestamp,
+                                                msg_id: stored_id,
+                                                reply_to_id,
+                                                flag_me: false,
+                                                flag_any: false,
+                                                views: None,
+                                            },
                                         )
                                         .await;
                                     }
@@ -3337,7 +3797,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         continue;
                     }
 
-                    // ---- Канал (&) ----
+                    // ---- Канал ----
                     if recipient_name.starts_with('&') {
                         let channel_name = recipient_name.trim_start_matches('&').to_string();
 
@@ -3348,9 +3808,9 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let st = db.lock().unwrap();
                             let mut stmt = st.conn
                                 .prepare("SELECT 1 FROM channel_subscribers cs JOIN channels c ON cs.channel_id = c.id WHERE c.name = ? AND cs.user_id = ?")
-                                .map_err(|e| format!("Ошибка запроса: {}", e))?;
-                            let mut rows = stmt.query(params![ch, uid]).map_err(|e| format!("Ошибка выполнения: {}", e))?;
-                            Ok::<_, String>(rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?.is_some())
+                                .map_err(|e| format!("Ошибка: {}", e))?;
+                            let mut rows = stmt.query(params![ch, uid]).map_err(|e| format!("Ошибка: {}", e))?;
+                            Ok::<_, String>(rows.next().map_err(|e| format!("Ошибка: {}", e))?.is_some())
                         })
                             .await
                             .unwrap()
@@ -3431,9 +3891,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             &my_username,
                             &recip_with_amp,
                             &plaintext,
-                            timestamp,
-                            stored_id,
-                            reply_to_id,
+                            MsgFields {
+                                timestamp,
+                                msg_id: stored_id,
+                                reply_to_id,
+                                flag_me: true,
+                                flag_any: false,
+                                views: Some(0),
+                            },
                         )
                         .await;
 
@@ -3489,9 +3954,14 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             &my_username,
                                             &recip_with_amp,
                                             &plaintext,
-                                            timestamp,
-                                            stored_id,
-                                            reply_to_id,
+                                            MsgFields {
+                                                timestamp,
+                                                msg_id: stored_id,
+                                                reply_to_id,
+                                                flag_me: true,
+                                                flag_any: false,
+                                                views: Some(0),
+                                            },
                                         )
                                         .await;
                                     }
@@ -3513,10 +3983,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 for fcm_tok in fcm_tokens {
                                     let title =
                                         format!("Новое сообщение в канале {}", channel_name);
-                                    let body = format!(
-                                        "{}",
-                                        content.chars().take(100).collect::<String>()
-                                    );
+                                    let body = content.chars().take(100).collect::<String>();
                                     let data_payload = json!({
                                         "sender": sender_display_name,
                                         "channel": channel_name,
@@ -3540,6 +4007,212 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     }
 
                     warn!("Неизвестный тип получателя: {}", recipient_name);
+                }
+
+                MSG_TYPE_READ => {
+                    if rest.len() < 2 {
+                        warn!("0x07: мало данных");
+                        continue;
+                    }
+                    let count = u16::from_be_bytes(rest[0..2].try_into().unwrap()) as usize;
+                    if rest.len() < 2 + count * 9 {
+                        warn!("0x07: не хватает данных");
+                        continue;
+                    }
+
+                    let mut personal_ids: Vec<i64> = Vec::new();
+                    let mut group_ids: Vec<i64> = Vec::new();
+                    let mut channel_ids: Vec<i64> = Vec::new();
+                    for i in 0..count {
+                        let off = 2 + i * 9;
+                        let kind = rest[off];
+                        let msg_id = i64::from_be_bytes(rest[off + 1..off + 9].try_into().unwrap());
+                        match kind {
+                            1 => personal_ids.push(msg_id),
+                            2 => group_ids.push(msg_id),
+                            3 => channel_ids.push(msg_id),
+                            _ => {}
+                        }
+                    }
+                    debug!(
+                        "0x07 от {}: p={}, g={}, c={}",
+                        my_username,
+                        personal_ids.len(),
+                        group_ids.len(),
+                        channel_ids.len()
+                    );
+
+                    // --- Личные ---
+                    if !personal_ids.is_empty() {
+                        let db = state.lock().await.db.clone();
+                        let me = my_user_id.clone();
+                        let ids = personal_ids.clone();
+                        let by_author = tokio::task::spawn_blocking(move || {
+                            let st = db.lock().unwrap();
+                            let mut map: HashMap<String, Vec<i64>> = HashMap::new();
+                            for msg_id in ids {
+                                let row: Option<(String, String)> = st
+                                    .conn
+                                    .query_row(
+                                        "SELECT sender_id, recipient_id FROM messages WHERE id = ?",
+                                        [msg_id],
+                                        |row| Ok((row.get(0)?, row.get(1)?)),
+                                    )
+                                    .ok();
+                                if let Some((sender_id, recipient_id)) = row {
+                                    if recipient_id == me {
+                                        let _ = st.conn.execute(
+                                            "UPDATE messages SET read_at = CURRENT_TIMESTAMP WHERE id = ? AND read_at IS NULL",
+                                            [msg_id],
+                                        );
+                                        map.entry(sender_id).or_default().push(msg_id);
+                                    }
+                                }
+                            }
+                            map
+                        })
+                            .await
+                            .unwrap();
+
+                        for (author_id, ids) in by_author {
+                            if author_id == my_user_id {
+                                continue;
+                            }
+                            let author_name = {
+                                let db = state.lock().await.db.clone();
+                                let aid = author_id.clone();
+                                tokio::task::spawn_blocking(move || {
+                                    let mut st = db.lock().unwrap();
+                                    st.resolve_username(&aid)
+                                })
+                                .await
+                                .unwrap()
+                            };
+                            let tokens = {
+                                let g = state.lock().await;
+                                g.online_users
+                                    .get(&author_name)
+                                    .cloned()
+                                    .unwrap_or_default()
+                            };
+                            let items: Vec<(u8, i64)> = ids.iter().map(|id| (1u8, *id)).collect();
+                            let pkt = build_read_packet(&items);
+                            for tok in tokens {
+                                let sess = {
+                                    let g = state.lock().await;
+                                    g.sessions.get(&tok).cloned()
+                                };
+                                if let Some(s) = sess {
+                                    let ttx = s.lock().await.tx.clone();
+                                    let _ = ttx.send(Message::Binary(pkt.clone().into()));
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Группы ---
+                    if !group_ids.is_empty() {
+                        let db = state.lock().await.db.clone();
+                        let _me = my_user_id.clone();
+                        let ids = group_ids.clone();
+                        let by_group = tokio::task::spawn_blocking(move || {
+                            let st = db.lock().unwrap();
+                            let mut map: HashMap<String, Vec<i64>> = HashMap::new();
+                            for msg_id in ids {
+                                let gid: Option<String> = st
+                                    .conn
+                                    .query_row(
+                                        "SELECT group_id FROM group_messages WHERE id = ?",
+                                        [msg_id],
+                                        |row| row.get(0),
+                                    )
+                                    .ok();
+                                if let Some(gid) = gid {
+                                    let _ = st.conn.execute(
+                                        "UPDATE group_messages SET first_read_at = CURRENT_TIMESTAMP WHERE id = ? AND first_read_at IS NULL",
+                                        [msg_id],
+                                    );
+                                    map.entry(gid).or_default().push(msg_id);
+                                }
+                            }
+                            map
+                        })
+                            .await
+                            .unwrap();
+
+                        for (group_id, ids) in by_group {
+                            let db = state.lock().await.db.clone();
+                            let gid = group_id.clone();
+                            let members = tokio::task::spawn_blocking(move || {
+                                let st = db.lock().unwrap();
+                                let mut stmt = st
+                                    .conn
+                                    .prepare("SELECT user_id FROM group_members WHERE group_id = ?")
+                                    .map_err(|e| e.to_string())?;
+                                let iter = stmt
+                                    .query_map([&gid], |row| row.get::<_, String>(0))
+                                    .map_err(|e| e.to_string())?;
+                                let mut v = Vec::new();
+                                for r in iter {
+                                    v.push(r.map_err(|e| e.to_string())?);
+                                }
+                                Ok::<_, String>(v)
+                            })
+                            .await
+                            .unwrap()
+                            .unwrap_or_default();
+
+                            let items: Vec<(u8, i64)> = ids.iter().map(|id| (2u8, *id)).collect();
+                            let pkt = build_read_packet(&items);
+
+                            for mid in members {
+                                if mid == my_user_id {
+                                    continue;
+                                }
+                                let name = {
+                                    let db = state.lock().await.db.clone();
+                                    let m = mid.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        let mut st = db.lock().unwrap();
+                                        st.resolve_username(&m)
+                                    })
+                                    .await
+                                    .unwrap()
+                                };
+                                let tokens = {
+                                    let g = state.lock().await;
+                                    g.online_users.get(&name).cloned().unwrap_or_default()
+                                };
+                                for tok in tokens {
+                                    let sess = {
+                                        let g = state.lock().await;
+                                        g.sessions.get(&tok).cloned()
+                                    };
+                                    if let Some(s) = sess {
+                                        let ttx = s.lock().await.tx.clone();
+                                        let _ = ttx.send(Message::Binary(pkt.clone().into()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Каналы ---
+                    if !channel_ids.is_empty() {
+                        let db = state.lock().await.db.clone();
+                        let me = my_user_id.clone();
+                        let ids = channel_ids.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            let st = db.lock().unwrap();
+                            for msg_id in ids {
+                                let _ = st.conn.execute(
+                                    "INSERT OR IGNORE INTO channel_message_views (channel_msg_id, user_id) VALUES (?, ?)",
+                                    params![msg_id, me],
+                                );
+                            }
+                        })
+                            .await;
+                    }
                 }
 
                 MSG_TYPE_DELETE => {
@@ -3567,7 +4240,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             )
                             .await;
                         } else {
-                            info!(
+                            debug!(
                                 "Сообщение kind={} id={} скрыто у {}",
                                 kind, msg_id, my_username
                             );
@@ -3856,6 +4529,23 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         continue;
                     }
 
+                    if cmd.starts_with("/getmsg") {
+                        let parts: Vec<&str> = cmd.split_whitespace().collect();
+                        if parts.len() < 3 {
+                            let _ = send_system_message(
+                                &tx,
+                                "[Система] Использование: /getmsg <kind> <id1> [<id2> ...]",
+                            )
+                            .await;
+                        } else {
+                            let kind: u8 = parts[1].parse().unwrap_or(0);
+                            let ids: Vec<i64> =
+                                parts[2..].iter().filter_map(|s| s.parse().ok()).collect();
+                            send_messages_by_ids(&tx, &keys, &my_user_id, kind, ids, &state).await;
+                        }
+                        continue;
+                    }
+
                     let response =
                         process_command(&cmd, &my_user_id, &my_username, &state, &session).await;
                     if !response.is_empty() {
@@ -3925,7 +4615,7 @@ async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
     let _ = send_task.await;
 }
 
-// ==================== Функция запуска сервера ====================
+// ==================== Запуск ====================
 async fn run_server(
     listener: TcpListener,
     state: Arc<Mutex<AppState>>,
@@ -3939,7 +4629,6 @@ async fn run_server(
     }
 }
 
-// ==================== Точка входа ====================
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
