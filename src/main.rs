@@ -2,6 +2,8 @@ mod app_state;
 mod client;
 mod constants;
 mod fcm;
+mod handshake; // ← новое
+mod senders; // ← новое
 
 use rusqlite::Connection;
 use std::collections::HashMap;
