@@ -2802,23 +2802,31 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                 }
 
                 MSG_TYPE_LOGOUT => {
+                    // C→S 0x06 (новый формат, все поля обязательны):
+                    //   [token_len u32 BE][token utf8][type u8][pwd_len u32 BE][pwd utf8]
+                    // type=0 → exit (pwd пустой), type=1 → delete_account (pwd обязателен).
                     if rest.len() < 4 {
                         warn!("MSG_TYPE_LOGOUT: слишком короткий пакет");
                         continue;
                     }
                     let token_len = u32::from_be_bytes(rest[0..4].try_into().unwrap()) as usize;
-                    if rest.len() < 4 + token_len {
+                    if rest.len() < 4 + token_len + 1 + 4 {
                         warn!("MSG_TYPE_LOGOUT: не хватает данных");
                         continue;
                     }
                     let token =
                         String::from_utf8(rest[4..4 + token_len].to_vec()).unwrap_or_default();
-
-                    let ltype = if rest.len() > 4 + token_len {
-                        rest[4 + token_len]
-                    } else {
-                        LOGOUT_TYPE_EXIT
-                    };
+                    let ltype = rest[4 + token_len];
+                    let pwd_off = 4 + token_len + 1;
+                    let pwd_len =
+                        u32::from_be_bytes(rest[pwd_off..pwd_off + 4].try_into().unwrap()) as usize;
+                    if rest.len() < pwd_off + 4 + pwd_len {
+                        warn!("MSG_TYPE_LOGOUT: не хватает пароля");
+                        continue;
+                    }
+                    let password =
+                        String::from_utf8(rest[pwd_off + 4..pwd_off + 4 + pwd_len].to_vec())
+                            .unwrap_or_default();
 
                     if token.is_empty() {
                         let _ = send_system_message(&tx, "[Система] Пустой токен").await;
@@ -2828,6 +2836,36 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     if ltype == LOGOUT_TYPE_DELETE_ACCOUNT {
                         info!("Logout: DELETE_ACCOUNT от user_id={}", my_user_id);
 
+                        // --- Проверка пароля ---
+                        if password.is_empty() {
+                            let _ = send_system_message(&tx, "[Система] Неверный пароль").await;
+                            continue;
+                        }
+                        let db = state.lock().await.db.clone();
+                        let uid = my_user_id.clone();
+                        let pwd = password.clone();
+                        let pwd_check = tokio::task::spawn_blocking(move || {
+                            let mut st = db.lock().unwrap();
+                            AppState::verify_password_for_user(&mut st.conn, &uid, &pwd)
+                        })
+                        .await
+                        .unwrap();
+
+                        match pwd_check {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                warn!("DELETE_ACCOUNT: неверный пароль для user_id={}", my_user_id);
+                                let _ = send_system_message(&tx, "[Система] Неверный пароль").await;
+                                continue;
+                            }
+                            Err(e) => {
+                                error!("DELETE_ACCOUNT: {}", e);
+                                let _ = send_system_message(&tx, &format!("[Система] {}", e)).await;
+                                continue;
+                            }
+                        }
+
+                        // --- Удаление аккаунта ---
                         let db = state.lock().await.db.clone();
                         let uid = my_user_id.clone();
                         let result = tokio::task::spawn_blocking(move || {
@@ -2893,7 +2931,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         continue;
                     }
 
-                    // Обычный logout.
+                    // Обычный logout (type=0).
                     info!("Logout: EXIT, token={}", token);
 
                     let db = state.lock().await.db.clone();

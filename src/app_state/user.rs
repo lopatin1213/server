@@ -775,4 +775,20 @@ impl AppState {
         }
         Ok(total)
     }
+    /// Проверить пароль пользователя по user_id (bcrypt).
+    /// Err — если юзер не найден или bcrypt сломался; Ok(false) — пароль неверный.
+    pub fn verify_password_for_user(
+        conn: &mut Connection,
+        user_id: &str,
+        password: &str,
+    ) -> Result<bool, String> {
+        let hash: String = conn
+            .query_row(
+                "SELECT password_hash FROM users WHERE id = ?",
+                [user_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Пользователь не найден".to_string())?;
+        verify(password, &hash).map_err(|e| format!("Ошибка проверки пароля: {}", e))
+    }
 }
