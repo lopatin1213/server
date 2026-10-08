@@ -21,6 +21,7 @@ pub struct MsgFields {
     pub flag_me: bool,
     pub flag_any: bool,
     pub views: Option<u32>,
+    pub edited: bool,
 }
 
 // ==================== Сессия ====================

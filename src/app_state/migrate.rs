@@ -453,6 +453,67 @@ impl AppState {
         Ok(())
     }
 
+    /// delete_at INTEGER NULL в таблицах сообщений.
+    pub fn migrate_delete_at(conn: &mut Connection) -> Result<(), String> {
+        let has_col = |conn: &Connection, table: &str, col: &str| -> Result<bool, String> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({})", table))
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            for name in rows {
+                if name.map_err(|e| e.to_string())? == col {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+
+        for table in ["messages", "group_messages", "channel_messages"] {
+            if !has_col(conn, table, "delete_at")? {
+                conn.execute(
+                    &format!("ALTER TABLE {} ADD COLUMN delete_at INTEGER", table),
+                    [],
+                )
+                .map_err(|e| format!("{}: {}", table, e))?;
+                info!("Добавлен столбец delete_at в {}", table);
+            }
+        }
+        Ok(())
+    }
+
+    /// edited BOOLEAN DEFAULT 0 в таблицах сообщений.
+    /// Используется для пометки отредактированных сообщений в UI.
+    pub fn migrate_edited(conn: &mut Connection) -> Result<(), String> {
+        let has_col = |conn: &Connection, table: &str, col: &str| -> Result<bool, String> {
+            let mut stmt = conn
+                .prepare(&format!("PRAGMA table_info({})", table))
+                .map_err(|e| e.to_string())?;
+            let rows = stmt
+                .query_map([], |row| row.get::<_, String>(1))
+                .map_err(|e| e.to_string())?;
+            for name in rows {
+                if name.map_err(|e| e.to_string())? == col {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+
+        for table in ["messages", "group_messages", "channel_messages"] {
+            if !has_col(conn, table, "edited")? {
+                conn.execute(
+                    &format!("ALTER TABLE {} ADD COLUMN edited BOOLEAN DEFAULT 0", table),
+                    [],
+                )
+                .map_err(|e| format!("{}: {}", table, e))?;
+                info!("Добавлен столбец edited в {}", table);
+            }
+        }
+        Ok(())
+    }
+
     // ---- init ----
     pub fn init_db(conn: &mut Connection) -> Result<(), String> {
         let sql = r#"
@@ -479,7 +540,8 @@ impl AppState {
                 sender_id TEXT NOT NULL,
                 recipient_id TEXT NOT NULL,
                 content TEXT NOT NULL,
-                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                edited BOOLEAN DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS groups (
                 id TEXT PRIMARY KEY,
@@ -499,7 +561,8 @@ impl AppState {
                 group_id TEXT REFERENCES groups(id) ON DELETE CASCADE,
                 sender_id TEXT NOT NULL,
                 content TEXT NOT NULL,
-                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                edited BOOLEAN DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS fcm_tokens (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -527,7 +590,8 @@ impl AppState {
                 channel_id TEXT REFERENCES channels(id) ON DELETE CASCADE,
                 sender_id TEXT NOT NULL,
                 content TEXT NOT NULL,
-                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                edited BOOLEAN DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS hidden_messages (
                 user_id TEXT NOT NULL,
@@ -546,6 +610,8 @@ impl AppState {
         Self::migrate_user_ids(conn)?;
         Self::migrate_reply_to_id(conn)?;
         Self::migrate_read_status(conn)?;
+        Self::migrate_delete_at(conn)?;
+        Self::migrate_edited(conn)?;
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id)",

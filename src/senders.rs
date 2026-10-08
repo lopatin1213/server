@@ -2,7 +2,7 @@ use aes_gcm::{
     Aes256Gcm, Key,
     aead::{Aead, AeadCore, KeyInit, OsRng},
 };
-use log::{debug, info, warn};
+use log::{info, warn};
 use rusqlite::params;
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
@@ -53,6 +53,12 @@ pub fn build_read_packet(items: &[(u8, i64)]) -> Vec<u8> {
     data
 }
 
+/// Сериализация S→C 0x01.
+/// Формат:
+///   [sender_len u32][sender][recipient_len u32][recipient]
+///   [nonce 12][enc_len u32][enc]
+///   [ts i64][msg_id i64][reply_to_id i64]
+///   [flag_me u8][flag_any u8][views u32][edited u8]
 pub async fn send_encrypted_message(
     tx: &mpsc::UnboundedSender<Message>,
     keys: &SessionKeys,
@@ -88,9 +94,9 @@ pub async fn send_encrypted_message(
     data.extend_from_slice(&fields.reply_to_id.to_be_bytes());
     data.push(if fields.flag_me { 1 } else { 0 });
     data.push(if fields.flag_any { 1 } else { 0 });
-    if let Some(v) = fields.views {
-        data.extend_from_slice(&v.to_be_bytes());
-    }
+    let views_val: u32 = fields.views.unwrap_or(0);
+    data.extend_from_slice(&views_val.to_be_bytes());
+    data.push(if fields.edited { 1 } else { 0 });
     tx.send(Message::Binary(data.into()))
         .map_err(|e| format!("send error: {}", e))
 }
@@ -160,6 +166,7 @@ pub async fn send_chat_history(
     let me = my_user_id.to_string();
     let chat_owned = chat.to_string();
 
+    // (msg_id, sender, recipient, content, ts, reply_to_id, flag_me, flag_any, views, edited)
     type HistRow = (
         i64,
         String,
@@ -170,6 +177,7 @@ pub async fn send_chat_history(
         bool,
         bool,
         Option<u32>,
+        bool,
     );
 
     let result: Result<Vec<HistRow>, String> = tokio::task::spawn_blocking(move || {
@@ -177,12 +185,13 @@ pub async fn send_chat_history(
 
         let raw: Vec<HistRow> = if chat_owned.starts_with('#') {
             let gname = chat_owned.trim_start_matches('#').to_string();
-            let rows: Vec<(i64, String, String, i64, Option<i64>, Option<String>)> = {
+            let rows: Vec<(i64, String, String, i64, Option<i64>, Option<String>, i64)> = {
                 let mut stmt = st
                     .conn
                     .prepare(
                         "SELECT gm.id, gm.sender_id, gm.content,
-                            strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, gm.first_read_at
+                            strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, gm.first_read_at,
+                            COALESCE(gm.edited, 0)
                      FROM group_messages gm
                      JOIN groups g ON gm.group_id = g.id
                      LEFT JOIN hidden_messages h
@@ -200,6 +209,7 @@ pub async fn send_chat_history(
                             row.get::<_, i64>(3)?,
                             row.get::<_, Option<i64>>(4)?,
                             row.get::<_, Option<String>>(5)?,
+                            row.get::<_, i64>(6).unwrap_or(0),
                         ))
                     })
                     .map_err(|e| e.to_string())?;
@@ -210,7 +220,7 @@ pub async fn send_chat_history(
                 v
             };
             let mut out = Vec::with_capacity(rows.len());
-            for (id, sender_id, content, ts, reply_id, first_read_at) in rows {
+            for (id, sender_id, content, ts, reply_id, first_read_at, edited) in rows {
                 let sender = st.resolve_username(&sender_id);
                 let is_sender = sender_id == me;
                 let flag_me = is_sender;
@@ -225,19 +235,21 @@ pub async fn send_chat_history(
                     flag_me,
                     flag_any,
                     None,
+                    edited != 0,
                 ));
             }
             out
         } else if chat_owned.starts_with('&') {
             let cname = chat_owned.trim_start_matches('&').to_string();
-            let rows: Vec<(i64, String, String, i64, Option<i64>, i64)> = {
+            let rows: Vec<(i64, String, String, i64, Option<i64>, i64, i64)> = {
                 let mut stmt = st
                     .conn
                     .prepare(
                         "SELECT cm.id, cm.sender_id, cm.content,
                             strftime('%s', cm.sent_at) * 1000, cm.reply_to_id,
                             (SELECT COUNT(*) FROM channel_message_views v
-                             WHERE v.channel_msg_id = cm.id)
+                             WHERE v.channel_msg_id = cm.id),
+                            COALESCE(cm.edited, 0)
                      FROM channel_messages cm
                      JOIN channels c ON cm.channel_id = c.id
                      LEFT JOIN hidden_messages h
@@ -255,6 +267,7 @@ pub async fn send_chat_history(
                             row.get::<_, i64>(3)?,
                             row.get::<_, Option<i64>>(4)?,
                             row.get::<_, i64>(5).unwrap_or(0),
+                            row.get::<_, i64>(6).unwrap_or(0),
                         ))
                     })
                     .map_err(|e| e.to_string())?;
@@ -265,7 +278,7 @@ pub async fn send_chat_history(
                 v
             };
             let mut out = Vec::with_capacity(rows.len());
-            for (id, sender_id, content, ts, reply_id, views) in rows {
+            for (id, sender_id, content, ts, reply_id, views, edited) in rows {
                 let sender = st.resolve_username(&sender_id);
                 let v = views as u32;
                 out.push((
@@ -278,6 +291,7 @@ pub async fn send_chat_history(
                     true,
                     v > 0,
                     Some(v),
+                    edited != 0,
                 ));
             }
             out
@@ -294,12 +308,14 @@ pub async fn send_chat_history(
                 i64,
                 Option<i64>,
                 Option<String>,
+                i64,
             )> = {
                 let mut stmt = st
                     .conn
                     .prepare(
                         "SELECT m.id, m.sender_id, m.recipient_id, m.content,
-                            strftime('%s', m.sent_at) * 1000, m.reply_to_id, m.read_at
+                            strftime('%s', m.sent_at) * 1000, m.reply_to_id, m.read_at,
+                            COALESCE(m.edited, 0)
                      FROM messages m
                      LEFT JOIN hidden_messages h
                             ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ?1
@@ -319,6 +335,7 @@ pub async fn send_chat_history(
                             row.get::<_, i64>(4)?,
                             row.get::<_, Option<i64>>(5)?,
                             row.get::<_, Option<String>>(6)?,
+                            row.get::<_, i64>(7).unwrap_or(0),
                         ))
                     })
                     .map_err(|e| e.to_string())?;
@@ -329,7 +346,7 @@ pub async fn send_chat_history(
                 v
             };
             let mut out = Vec::with_capacity(rows.len());
-            for (id, sender_id, recipient_id, content, ts, reply_id, read_at) in rows {
+            for (id, sender_id, recipient_id, content, ts, reply_id, read_at, edited) in rows {
                 let sender = st.resolve_username(&sender_id);
                 let recipient = st.resolve_username(&recipient_id);
                 let is_sender = sender_id == me;
@@ -337,7 +354,16 @@ pub async fn send_chat_history(
                 let flag_me = if is_sender { true } else { read_flag };
                 let flag_any = if is_sender { read_flag } else { true };
                 out.push((
-                    id, sender, recipient, content, ts, reply_id, flag_me, flag_any, None,
+                    id,
+                    sender,
+                    recipient,
+                    content,
+                    ts,
+                    reply_id,
+                    flag_me,
+                    flag_any,
+                    None,
+                    edited != 0,
                 ));
             }
             out
@@ -361,7 +387,8 @@ pub async fn send_chat_history(
 
     let count = msgs.len();
     info!("История {}: отдано {} сообщений", chat, count);
-    for (msg_id, sender, recipient, content, ts, reply_id, flag_me, flag_any, views) in msgs {
+    for (msg_id, sender, recipient, content, ts, reply_id, flag_me, flag_any, views, edited) in msgs
+    {
         let _ = send_encrypted_message(
             tx,
             keys,
@@ -375,6 +402,7 @@ pub async fn send_chat_history(
                 flag_me,
                 flag_any,
                 views,
+                edited,
             },
         )
         .await;
@@ -419,7 +447,8 @@ pub async fn send_messages_by_ids(
         requested,
         msgs.len()
     );
-    for (msg_id, sender, recipient, content, ts, reply_id, flag_me, flag_any, views) in msgs {
+    for (msg_id, sender, recipient, content, ts, reply_id, flag_me, flag_any, views, edited) in msgs
+    {
         let _ = send_encrypted_message(
             tx,
             keys,
@@ -433,6 +462,7 @@ pub async fn send_messages_by_ids(
                 flag_me,
                 flag_any,
                 views,
+                edited,
             },
         )
         .await;

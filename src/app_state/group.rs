@@ -116,12 +116,25 @@ impl AppState {
         }
     }
 
-    /// (msg_id, group_name, sender_id, content, ts, reply_to_id, flag_me, flag_any).
+    /// (msg_id, group_name, sender_id, content, ts, reply_to_id, flag_me, flag_any, edited).
     pub fn get_recent_groups(
         conn: &mut Connection,
         user_id: &str,
         per_chat: i64,
-    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>, bool, bool)>, String> {
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            bool,
+            bool,
+            bool,
+        )>,
+        String,
+    > {
         let mut stmt = conn
             .prepare(
                 "WITH ranked AS (
@@ -129,6 +142,7 @@ impl AppState {
                            gm.sender_id, gm.content,
                            strftime('%s', gm.sent_at) * 1000 AS ts,
                            gm.reply_to_id, gm.first_read_at,
+                           COALESCE(gm.edited, 0) AS edited,
                            ROW_NUMBER() OVER (
                                PARTITION BY gm.group_id ORDER BY gm.id DESC
                            ) AS rn
@@ -139,7 +153,7 @@ impl AppState {
                            ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
                     WHERE h.msg_id IS NULL
                 )
-                SELECT id, group_name, sender_id, content, ts, reply_to_id, first_read_at
+                SELECT id, group_name, sender_id, content, ts, reply_to_id, first_read_at, edited
                 FROM ranked
                 WHERE rn <= ?2
                 ORDER BY id ASC",
@@ -149,6 +163,7 @@ impl AppState {
             .query_map(params![user_id, per_chat], |row| {
                 let sender_id: String = row.get(2)?;
                 let first_read_at: Option<String> = row.get(6)?;
+                let edited: i64 = row.get(7).unwrap_or(0);
                 let is_sender = sender_id == user_id;
                 let read_flag = first_read_at.is_some();
                 let flag_me = is_sender;
@@ -162,6 +177,7 @@ impl AppState {
                     row.get::<_, Option<i64>>(5)?,
                     flag_me,
                     flag_any,
+                    edited != 0,
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -170,5 +186,33 @@ impl AppState {
             out.push(r.map_err(|e| e.to_string())?);
         }
         Ok(out)
+    }
+
+    /// Обновить текст группового сообщения и пометить edited = 1.
+    /// Возвращает Some(sender_id) если запись найдена, иначе None.
+    pub fn update_group_message_content(
+        conn: &mut Connection,
+        msg_id: i64,
+        new_text: &str,
+    ) -> Result<Option<String>, String> {
+        let sender_id: Option<String> = conn
+            .query_row(
+                "SELECT sender_id FROM group_messages WHERE id = ?",
+                [msg_id],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if sender_id.is_none() {
+            return Ok(None);
+        }
+
+        conn.execute(
+            "UPDATE group_messages SET content = ?, edited = 1 WHERE id = ?",
+            params![new_text, msg_id],
+        )
+        .map_err(|e| format!("Ошибка обновления группового сообщения: {}", e))?;
+
+        Ok(sender_id)
     }
 }

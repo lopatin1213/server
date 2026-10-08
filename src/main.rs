@@ -85,6 +85,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(unix))]
         std::future::pending::<()>().await;
     };
+    // Воркер чистки просроченных сообщений (delete_at).
+    {
+        let state_cleanup = state.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                crate::constants::PURGE_INTERVAL_SECS,
+            ));
+            loop {
+                interval.tick().await;
+                let db = state_cleanup.lock().await.db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let mut st = db.lock().unwrap();
+                    AppState::purge_expired(&mut st.conn)
+                })
+                .await;
+            }
+        });
+    }
 
     tokio::select! {
         _ = run_server(listener, state) => {},

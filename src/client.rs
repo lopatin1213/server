@@ -1,5 +1,5 @@
 use aes_gcm::{
-    Aes256Gcm, Key,
+    Key,
     aead::{Aead, KeyInit},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -474,13 +474,15 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         }
     };
 
-    let keys = match ws_handshake(&mut ws_stream).await {
+    let hs = match ws_handshake(&mut ws_stream).await {
         Ok(k) => k,
         Err(e) => {
             error!("Handshake error: {}", e);
             return;
         }
     };
+    let keys = hs.keys;
+    info!("Согласованная версия протокола: v{}", hs.agreed_version);
 
     let (mut sink, mut stream) = ws_stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
@@ -936,7 +938,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .unwrap();
         if let Ok(msgs) = personal {
             let count = msgs.len();
-            for (msg_id, sender_id, recipient_id, content, ts, reply_id, flag_me, flag_any) in msgs
+            for (
+                msg_id,
+                sender_id,
+                recipient_id,
+                content,
+                ts,
+                reply_id,
+                flag_me,
+                flag_any,
+                edited,
+            ) in msgs
             {
                 let db = state_h.lock().await.db.clone();
                 let sid = sender_id.clone();
@@ -960,6 +972,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         flag_me,
                         flag_any,
                         views: None,
+                        edited,
                     },
                 )
                 .await;
@@ -978,7 +991,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .unwrap();
         if let Ok(msgs) = groups {
             let count = msgs.len();
-            for (msg_id, gname, sender_id, content, ts, reply_id, flag_me, flag_any) in msgs {
+            for (msg_id, gname, sender_id, content, ts, reply_id, flag_me, flag_any, edited) in msgs
+            {
                 let db = state_h.lock().await.db.clone();
                 let sid = sender_id.clone();
                 let sender = tokio::task::spawn_blocking(move || {
@@ -1001,6 +1015,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         flag_me,
                         flag_any,
                         views: None,
+                        edited,
                     },
                 )
                 .await;
@@ -1022,7 +1037,18 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         .unwrap();
         if let Ok(msgs) = channels {
             let count = msgs.len();
-            for (msg_id, cname, sender_id, content, ts, reply_id, flag_me, flag_any, views) in msgs
+            for (
+                msg_id,
+                cname,
+                sender_id,
+                content,
+                ts,
+                reply_id,
+                flag_me,
+                flag_any,
+                views,
+                edited,
+            ) in msgs
             {
                 let db = state_h.lock().await.db.clone();
                 let sid = sender_id.clone();
@@ -1046,6 +1072,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         flag_me,
                         flag_any,
                         views: Some(views),
+                        edited,
                     },
                 )
                 .await;
@@ -1284,6 +1311,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 flag_me: true,
                                 flag_any: false,
                                 views: None,
+                                edited: false,
                             },
                         )
                         .await;
@@ -1320,6 +1348,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             flag_me: false,
                                             flag_any: false,
                                             views: None,
+                                            edited: false,
                                         },
                                     )
                                     .await;
@@ -1434,6 +1463,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 flag_me: true,
                                 flag_any: false,
                                 views: None,
+                                edited: false,
                             },
                         )
                         .await;
@@ -1497,6 +1527,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                                 flag_me: false,
                                                 flag_any: false,
                                                 views: None,
+                                                edited: false,
                                             },
                                         )
                                         .await;
@@ -1646,6 +1677,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 flag_me: true,
                                 flag_any: false,
                                 views: Some(0),
+                                edited: false,
                             },
                         )
                         .await;
@@ -1709,6 +1741,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                                 flag_me: true,
                                                 flag_any: false,
                                                 views: Some(0),
+                                                edited: false,
                                             },
                                         )
                                         .await;
@@ -1757,6 +1790,585 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     warn!("Неизвестный тип получателя: {}", recipient_name);
                 }
 
+                MSG_TYPE_EDIT => {
+                    // C→S 0x08:
+                    //   [msg_id i64 BE][kind u8][nonce 12][enc_len u32 BE][enc]
+                    // new_text зашифрован сессионным ключом клиента (AES-256-GCM).
+                    if rest.len() < 8 + 1 + 12 + 4 {
+                        warn!("0x08: мало данных ({} байт)", rest.len());
+                        continue;
+                    }
+                    let mut offset = 0usize;
+                    let msg_id = i64::from_be_bytes(rest[offset..offset + 8].try_into().unwrap());
+                    offset += 8;
+                    let kind = rest[offset];
+                    offset += 1;
+                    let nonce_bytes = &rest[offset..offset + 12];
+                    offset += 12;
+                    let enc_len =
+                        u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    if rest.len() < offset + enc_len {
+                        warn!(
+                            "0x08: не хватает enc ({} из {})",
+                            rest.len() - offset,
+                            enc_len
+                        );
+                        continue;
+                    }
+                    let encrypted = &rest[offset..offset + enc_len];
+
+                    let key = &keys.key;
+                    let cipher =
+                        aes_gcm::Aes256Gcm::new(Key::<aes_gcm::Aes256Gcm>::from_slice(key));
+                    let nonce_ref = aes_gcm::Nonce::from_slice(nonce_bytes);
+                    let plaintext = match cipher.decrypt(nonce_ref, encrypted) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!("0x08: ошибка расшифровки: {}", e);
+                            continue;
+                        }
+                    };
+                    let new_text = String::from_utf8_lossy(&plaintext).to_string();
+                    info!(
+                        "0x08 от {}: msg_id={}, kind={}, len={}",
+                        my_username,
+                        msg_id,
+                        kind,
+                        new_text.len()
+                    );
+
+                    match kind {
+                        MSG_KIND_PERSONAL => {
+                            let db = state.lock().await.db.clone();
+                            let new_text_clone = new_text.clone();
+                            let upd = tokio::task::spawn_blocking(move || {
+                                let mut st = db.lock().unwrap();
+                                AppState::update_personal_message_content(
+                                    &mut st.conn,
+                                    msg_id,
+                                    &new_text_clone,
+                                )
+                            })
+                            .await
+                            .unwrap();
+
+                            let (sender_id, recipient_id) = match upd {
+                                Ok(Some(v)) => v,
+                                Ok(None) => {
+                                    let _ =
+                                        send_system_message(&tx, "[Система] Сообщение не найдено")
+                                            .await;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        send_system_message(&tx, &format!("[Система] {}", e)).await;
+                                    continue;
+                                }
+                            };
+
+                            if sender_id != my_user_id {
+                                let _ = send_system_message(
+                                    &tx,
+                                    "[Система] Редактировать можно только свои сообщения",
+                                )
+                                .await;
+                                continue;
+                            }
+
+                            // Читаем ts/reply_to_id/read_at после update.
+                            let db = state.lock().await.db.clone();
+                            let mid = msg_id;
+                            let extra = tokio::task::spawn_blocking(move || {
+                                let st = db.lock().unwrap();
+                                st.conn
+                                    .query_row(
+                                        "SELECT strftime('%s', sent_at) * 1000, reply_to_id, read_at \
+                                         FROM messages WHERE id = ?",
+                                        [mid],
+                                        |row| {
+                                            Ok((
+                                                row.get::<_, i64>(0)?,
+                                                row.get::<_, Option<i64>>(1)?,
+                                                row.get::<_, Option<String>>(2)?,
+                                            ))
+                                        },
+                                    )
+                                    .ok()
+                            })
+                                .await
+                                .unwrap();
+
+                            let (ts, reply_opt, read_at) = match extra {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let reply_id = reply_opt.unwrap_or(0);
+                            let read_flag = read_at.is_some();
+
+                            // Имена для 0x01
+                            let db = state.lock().await.db.clone();
+                            let sid = sender_id.clone();
+                            let rid = recipient_id.clone();
+                            let (s_name, r_name) = tokio::task::spawn_blocking(move || {
+                                let mut st = db.lock().unwrap();
+                                (st.resolve_username(&sid), st.resolve_username(&rid))
+                            })
+                            .await
+                            .unwrap();
+
+                            // Автору — на все его сессии
+                            send_to_all_my_sessions(
+                                &state,
+                                &my_username,
+                                &r_name,
+                                new_text.as_bytes(),
+                                MsgFields {
+                                    timestamp: ts,
+                                    msg_id,
+                                    reply_to_id: reply_id,
+                                    flag_me: true,
+                                    flag_any: read_flag,
+                                    views: None,
+                                    edited: true,
+                                },
+                            )
+                            .await;
+
+                            // Получателю — если он не сам себе и не скрыл.
+                            if recipient_id != my_user_id {
+                                let db = state.lock().await.db.clone();
+                                let rid2 = recipient_id.clone();
+                                let mid2 = msg_id;
+                                let hidden = tokio::task::spawn_blocking(move || {
+                                    let st = db.lock().unwrap();
+                                    st.conn
+                                        .query_row(
+                                            "SELECT 1 FROM hidden_messages \
+                                             WHERE user_id = ? AND kind = 1 AND msg_id = ?",
+                                            params![rid2, mid2],
+                                            |_| Ok(()),
+                                        )
+                                        .is_ok()
+                                })
+                                .await
+                                .unwrap();
+
+                                if !hidden {
+                                    let tokens = {
+                                        let g = state.lock().await;
+                                        g.online_users.get(&r_name).cloned().unwrap_or_default()
+                                    };
+                                    for tok in tokens {
+                                        let sess = {
+                                            let g = state.lock().await;
+                                            g.sessions.get(&tok).cloned()
+                                        };
+                                        if let Some(s) = sess {
+                                            let (ttx, tkeys) = {
+                                                let guard = s.lock().await;
+                                                (guard.tx.clone(), guard.keys.clone())
+                                            };
+                                            let _ = send_encrypted_message(
+                                                &ttx,
+                                                &tkeys,
+                                                &s_name,
+                                                &r_name,
+                                                new_text.as_bytes(),
+                                                MsgFields {
+                                                    timestamp: ts,
+                                                    msg_id,
+                                                    reply_to_id: reply_id,
+                                                    flag_me: read_flag,
+                                                    flag_any: true,
+                                                    views: None,
+                                                    edited: true,
+                                                },
+                                            )
+                                            .await;
+                                        }
+                                    }
+                                }
+                            }
+                            info!("Личное сообщение id={} отредактировано", msg_id);
+                        }
+
+                        MSG_KIND_GROUP => {
+                            let db = state.lock().await.db.clone();
+                            let new_text_clone = new_text.clone();
+                            let upd = tokio::task::spawn_blocking(move || {
+                                let mut st = db.lock().unwrap();
+                                AppState::update_group_message_content(
+                                    &mut st.conn,
+                                    msg_id,
+                                    &new_text_clone,
+                                )
+                            })
+                            .await
+                            .unwrap();
+
+                            let sender_id = match upd {
+                                Ok(Some(v)) => v,
+                                Ok(None) => {
+                                    let _ =
+                                        send_system_message(&tx, "[Система] Сообщение не найдено")
+                                            .await;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        send_system_message(&tx, &format!("[Система] {}", e)).await;
+                                    continue;
+                                }
+                            };
+
+                            if sender_id != my_user_id {
+                                let _ = send_system_message(
+                                    &tx,
+                                    "[Система] Редактировать можно только свои сообщения",
+                                )
+                                .await;
+                                continue;
+                            }
+
+                            // Читаем ts/reply_to_id/first_read_at и group_name
+                            let db = state.lock().await.db.clone();
+                            let mid = msg_id;
+                            let extra = tokio::task::spawn_blocking(move || {
+                                let st = db.lock().unwrap();
+                                st.conn
+                                    .query_row(
+                                        "SELECT strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, \
+                                                gm.first_read_at, g.name \
+                                         FROM group_messages gm \
+                                         JOIN groups g ON gm.group_id = g.id \
+                                         WHERE gm.id = ?",
+                                        [mid],
+                                        |row| {
+                                            Ok((
+                                                row.get::<_, i64>(0)?,
+                                                row.get::<_, Option<i64>>(1)?,
+                                                row.get::<_, Option<String>>(2)?,
+                                                row.get::<_, String>(3)?,
+                                            ))
+                                        },
+                                    )
+                                    .ok()
+                            })
+                            .await
+                            .unwrap();
+
+                            let (ts, reply_opt, first_read_at, gname) = match extra {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let reply_id = reply_opt.unwrap_or(0);
+                            let flag_any = first_read_at.is_some();
+                            let recip_with_hash = format!("#{}", gname);
+
+                            // Автору — на все его сессии
+                            send_to_all_my_sessions(
+                                &state,
+                                &my_username,
+                                &recip_with_hash,
+                                new_text.as_bytes(),
+                                MsgFields {
+                                    timestamp: ts,
+                                    msg_id,
+                                    reply_to_id: reply_id,
+                                    flag_me: true,
+                                    flag_any,
+                                    views: None,
+                                    edited: true,
+                                },
+                            )
+                            .await;
+
+                            // Участникам группы
+                            let db = state.lock().await.db.clone();
+                            let gname2 = gname.clone();
+                            let members = tokio::task::spawn_blocking(move || {
+                                let mut st = db.lock().unwrap();
+                                AppState::get_group_members(&mut st.conn, &gname2)
+                            })
+                            .await
+                            .unwrap()
+                            .unwrap_or_default();
+
+                            for member_id in members {
+                                if member_id == my_user_id {
+                                    continue;
+                                }
+                                // hidden check
+                                let db = state.lock().await.db.clone();
+                                let mid_c = member_id.clone();
+                                let mid2 = msg_id;
+                                let hidden = tokio::task::spawn_blocking(move || {
+                                    let st = db.lock().unwrap();
+                                    st.conn
+                                        .query_row(
+                                            "SELECT 1 FROM hidden_messages \
+                                             WHERE user_id = ? AND kind = 2 AND msg_id = ?",
+                                            params![mid_c, mid2],
+                                            |_| Ok(()),
+                                        )
+                                        .is_ok()
+                                })
+                                .await
+                                .unwrap();
+                                if hidden {
+                                    continue;
+                                }
+
+                                let db = state.lock().await.db.clone();
+                                let mid_c = member_id.clone();
+                                let member_name_opt = tokio::task::spawn_blocking(move || {
+                                    let mut st = db.lock().unwrap();
+                                    let name = st.resolve_username(&mid_c);
+                                    if name == DELETED_LABEL {
+                                        None
+                                    } else {
+                                        Some(name)
+                                    }
+                                })
+                                .await
+                                .unwrap();
+
+                                let member_name = match member_name_opt {
+                                    Some(n) => n,
+                                    None => continue,
+                                };
+
+                                let tokens = {
+                                    let g = state.lock().await;
+                                    g.online_users
+                                        .get(&member_name)
+                                        .cloned()
+                                        .unwrap_or_default()
+                                };
+                                for tok in tokens {
+                                    let sess = {
+                                        let g = state.lock().await;
+                                        g.sessions.get(&tok).cloned()
+                                    };
+                                    if let Some(s) = sess {
+                                        let (ttx, tkeys) = {
+                                            let guard = s.lock().await;
+                                            (guard.tx.clone(), guard.keys.clone())
+                                        };
+                                        let _ = send_encrypted_message(
+                                            &ttx,
+                                            &tkeys,
+                                            &my_username,
+                                            &recip_with_hash,
+                                            new_text.as_bytes(),
+                                            MsgFields {
+                                                timestamp: ts,
+                                                msg_id,
+                                                reply_to_id: reply_id,
+                                                flag_me: false,
+                                                flag_any,
+                                                views: None,
+                                                edited: true,
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            info!("Групповое сообщение id={} отредактировано", msg_id);
+                        }
+
+                        MSG_KIND_CHANNEL => {
+                            let db = state.lock().await.db.clone();
+                            let new_text_clone = new_text.clone();
+                            let upd = tokio::task::spawn_blocking(move || {
+                                let mut st = db.lock().unwrap();
+                                AppState::update_channel_message_content(
+                                    &mut st.conn,
+                                    msg_id,
+                                    &new_text_clone,
+                                )
+                            })
+                            .await
+                            .unwrap();
+
+                            let (cname, creator_id, _sender_id) = match upd {
+                                Ok(Some(v)) => v,
+                                Ok(None) => {
+                                    let _ =
+                                        send_system_message(&tx, "[Система] Сообщение не найдено")
+                                            .await;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    let _ =
+                                        send_system_message(&tx, &format!("[Система] {}", e)).await;
+                                    continue;
+                                }
+                            };
+
+                            if creator_id != my_user_id {
+                                let _ = send_system_message(
+                                    &tx,
+                                    "[Система] Только владелец канала может редактировать сообщения",
+                                )
+                                    .await;
+                                continue;
+                            }
+
+                            // Читаем ts/reply_to_id/views после update.
+                            let db = state.lock().await.db.clone();
+                            let mid = msg_id;
+                            let extra = tokio::task::spawn_blocking(move || {
+                                let st = db.lock().unwrap();
+                                st.conn
+                                    .query_row(
+                                        "SELECT strftime('%s', cm.sent_at) * 1000, cm.reply_to_id, \
+                                                (SELECT COUNT(*) FROM channel_message_views v \
+                                                 WHERE v.channel_msg_id = cm.id) \
+                                         FROM channel_messages cm WHERE cm.id = ?",
+                                        [mid],
+                                        |row| {
+                                            Ok((
+                                                row.get::<_, i64>(0)?,
+                                                row.get::<_, Option<i64>>(1)?,
+                                                row.get::<_, i64>(2).unwrap_or(0),
+                                            ))
+                                        },
+                                    )
+                                    .ok()
+                            })
+                            .await
+                            .unwrap();
+
+                            let (ts, reply_opt, views) = match extra {
+                                Some(v) => v,
+                                None => continue,
+                            };
+                            let reply_id = reply_opt.unwrap_or(0);
+                            let views_u = views as u32;
+                            let recip_with_amp = format!("&{}", cname);
+
+                            // Владельцу — на все его сессии
+                            send_to_all_my_sessions(
+                                &state,
+                                &my_username,
+                                &recip_with_amp,
+                                new_text.as_bytes(),
+                                MsgFields {
+                                    timestamp: ts,
+                                    msg_id,
+                                    reply_to_id: reply_id,
+                                    flag_me: true,
+                                    flag_any: views_u > 0,
+                                    views: Some(views_u),
+                                    edited: true,
+                                },
+                            )
+                            .await;
+
+                            // Подписчикам
+                            let db = state.lock().await.db.clone();
+                            let cname2 = cname.clone();
+                            let subscribers = tokio::task::spawn_blocking(move || {
+                                let mut st = db.lock().unwrap();
+                                AppState::get_channel_subscribers(&mut st.conn, &cname2)
+                            })
+                            .await
+                            .unwrap()
+                            .unwrap_or_default();
+
+                            for sub_id in subscribers {
+                                if sub_id == my_user_id {
+                                    continue;
+                                }
+                                // hidden check
+                                let db = state.lock().await.db.clone();
+                                let sid_c = sub_id.clone();
+                                let mid2 = msg_id;
+                                let hidden = tokio::task::spawn_blocking(move || {
+                                    let st = db.lock().unwrap();
+                                    st.conn
+                                        .query_row(
+                                            "SELECT 1 FROM hidden_messages \
+                                             WHERE user_id = ? AND kind = 3 AND msg_id = ?",
+                                            params![sid_c, mid2],
+                                            |_| Ok(()),
+                                        )
+                                        .is_ok()
+                                })
+                                .await
+                                .unwrap();
+                                if hidden {
+                                    continue;
+                                }
+
+                                let db = state.lock().await.db.clone();
+                                let sid_c = sub_id.clone();
+                                let sub_name_opt = tokio::task::spawn_blocking(move || {
+                                    let mut st = db.lock().unwrap();
+                                    let name = st.resolve_username(&sid_c);
+                                    if name == DELETED_LABEL {
+                                        None
+                                    } else {
+                                        Some(name)
+                                    }
+                                })
+                                .await
+                                .unwrap();
+
+                                let sub_name = match sub_name_opt {
+                                    Some(n) => n,
+                                    None => continue,
+                                };
+
+                                let tokens = {
+                                    let g = state.lock().await;
+                                    g.online_users.get(&sub_name).cloned().unwrap_or_default()
+                                };
+                                for tok in tokens {
+                                    let sess = {
+                                        let g = state.lock().await;
+                                        g.sessions.get(&tok).cloned()
+                                    };
+                                    if let Some(s) = sess {
+                                        let (ttx, tkeys) = {
+                                            let guard = s.lock().await;
+                                            (guard.tx.clone(), guard.keys.clone())
+                                        };
+                                        let _ = send_encrypted_message(
+                                            &ttx,
+                                            &tkeys,
+                                            &my_username,
+                                            &recip_with_amp,
+                                            new_text.as_bytes(),
+                                            MsgFields {
+                                                timestamp: ts,
+                                                msg_id,
+                                                reply_to_id: reply_id,
+                                                flag_me: true,
+                                                flag_any: views_u > 0,
+                                                views: Some(views_u),
+                                                edited: true,
+                                            },
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                            info!("Сообщение канала {} id={} отредактировано", cname, msg_id);
+                        }
+
+                        _ => {
+                            warn!("0x08: неизвестный kind={}", kind);
+                            let _ =
+                                send_system_message(&tx, "[Система] Неизвестный kind edit").await;
+                        }
+                    }
+                }
+
                 MSG_TYPE_READ => {
                     if rest.len() < 2 {
                         warn!("0x07: мало данных");
@@ -1796,7 +2408,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let me = my_user_id.clone();
                         let ids = personal_ids.clone();
                         let by_author = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
+                            let st = db.lock().unwrap();
                             let mut map: HashMap<String, Vec<i64>> = HashMap::new();
                             for msg_id in ids {
                                 let row: Option<(String, String)> = st
@@ -1865,7 +2477,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         let me = my_user_id.clone();
                         let ids = group_ids.clone();
                         let by_group = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
+                            let st = db.lock().unwrap();
                             let mut map: HashMap<String, Vec<i64>> = HashMap::new();
                             for msg_id in ids {
                                 let gid: Option<String> = st
@@ -2201,12 +2813,88 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     }
                     let token =
                         String::from_utf8(rest[4..4 + token_len].to_vec()).unwrap_or_default();
-                    info!("Logout: token={}", token);
+
+                    let ltype = if rest.len() > 4 + token_len {
+                        rest[4 + token_len]
+                    } else {
+                        LOGOUT_TYPE_EXIT
+                    };
 
                     if token.is_empty() {
                         let _ = send_system_message(&tx, "[Система] Пустой токен").await;
                         continue;
                     }
+
+                    if ltype == LOGOUT_TYPE_DELETE_ACCOUNT {
+                        info!("Logout: DELETE_ACCOUNT от user_id={}", my_user_id);
+
+                        let db = state.lock().await.db.clone();
+                        let uid = my_user_id.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let mut st = db.lock().unwrap();
+                            AppState::soft_delete_account(&mut st, &uid)
+                        })
+                        .await
+                        .unwrap();
+
+                        let tokens_to_kill = match result {
+                            Ok(v) => v,
+                            Err(e) => {
+                                error!("Ошибка удаления аккаунта: {}", e);
+                                let _ = send_system_message(
+                                    &tx,
+                                    &format!("[Система] Ошибка удаления аккаунта: {}", e),
+                                )
+                                .await;
+                                continue;
+                            }
+                        };
+
+                        info!(
+                            "Аккаунт {} удалён, закрываю {} сессий",
+                            my_username,
+                            tokens_to_kill.len()
+                        );
+
+                        // S→C 0x06 с причиной: [0x06][reason_len u32][reason utf8]
+                        let reason = "Аккаунт удалён";
+                        let rb = reason.as_bytes();
+                        let mut pkt = Vec::with_capacity(1 + 4 + rb.len());
+                        pkt.push(MSG_TYPE_LOGOUT);
+                        pkt.extend_from_slice(&(rb.len() as u32).to_be_bytes());
+                        pkt.extend_from_slice(rb);
+
+                        for tok in &tokens_to_kill {
+                            let sess = {
+                                let g = state.lock().await;
+                                g.sessions.get(tok).cloned()
+                            };
+                            if let Some(s) = sess {
+                                let ttx = s.lock().await.tx.clone();
+                                let _ = ttx.send(Message::Binary(pkt.clone().into()));
+                            }
+                        }
+
+                        {
+                            let mut g = state.lock().await;
+                            g.online_users.remove(&my_username);
+                            for tok in &tokens_to_kill {
+                                g.sessions.remove(tok);
+                            }
+                        }
+
+                        let msg = format!("[Система] Пользователь {} удалил аккаунт", my_username);
+                        broadcast_system_message(&state, &msg, Some(&my_username)).await;
+
+                        {
+                            let mut guard = session.lock().await;
+                            guard.connected = false;
+                        }
+                        continue;
+                    }
+
+                    // Обычный logout.
+                    info!("Logout: EXIT, token={}", token);
 
                     let db = state.lock().await.db.clone();
                     let tok = token.clone();

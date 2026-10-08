@@ -300,18 +300,32 @@ impl AppState {
         Ok(conn.last_insert_rowid())
     }
 
-    /// (msg_id, sender_id, recipient_id, content, ts, reply_to_id, flag_me, flag_any).
+    /// (msg_id, sender_id, recipient_id, content, ts, reply_to_id, flag_me, flag_any, edited).
     pub fn get_recent_personal(
         conn: &mut Connection,
         user_id: &str,
         per_chat: i64,
-    ) -> Result<Vec<(i64, String, String, String, i64, Option<i64>, bool, bool)>, String> {
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            bool,
+            bool,
+            bool,
+        )>,
+        String,
+    > {
         let mut stmt = conn
             .prepare(
                 "WITH ranked AS (
                     SELECT m.id, m.sender_id, m.recipient_id, m.content,
                            strftime('%s', m.sent_at) * 1000 AS ts,
                            m.reply_to_id, m.read_at,
+                           COALESCE(m.edited, 0) AS edited,
                            ROW_NUMBER() OVER (
                                PARTITION BY CASE WHEN m.sender_id = ?1 THEN m.recipient_id
                                                  ELSE m.sender_id END
@@ -323,7 +337,7 @@ impl AppState {
                     WHERE (m.sender_id = ?1 OR m.recipient_id = ?1)
                       AND h.msg_id IS NULL
                 )
-                SELECT id, sender_id, recipient_id, content, ts, reply_to_id, read_at
+                SELECT id, sender_id, recipient_id, content, ts, reply_to_id, read_at, edited
                 FROM ranked
                 WHERE rn <= ?2
                 ORDER BY id ASC",
@@ -333,6 +347,7 @@ impl AppState {
             .query_map(params![user_id, per_chat], |row| {
                 let sender_id: String = row.get(1)?;
                 let read_at: Option<String> = row.get(6)?;
+                let edited: i64 = row.get(7).unwrap_or(0);
                 let is_sender = sender_id == user_id;
                 let read_flag = read_at.is_some();
                 let flag_me = if is_sender { true } else { read_flag };
@@ -346,6 +361,7 @@ impl AppState {
                     row.get::<_, Option<i64>>(5)?,
                     flag_me,
                     flag_any,
+                    edited != 0,
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -380,6 +396,34 @@ impl AppState {
         Ok(())
     }
 
+    /// Обновить текст личного сообщения и пометить edited = 1.
+    /// Возвращает Some((sender_id, recipient_id)) если запись найдена, иначе None.
+    pub fn update_personal_message_content(
+        conn: &mut Connection,
+        msg_id: i64,
+        new_text: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        let ids: Option<(String, String)> = conn
+            .query_row(
+                "SELECT sender_id, recipient_id FROM messages WHERE id = ?",
+                [msg_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+
+        if ids.is_none() {
+            return Ok(None);
+        }
+
+        conn.execute(
+            "UPDATE messages SET content = ?, edited = 1 WHERE id = ?",
+            params![new_text, msg_id],
+        )
+        .map_err(|e| format!("Ошибка обновления сообщения: {}", e))?;
+
+        Ok(ids)
+    }
+
     pub fn hide_message(
         conn: &mut Connection,
         user_id: &str,
@@ -395,6 +439,10 @@ impl AppState {
     }
 
     /// Точечная выборка сообщений по списку id (для /getmsg).
+    /// Кортежи:
+    ///   personal: (msg_id, sender, recipient, content, ts, reply_to_id, flag_me, flag_any, None, edited)
+    ///   group:    (msg_id, sender, recipient, content, ts, reply_to_id, flag_me, flag_any, None, edited)
+    ///   channel:  (msg_id, sender, recipient, content, ts, reply_to_id, true, v>0, Some(v), edited)
     pub fn get_messages_by_ids(
         st: &mut DbState,
         kind: u8,
@@ -411,6 +459,7 @@ impl AppState {
             bool,
             bool,
             Option<u32>,
+            bool,
         )>,
         String,
     > {
@@ -425,7 +474,8 @@ impl AppState {
             MSG_KIND_PERSONAL => {
                 let sql = format!(
                     "SELECT m.id, m.sender_id, m.recipient_id, m.content, \
-                            strftime('%s', m.sent_at) * 1000, m.reply_to_id, m.read_at \
+                            strftime('%s', m.sent_at) * 1000, m.reply_to_id, m.read_at, \
+                            COALESCE(m.edited, 0) \
                      FROM messages m \
                      LEFT JOIN hidden_messages h \
                             ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ? \
@@ -443,6 +493,7 @@ impl AppState {
                     i64,
                     Option<i64>,
                     Option<String>,
+                    i64,
                 )> = {
                     let mut stmt = st.conn.prepare(&sql).map_err(|e| e.to_string())?;
                     let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
@@ -462,6 +513,7 @@ impl AppState {
                                 row.get::<_, i64>(4)?,
                                 row.get::<_, Option<i64>>(5)?,
                                 row.get::<_, Option<String>>(6)?,
+                                row.get::<_, i64>(7).unwrap_or(0),
                             ))
                         })
                         .map_err(|e| e.to_string())?;
@@ -472,7 +524,7 @@ impl AppState {
                     v
                 };
 
-                for (id, sender_id, recipient_id, content, ts, reply_id, read_at) in raw {
+                for (id, sender_id, recipient_id, content, ts, reply_id, read_at, edited) in raw {
                     let sender = st.resolve_username(&sender_id);
                     let recipient = st.resolve_username(&recipient_id);
                     let is_sender = sender_id == user_id;
@@ -480,14 +532,24 @@ impl AppState {
                     let flag_me = if is_sender { true } else { read_flag };
                     let flag_any = if is_sender { read_flag } else { true };
                     out.push((
-                        id, sender, recipient, content, ts, reply_id, flag_me, flag_any, None,
+                        id,
+                        sender,
+                        recipient,
+                        content,
+                        ts,
+                        reply_id,
+                        flag_me,
+                        flag_any,
+                        None,
+                        edited != 0,
                     ));
                 }
             }
             MSG_KIND_GROUP => {
                 let sql = format!(
                     "SELECT gm.id, g.name, gm.sender_id, gm.content, \
-                            strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, gm.first_read_at \
+                            strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, gm.first_read_at, \
+                            COALESCE(gm.edited, 0) \
                      FROM group_messages gm \
                      JOIN groups g ON gm.group_id = g.id \
                      JOIN group_members gmem ON gmem.group_id = g.id AND gmem.user_id = ? \
@@ -505,6 +567,7 @@ impl AppState {
                     i64,
                     Option<i64>,
                     Option<String>,
+                    i64,
                 )> = {
                     let mut stmt = st.conn.prepare(&sql).map_err(|e| e.to_string())?;
                     let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
@@ -523,6 +586,7 @@ impl AppState {
                                 row.get::<_, i64>(4)?,
                                 row.get::<_, Option<i64>>(5)?,
                                 row.get::<_, Option<String>>(6)?,
+                                row.get::<_, i64>(7).unwrap_or(0),
                             ))
                         })
                         .map_err(|e| e.to_string())?;
@@ -533,14 +597,23 @@ impl AppState {
                     v
                 };
 
-                for (id, gname, sender_id, content, ts, reply_id, first_read_at) in raw {
+                for (id, gname, sender_id, content, ts, reply_id, first_read_at, edited) in raw {
                     let sender = st.resolve_username(&sender_id);
                     let recipient = format!("#{}", gname);
                     let is_sender = sender_id == user_id;
                     let flag_me = is_sender;
                     let flag_any = first_read_at.is_some();
                     out.push((
-                        id, sender, recipient, content, ts, reply_id, flag_me, flag_any, None,
+                        id,
+                        sender,
+                        recipient,
+                        content,
+                        ts,
+                        reply_id,
+                        flag_me,
+                        flag_any,
+                        None,
+                        edited != 0,
                     ));
                 }
             }
@@ -548,7 +621,8 @@ impl AppState {
                 let sql = format!(
                     "SELECT cm.id, c.name, cm.sender_id, cm.content, \
                             strftime('%s', cm.sent_at) * 1000, cm.reply_to_id, \
-                            (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id) \
+                            (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id), \
+                            COALESCE(cm.edited, 0) \
                      FROM channel_messages cm \
                      JOIN channels c ON cm.channel_id = c.id \
                      JOIN channel_subscribers cs ON cs.channel_id = c.id AND cs.user_id = ? \
@@ -558,7 +632,7 @@ impl AppState {
                     placeholders
                 );
 
-                let raw: Vec<(i64, String, String, String, i64, Option<i64>, i64)> = {
+                let raw: Vec<(i64, String, String, String, i64, Option<i64>, i64, i64)> = {
                     let mut stmt = st.conn.prepare(&sql).map_err(|e| e.to_string())?;
                     let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
                     params_vec.push(rusqlite::types::Value::Text(user_id.to_string()));
@@ -576,6 +650,7 @@ impl AppState {
                                 row.get::<_, i64>(4)?,
                                 row.get::<_, Option<i64>>(5)?,
                                 row.get::<_, i64>(6).unwrap_or(0),
+                                row.get::<_, i64>(7).unwrap_or(0),
                             ))
                         })
                         .map_err(|e| e.to_string())?;
@@ -586,7 +661,7 @@ impl AppState {
                     v
                 };
 
-                for (id, cname, sender_id, content, ts, reply_id, views) in raw {
+                for (id, cname, sender_id, content, ts, reply_id, views, edited) in raw {
                     let sender = st.resolve_username(&sender_id);
                     let recipient = format!("&{}", cname);
                     let v = views as u32;
@@ -600,6 +675,7 @@ impl AppState {
                         true,
                         v > 0,
                         Some(v),
+                        edited != 0,
                     ));
                 }
             }
@@ -607,5 +683,96 @@ impl AppState {
         }
 
         Ok(out)
+    }
+
+    /// Удаление аккаунта.
+    /// Возвращает список session_token'ов, которые надо закрыть принудительно.
+    pub fn soft_delete_account(st: &mut DbState, user_id: &str) -> Result<Vec<String>, String> {
+        let now: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs() as i64;
+        let expire = now + crate::constants::DELETE_GRACE_PERIOD_SECS;
+
+        let mut tokens: Vec<String> = Vec::new();
+        {
+            let mut stmt = st
+                .conn
+                .prepare("SELECT token FROM sessions WHERE user_id = ?")
+                .map_err(|e| e.to_string())?;
+            let iter = stmt
+                .query_map([user_id], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?;
+            for r in iter {
+                tokens.push(r.map_err(|e| e.to_string())?);
+            }
+        }
+
+        st.conn
+            .execute(
+                "UPDATE messages SET sender_id = ?1, delete_at = ?2 WHERE sender_id = ?3",
+                params![crate::constants::DELETED_LABEL, expire, user_id],
+            )
+            .map_err(|e| format!("messages sender: {}", e))?;
+        st.conn
+            .execute(
+                "UPDATE messages SET recipient_id = ?1, delete_at = ?2 WHERE recipient_id = ?3",
+                params![crate::constants::DELETED_LABEL, expire, user_id],
+            )
+            .map_err(|e| format!("messages recipient: {}", e))?;
+        st.conn
+            .execute(
+                "UPDATE group_messages SET sender_id = ?1, delete_at = ?2 WHERE sender_id = ?3",
+                params![crate::constants::DELETED_LABEL, expire, user_id],
+            )
+            .map_err(|e| format!("group_messages: {}", e))?;
+        st.conn
+            .execute(
+                "UPDATE channel_messages SET sender_id = ?1, delete_at = ?2 WHERE sender_id = ?3",
+                params![crate::constants::DELETED_LABEL, expire, user_id],
+            )
+            .map_err(|e| format!("channel_messages: {}", e))?;
+
+        st.conn
+            .execute("DELETE FROM groups WHERE creator_id = ?", [user_id])
+            .map_err(|e| format!("groups: {}", e))?;
+        st.conn
+            .execute("DELETE FROM channels WHERE creator_id = ?", [user_id])
+            .map_err(|e| format!("channels: {}", e))?;
+
+        st.conn
+            .execute("DELETE FROM users WHERE id = ?", [user_id])
+            .map_err(|e| format!("users: {}", e))?;
+
+        st.id_to_username.remove(user_id);
+        st.username_to_id.retain(|_u, id| id != user_id);
+
+        Ok(tokens)
+    }
+
+    /// Удаление просроченных сообщений (delete_at <= now).
+    pub fn purge_expired(conn: &mut Connection) -> Result<usize, String> {
+        let now: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|e| e.to_string())?
+            .as_secs() as i64;
+
+        let mut total = 0;
+        for table in ["messages", "group_messages", "channel_messages"] {
+            let n = conn
+                .execute(
+                    &format!(
+                        "DELETE FROM {} WHERE delete_at IS NOT NULL AND delete_at <= ?",
+                        table
+                    ),
+                    [now],
+                )
+                .map_err(|e| format!("{}: {}", table, e))?;
+            total += n;
+        }
+        if total > 0 {
+            info!("Purge: удалено {} старых строк", total);
+        }
+        Ok(total)
     }
 }

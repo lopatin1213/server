@@ -121,7 +121,7 @@ impl AppState {
         }
     }
 
-    /// (msg_id, channel_name, sender_id, content, ts, reply_to_id, flag_me, flag_any, views).
+    /// (msg_id, channel_name, sender_id, content, ts, reply_to_id, flag_me, flag_any, views, edited).
     pub fn get_recent_channels(
         conn: &mut Connection,
         user_id: &str,
@@ -137,6 +137,7 @@ impl AppState {
             bool,
             bool,
             u32,
+            bool,
         )>,
         String,
     > {
@@ -147,6 +148,7 @@ impl AppState {
                            cm.sender_id, cm.content,
                            strftime('%s', cm.sent_at) * 1000 AS ts,
                            cm.reply_to_id,
+                           COALESCE(cm.edited, 0) AS edited,
                            (SELECT COUNT(*) FROM channel_message_views v
                             WHERE v.channel_msg_id = cm.id) AS views,
                            ROW_NUMBER() OVER (
@@ -159,7 +161,7 @@ impl AppState {
                            ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
                     WHERE h.msg_id IS NULL
                 )
-                SELECT id, channel_name, sender_id, content, ts, reply_to_id, views
+                SELECT id, channel_name, sender_id, content, ts, reply_to_id, views, edited
                 FROM ranked
                 WHERE rn <= ?2
                 ORDER BY id ASC",
@@ -168,6 +170,7 @@ impl AppState {
         let iter = stmt
             .query_map(params![user_id, per_chat], |row| {
                 let views: i64 = row.get(6).unwrap_or(0);
+                let edited: i64 = row.get(7).unwrap_or(0);
                 let v = views as u32;
                 Ok((
                     row.get::<_, i64>(0)?,
@@ -179,6 +182,7 @@ impl AppState {
                     true,
                     v > 0,
                     v,
+                    edited != 0,
                 ))
             })
             .map_err(|e| e.to_string())?;
@@ -216,5 +220,35 @@ impl AppState {
         conn.execute("DELETE FROM channel_messages WHERE id = ?", [msg_id])
             .map_err(|e| format!("Ошибка удаления: {}", e))?;
         Ok(())
+    }
+
+    /// Обновить текст сообщения канала и пометить edited = 1.
+    /// Возвращает Some((channel_name, creator_id, sender_id)) если запись найдена, иначе None.
+    pub fn update_channel_message_content(
+        conn: &mut Connection,
+        msg_id: i64,
+        new_text: &str,
+    ) -> Result<Option<(String, String, String)>, String> {
+        let meta: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT c.name, c.creator_id, cm.sender_id \
+                 FROM channel_messages cm JOIN channels c ON cm.channel_id = c.id \
+                 WHERE cm.id = ?",
+                [msg_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+
+        if meta.is_none() {
+            return Ok(None);
+        }
+
+        conn.execute(
+            "UPDATE channel_messages SET content = ?, edited = 1 WHERE id = ?",
+            params![new_text, msg_id],
+        )
+        .map_err(|e| format!("Ошибка обновления сообщения канала: {}", e))?;
+
+        Ok(meta)
     }
 }
