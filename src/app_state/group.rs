@@ -67,6 +67,33 @@ impl AppState {
         }
     }
 
+    /// Полное удаление группы (только владелец).
+    /// Возвращает true, если удалено, false если нет прав.
+    pub fn delete_group(
+        conn: &mut Connection,
+        group_name: &str,
+        user_id: &str,
+    ) -> Result<bool, String> {
+        let mut stmt = conn
+            .prepare("SELECT creator_id FROM groups WHERE name = ?")
+            .map_err(|e| format!("Ошибка запроса группы: {}", e))?;
+        let mut rows = stmt
+            .query([group_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
+
+        if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
+            let creator_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
+            if creator_id != user_id {
+                return Ok(false); // Не владелец
+            }
+            conn.execute("DELETE FROM groups WHERE name = ?", [group_name])
+                .map_err(|e| format!("Ошибка удаления группы: {}", e))?;
+            Ok(true)
+        } else {
+            Err("Группа не найдена".to_string())
+        }
+    }
+
     pub fn get_group_members(
         conn: &mut Connection,
         group_name: &str,
@@ -116,7 +143,6 @@ impl AppState {
         }
     }
 
-    /// (msg_id, group_name, sender_id, content, ts, reply_to_id, flag_me, flag_any, edited).
     pub fn get_recent_groups(
         conn: &mut Connection,
         user_id: &str,
@@ -188,8 +214,6 @@ impl AppState {
         Ok(out)
     }
 
-    /// Обновить текст группового сообщения и пометить edited = 1.
-    /// Возвращает Some(sender_id) если запись найдена, иначе None.
     pub fn update_group_message_content(
         conn: &mut Connection,
         msg_id: i64,

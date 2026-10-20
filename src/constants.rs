@@ -1,8 +1,8 @@
 use std::time::Duration as StdDuration;
 
 // ==================== Версия протокола ====================
-pub const MIN_PROTO_VERSION: u16 = 1;
-pub const CURRENT_PROTO_VERSION: u16 = 2;
+pub const MIN_PROTO_VERSION: u16 = 3;
+pub const CURRENT_PROTO_VERSION: u16 = 3;
 
 pub const HANDSHAKE_OK: u8 = 0x00;
 pub const HANDSHAKE_REJECT: u8 = 0xFF;

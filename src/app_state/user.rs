@@ -117,12 +117,42 @@ impl AppState {
         token: &str,
         device_name: &str,
     ) -> Result<(), String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Ok(());
+        }
+
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT user_id FROM fcm_tokens WHERE token = ?",
+                [token],
+                |row| row.get(0),
+            )
+            .ok();
+
+        if existing.as_deref() == Some(user_id) {
+            // Токен уже наш — обновляем только привязку к сессии
+            conn.execute(
+                "UPDATE fcm_tokens SET session_token = ?, device_name = ? WHERE token = ?",
+                params![session_token, device_name, token],
+            )
+            .map_err(|e| format!("Ошибка обновления FCM-токена: {}", e))?;
+            return Ok(());
+        }
+
+        // Токен новый или принадлежит другому юзеру
         conn.execute("DELETE FROM fcm_tokens WHERE token = ?", params![token])
             .map_err(|e| format!("Ошибка очистки старого FCM-токена: {}", e))?;
+        let dev = if device_name.is_empty() {
+            "unknown"
+        } else {
+            device_name
+        };
         conn.execute(
             "INSERT INTO fcm_tokens (user_id, session_token, token, device_name) VALUES (?, ?, ?, ?)",
-            params![user_id, session_token, token, device_name],
-        ).map_err(|e| format!("Ошибка сохранения FCM-токена: {}", e))?;
+            params![user_id, session_token, token, dev],
+        )
+            .map_err(|e| format!("Ошибка сохранения FCM-токена: {}", e))?;
         Ok(())
     }
 
@@ -282,6 +312,21 @@ impl AppState {
         .map_err(|e| e.to_string())
     }
 
+    pub fn verify_password_for_user(
+        conn: &mut Connection,
+        user_id: &str,
+        password: &str,
+    ) -> Result<bool, String> {
+        let hash: String = conn
+            .query_row(
+                "SELECT password_hash FROM users WHERE id = ?",
+                [user_id],
+                |row| row.get(0),
+            )
+            .map_err(|_| "Пользователь не найден".to_string())?;
+        verify(password, &hash).map_err(|e| format!("Ошибка проверки пароля: {}", e))
+    }
+
     // ---- Личные сообщения ----
     pub fn store_message(
         conn: &mut Connection,
@@ -300,7 +345,6 @@ impl AppState {
         Ok(conn.last_insert_rowid())
     }
 
-    /// (msg_id, sender_id, recipient_id, content, ts, reply_to_id, flag_me, flag_any, edited).
     pub fn get_recent_personal(
         conn: &mut Connection,
         user_id: &str,
@@ -396,8 +440,35 @@ impl AppState {
         Ok(())
     }
 
-    /// Обновить текст личного сообщения и пометить edited = 1.
-    /// Возвращает Some((sender_id, recipient_id)) если запись найдена, иначе None.
+    /// Удаление всей истории личного чата (у обоих).
+    pub fn delete_personal_chat(
+        conn: &mut Connection,
+        user_id1: &str,
+        user_id2: &str,
+    ) -> Result<(), String> {
+        conn.execute(
+            "DELETE FROM messages WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)",
+            params![user_id1, user_id2, user_id2, user_id1],
+        ).map_err(|e| format!("Ошибка удаления личного чата: {}", e))?;
+        Ok(())
+    }
+
+    /// Скрыть всю историю личного чата (только у себя).
+    pub fn hide_personal_chat(
+        conn: &mut Connection,
+        user_id: &str,
+        peer_id: &str,
+    ) -> Result<(), String> {
+        conn.execute(
+            "INSERT OR IGNORE INTO hidden_messages (user_id, kind, msg_id) \
+             SELECT ?, 1, id FROM messages \
+             WHERE (sender_id = ? AND recipient_id = ?) OR (sender_id = ? AND recipient_id = ?)",
+            params![user_id, user_id, peer_id, peer_id, user_id],
+        )
+        .map_err(|e| format!("Ошибка скрытия личного чата: {}", e))?;
+        Ok(())
+    }
+
     pub fn update_personal_message_content(
         conn: &mut Connection,
         msg_id: i64,
@@ -438,11 +509,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Точечная выборка сообщений по списку id (для /getmsg).
-    /// Кортежи:
-    ///   personal: (msg_id, sender, recipient, content, ts, reply_to_id, flag_me, flag_any, None, edited)
-    ///   group:    (msg_id, sender, recipient, content, ts, reply_to_id, flag_me, flag_any, None, edited)
-    ///   channel:  (msg_id, sender, recipient, content, ts, reply_to_id, true, v>0, Some(v), edited)
     pub fn get_messages_by_ids(
         st: &mut DbState,
         kind: u8,
@@ -601,8 +667,6 @@ impl AppState {
                     let sender = st.resolve_username(&sender_id);
                     let recipient = format!("#{}", gname);
                     let is_sender = sender_id == user_id;
-                    let flag_me = is_sender;
-                    let flag_any = first_read_at.is_some();
                     out.push((
                         id,
                         sender,
@@ -610,8 +674,8 @@ impl AppState {
                         content,
                         ts,
                         reply_id,
-                        flag_me,
-                        flag_any,
+                        is_sender,
+                        first_read_at.is_some(),
                         None,
                         edited != 0,
                     ));
@@ -685,8 +749,6 @@ impl AppState {
         Ok(out)
     }
 
-    /// Удаление аккаунта.
-    /// Возвращает список session_token'ов, которые надо закрыть принудительно.
     pub fn soft_delete_account(st: &mut DbState, user_id: &str) -> Result<Vec<String>, String> {
         let now: i64 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -732,14 +794,12 @@ impl AppState {
                 params![crate::constants::DELETED_LABEL, expire, user_id],
             )
             .map_err(|e| format!("channel_messages: {}", e))?;
-
         st.conn
             .execute("DELETE FROM groups WHERE creator_id = ?", [user_id])
             .map_err(|e| format!("groups: {}", e))?;
         st.conn
             .execute("DELETE FROM channels WHERE creator_id = ?", [user_id])
             .map_err(|e| format!("channels: {}", e))?;
-
         st.conn
             .execute("DELETE FROM users WHERE id = ?", [user_id])
             .map_err(|e| format!("users: {}", e))?;
@@ -750,13 +810,11 @@ impl AppState {
         Ok(tokens)
     }
 
-    /// Удаление просроченных сообщений (delete_at <= now).
     pub fn purge_expired(conn: &mut Connection) -> Result<usize, String> {
         let now: i64 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_secs() as i64;
-
         let mut total = 0;
         for table in ["messages", "group_messages", "channel_messages"] {
             let n = conn
@@ -774,21 +832,5 @@ impl AppState {
             info!("Purge: удалено {} старых строк", total);
         }
         Ok(total)
-    }
-    /// Проверить пароль пользователя по user_id (bcrypt).
-    /// Err — если юзер не найден или bcrypt сломался; Ok(false) — пароль неверный.
-    pub fn verify_password_for_user(
-        conn: &mut Connection,
-        user_id: &str,
-        password: &str,
-    ) -> Result<bool, String> {
-        let hash: String = conn
-            .query_row(
-                "SELECT password_hash FROM users WHERE id = ?",
-                [user_id],
-                |row| row.get(0),
-            )
-            .map_err(|_| "Пользователь не найден".to_string())?;
-        verify(password, &hash).map_err(|e| format!("Ошибка проверки пароля: {}", e))
     }
 }

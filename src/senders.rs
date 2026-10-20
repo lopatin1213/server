@@ -41,6 +41,21 @@ pub fn build_delete_packet(msg_id: i64, kind: u8, dtype: u8) -> Vec<u8> {
     }
 }
 
+/// C→S и S→C 0x05 (удаление целого чата/группы/канала):
+/// [0x05][0 i64 BE][kind u8][type u8][name_len u32 BE][name utf8]
+pub fn build_delete_chat_packet(kind: u8, name: &str, dtype: u8) -> Vec<u8> {
+    let name_bytes = name.as_bytes();
+    let total_len = 1 + 8 + 1 + 1 + 4 + name_bytes.len();
+    let mut data = Vec::with_capacity(total_len);
+    data.push(MSG_TYPE_DELETE);
+    data.extend_from_slice(&0i64.to_be_bytes()); // msg_id = 0
+    data.push(kind);
+    data.push(dtype);
+    data.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
+    data.extend_from_slice(name_bytes);
+    data
+}
+
 pub fn build_read_packet(items: &[(u8, i64)]) -> Vec<u8> {
     let mut data = Vec::with_capacity(3 + items.len() * 9);
     data.push(MSG_TYPE_READ);
@@ -53,12 +68,6 @@ pub fn build_read_packet(items: &[(u8, i64)]) -> Vec<u8> {
     data
 }
 
-/// Сериализация S→C 0x01.
-/// Формат:
-///   [sender_len u32][sender][recipient_len u32][recipient]
-///   [nonce 12][enc_len u32][enc]
-///   [ts i64][msg_id i64][reply_to_id i64]
-///   [flag_me u8][flag_any u8][views u32][edited u8]
 pub async fn send_encrypted_message(
     tx: &mpsc::UnboundedSender<Message>,
     keys: &SessionKeys,
@@ -66,6 +75,7 @@ pub async fn send_encrypted_message(
     recipient_name: &str,
     plaintext: &[u8],
     fields: MsgFields,
+    client_msg_id: Option<i64>, // <--- ДОБАВЛЕНО
 ) -> Result<(), String> {
     if plaintext.len() > MAX_MESSAGE_SIZE {
         return Err("Message too large".to_string());
@@ -97,17 +107,20 @@ pub async fn send_encrypted_message(
     let views_val: u32 = fields.views.unwrap_or(0);
     data.extend_from_slice(&views_val.to_be_bytes());
     data.push(if fields.edited { 1 } else { 0 });
+
+    // ДОБАВЛЕНО: Сериализация client_msg_id (0, если это не ACK)
+    data.extend_from_slice(&client_msg_id.unwrap_or(0).to_be_bytes());
+
     tx.send(Message::Binary(data.into()))
         .map_err(|e| format!("send error: {}", e))
 }
-
-/// Разослать сообщение всем активным сессиям пользователя [my_username].
 pub async fn send_to_all_my_sessions(
     state: &Arc<Mutex<AppState>>,
     my_username: &str,
     recipient_name: &str,
     plaintext: &[u8],
     fields: MsgFields,
+    client_msg_id: Option<i64>, // <--- ДОБАВЛЕНО
 ) {
     let tokens = {
         let g = state.lock().await;
@@ -123,9 +136,34 @@ pub async fn send_to_all_my_sessions(
                 let guard = s.lock().await;
                 (guard.tx.clone(), guard.keys.clone())
             };
-            let _ =
-                send_encrypted_message(&tx, &keys, my_username, recipient_name, plaintext, fields)
-                    .await;
+            let _ = send_encrypted_message(
+                &tx,
+                &keys,
+                my_username,
+                recipient_name,
+                plaintext,
+                fields,
+                client_msg_id,
+            )
+            .await;
+        }
+    }
+}
+
+/// Разослать сырой пакет (например, 0x05 при удалении) всем активным сессиям пользователя.
+pub async fn send_to_user_sessions(state: &Arc<Mutex<AppState>>, username: &str, packet: Vec<u8>) {
+    let tokens = {
+        let g = state.lock().await;
+        g.online_users.get(username).cloned().unwrap_or_default()
+    };
+    for tok in tokens {
+        let sess = {
+            let g = state.lock().await;
+            g.sessions.get(&tok).cloned()
+        };
+        if let Some(s) = sess {
+            let tx = s.lock().await.tx.clone();
+            let _ = tx.send(Message::Binary(packet.clone().into()));
         }
     }
 }
@@ -166,7 +204,6 @@ pub async fn send_chat_history(
     let me = my_user_id.to_string();
     let chat_owned = chat.to_string();
 
-    // (msg_id, sender, recipient, content, ts, reply_to_id, flag_me, flag_any, views, edited)
     type HistRow = (
         i64,
         String,
@@ -186,113 +223,56 @@ pub async fn send_chat_history(
         let raw: Vec<HistRow> = if chat_owned.starts_with('#') {
             let gname = chat_owned.trim_start_matches('#').to_string();
             let rows: Vec<(i64, String, String, i64, Option<i64>, Option<String>, i64)> = {
-                let mut stmt = st
-                    .conn
-                    .prepare(
-                        "SELECT gm.id, gm.sender_id, gm.content,
+                let mut stmt = st.conn.prepare(
+                    "SELECT gm.id, gm.sender_id, gm.content,
                             strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, gm.first_read_at,
                             COALESCE(gm.edited, 0)
                      FROM group_messages gm
                      JOIN groups g ON gm.group_id = g.id
-                     LEFT JOIN hidden_messages h
-                            ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
+                     LEFT JOIN hidden_messages h ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
                      WHERE g.name = ?2 AND gm.id < ?3 AND h.msg_id IS NULL
                      ORDER BY gm.id DESC LIMIT ?4",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let iter = stmt
-                    .query_map(params![me, gname, cursor, limit], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, Option<i64>>(4)?,
-                            row.get::<_, Option<String>>(5)?,
-                            row.get::<_, i64>(6).unwrap_or(0),
-                        ))
-                    })
-                    .map_err(|e| e.to_string())?;
+                ).map_err(|e| e.to_string())?;
+                let iter = stmt.query_map(params![me, gname, cursor, limit], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, i64>(6).unwrap_or(0)))
+                }).map_err(|e| e.to_string())?;
                 let mut v = Vec::new();
-                for r in iter {
-                    v.push(r.map_err(|e| e.to_string())?);
-                }
+                for r in iter { v.push(r.map_err(|e| e.to_string())?); }
                 v
             };
             let mut out = Vec::with_capacity(rows.len());
             for (id, sender_id, content, ts, reply_id, first_read_at, edited) in rows {
                 let sender = st.resolve_username(&sender_id);
                 let is_sender = sender_id == me;
-                let flag_me = is_sender;
-                let flag_any = first_read_at.is_some();
-                out.push((
-                    id,
-                    sender,
-                    chat_owned.clone(),
-                    content,
-                    ts,
-                    reply_id,
-                    flag_me,
-                    flag_any,
-                    None,
-                    edited != 0,
-                ));
+                out.push((id, sender, chat_owned.clone(), content, ts, reply_id, is_sender, first_read_at.is_some(), None, edited != 0));
             }
             out
         } else if chat_owned.starts_with('&') {
             let cname = chat_owned.trim_start_matches('&').to_string();
             let rows: Vec<(i64, String, String, i64, Option<i64>, i64, i64)> = {
-                let mut stmt = st
-                    .conn
-                    .prepare(
-                        "SELECT cm.id, cm.sender_id, cm.content,
+                let mut stmt = st.conn.prepare(
+                    "SELECT cm.id, cm.sender_id, cm.content,
                             strftime('%s', cm.sent_at) * 1000, cm.reply_to_id,
-                            (SELECT COUNT(*) FROM channel_message_views v
-                             WHERE v.channel_msg_id = cm.id),
+                            (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id),
                             COALESCE(cm.edited, 0)
                      FROM channel_messages cm
                      JOIN channels c ON cm.channel_id = c.id
-                     LEFT JOIN hidden_messages h
-                            ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
+                     LEFT JOIN hidden_messages h ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
                      WHERE c.name = ?2 AND cm.id < ?3 AND h.msg_id IS NULL
                      ORDER BY cm.id DESC LIMIT ?4",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let iter = stmt
-                    .query_map(params![me, cname, cursor, limit], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
-                            row.get::<_, Option<i64>>(4)?,
-                            row.get::<_, i64>(5).unwrap_or(0),
-                            row.get::<_, i64>(6).unwrap_or(0),
-                        ))
-                    })
-                    .map_err(|e| e.to_string())?;
+                ).map_err(|e| e.to_string())?;
+                let iter = stmt.query_map(params![me, cname, cursor, limit], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, i64>(5).unwrap_or(0), row.get::<_, i64>(6).unwrap_or(0)))
+                }).map_err(|e| e.to_string())?;
                 let mut v = Vec::new();
-                for r in iter {
-                    v.push(r.map_err(|e| e.to_string())?);
-                }
+                for r in iter { v.push(r.map_err(|e| e.to_string())?); }
                 v
             };
             let mut out = Vec::with_capacity(rows.len());
             for (id, sender_id, content, ts, reply_id, views, edited) in rows {
                 let sender = st.resolve_username(&sender_id);
                 let v = views as u32;
-                out.push((
-                    id,
-                    sender,
-                    chat_owned.clone(),
-                    content,
-                    ts,
-                    reply_id,
-                    true,
-                    v > 0,
-                    Some(v),
-                    edited != 0,
-                ));
+                out.push((id, sender, chat_owned.clone(), content, ts, reply_id, true, v > 0, Some(v), edited != 0));
             }
             out
         } else {
@@ -300,49 +280,22 @@ pub async fn send_chat_history(
                 Some(id) => id,
                 None => return Ok(Vec::new()),
             };
-            let rows: Vec<(
-                i64,
-                String,
-                String,
-                String,
-                i64,
-                Option<i64>,
-                Option<String>,
-                i64,
-            )> = {
-                let mut stmt = st
-                    .conn
-                    .prepare(
-                        "SELECT m.id, m.sender_id, m.recipient_id, m.content,
+            let rows: Vec<(i64, String, String, String, i64, Option<i64>, Option<String>, i64)> = {
+                let mut stmt = st.conn.prepare(
+                    "SELECT m.id, m.sender_id, m.recipient_id, m.content,
                             strftime('%s', m.sent_at) * 1000, m.reply_to_id, m.read_at,
                             COALESCE(m.edited, 0)
                      FROM messages m
-                     LEFT JOIN hidden_messages h
-                            ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ?1
-                     WHERE ((m.sender_id = ?1 AND m.recipient_id = ?2) OR
-                            (m.sender_id = ?2 AND m.recipient_id = ?1))
+                     LEFT JOIN hidden_messages h ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ?1
+                     WHERE ((m.sender_id = ?1 AND m.recipient_id = ?2) OR (m.sender_id = ?2 AND m.recipient_id = ?1))
                        AND m.id < ?3 AND h.msg_id IS NULL
                      ORDER BY m.id DESC LIMIT ?4",
-                    )
-                    .map_err(|e| e.to_string())?;
-                let iter = stmt
-                    .query_map(params![me, peer_id, cursor, limit], |row| {
-                        Ok((
-                            row.get::<_, i64>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, i64>(4)?,
-                            row.get::<_, Option<i64>>(5)?,
-                            row.get::<_, Option<String>>(6)?,
-                            row.get::<_, i64>(7).unwrap_or(0),
-                        ))
-                    })
-                    .map_err(|e| e.to_string())?;
+                ).map_err(|e| e.to_string())?;
+                let iter = stmt.query_map(params![me, peer_id, cursor, limit], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, i64>(7).unwrap_or(0)))
+                }).map_err(|e| e.to_string())?;
                 let mut v = Vec::new();
-                for r in iter {
-                    v.push(r.map_err(|e| e.to_string())?);
-                }
+                for r in iter { v.push(r.map_err(|e| e.to_string())?); }
                 v
             };
             let mut out = Vec::with_capacity(rows.len());
@@ -353,18 +306,7 @@ pub async fn send_chat_history(
                 let read_flag = read_at.is_some();
                 let flag_me = if is_sender { true } else { read_flag };
                 let flag_any = if is_sender { read_flag } else { true };
-                out.push((
-                    id,
-                    sender,
-                    recipient,
-                    content,
-                    ts,
-                    reply_id,
-                    flag_me,
-                    flag_any,
-                    None,
-                    edited != 0,
-                ));
+                out.push((id, sender, recipient, content, ts, reply_id, flag_me, flag_any, None, edited != 0));
             }
             out
         };
@@ -373,8 +315,8 @@ pub async fn send_chat_history(
         v.reverse();
         Ok(v)
     })
-    .await
-    .unwrap_or_else(|e| Err(format!("join: {}", e)));
+        .await
+        .unwrap_or_else(|e| Err(format!("join: {}", e)));
 
     let msgs = match result {
         Ok(v) => v,
@@ -404,6 +346,7 @@ pub async fn send_chat_history(
                 views,
                 edited,
             },
+            None, // <--- ДОБАВИТЬ СЮДА
         )
         .await;
     }
@@ -464,6 +407,7 @@ pub async fn send_messages_by_ids(
                 views,
                 edited,
             },
+            None, // <--- ДОБАВИТЬ СЮДА
         )
         .await;
     }

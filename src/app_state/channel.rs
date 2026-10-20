@@ -72,6 +72,33 @@ impl AppState {
         }
     }
 
+    /// Полное удаление канала (только владелец).
+    /// Возвращает true, если удалено, false если нет прав.
+    pub fn delete_channel(
+        conn: &mut Connection,
+        channel_name: &str,
+        user_id: &str,
+    ) -> Result<bool, String> {
+        let mut stmt = conn
+            .prepare("SELECT creator_id FROM channels WHERE name = ?")
+            .map_err(|e| format!("Ошибка запроса канала: {}", e))?;
+        let mut rows = stmt
+            .query([channel_name])
+            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
+
+        if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
+            let creator_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
+            if creator_id != user_id {
+                return Ok(false); // Не владелец
+            }
+            conn.execute("DELETE FROM channels WHERE name = ?", [channel_name])
+                .map_err(|e| format!("Ошибка удаления канала: {}", e))?;
+            Ok(true)
+        } else {
+            Err("Канал не найден".to_string())
+        }
+    }
+
     pub fn get_channel_subscribers(
         conn: &mut Connection,
         channel_name: &str,
@@ -121,7 +148,6 @@ impl AppState {
         }
     }
 
-    /// (msg_id, channel_name, sender_id, content, ts, reply_to_id, flag_me, flag_any, views, edited).
     pub fn get_recent_channels(
         conn: &mut Connection,
         user_id: &str,
@@ -222,8 +248,6 @@ impl AppState {
         Ok(())
     }
 
-    /// Обновить текст сообщения канала и пометить edited = 1.
-    /// Возвращает Some((channel_name, creator_id, sender_id)) если запись найдена, иначе None.
     pub fn update_channel_message_content(
         conn: &mut Connection,
         msg_id: i64,
