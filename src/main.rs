@@ -49,9 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if fk_enabled != 1 {
         eprintln!("ВНИМАНИЕ: foreign_keys не включены!");
     }
-    if let Err(e) = conn.execute_batch("VACUUM") {
-    log::warn!("VACUUM не удался, продолжаем работу: {}", e);
-}
+    
 
     AppState::init_db(&mut conn)?;
 
