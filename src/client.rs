@@ -579,359 +579,271 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
     }
 
     let command = parts[0];
-    let phone = parts[1].trim().to_string();
-    let password = parts[2].trim().to_string();
 
-    let fcm_token = if parts.len() > 4 {
-        Some(parts[parts.len() - 1].trim().to_string())
-    } else {
-        None
-    };
+let auth_result = match command {
+    "token" => {
+        // Формат: token|<token>|device|fcm
+        let token = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let device_name = parts.get(2).map(|s| s.trim()).unwrap_or("unknown");
+        let fcm_token = parts.get(3)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
 
-    let auth_result = match command {
-        "token" => {
-            let token = parts[1].trim();
-            let device_name = if parts.len() > 3 {
-                parts[2].trim().to_string()
-            } else {
-                "unknown".to_string()
-            };
+        let db = state.lock().await.db.clone();
+        let token_str = token.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut st = db.lock().unwrap();
+            AppState::check_session(&mut st.conn, &token_str)
+        })
+        .await
+        .unwrap();
 
-            let db = state.lock().await.db.clone();
-            let token_str = token.to_string();
-            let result = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                AppState::check_session(&mut st.conn, &token_str)
-            })
-            .await
-            .unwrap();
+        match result {
+            Ok((user_id, username)) => {
+                let msg = format!("Успех|{}|{}|{}", user_id, token, username);
+                let _ = send_system_message(&tx, &msg).await;
 
-            match result {
-                Ok((user_id, username)) => {
-                    let msg = format!("Успех|{}|{}|{}", user_id, token, username);
-                    let _ = send_system_message(&tx, &msg).await;
-
-                    if let Some(fcm) = fcm_token {
-                        let db = state.lock().await.db.clone();
-                        let uid = user_id.clone();
-                        let session_tok = token.to_string();
-                        let fcm_tok = fcm.clone();
-                        let dev = device_name.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            let _ = AppState::save_fcm_token(
-                                &mut st.conn,
-                                &uid,
-                                &session_tok,
-                                &fcm_tok,
-                                &dev,
-                            );
-                        })
-                        .await
-                        .unwrap();
-                    }
-
-                    {
-                        let mut guard = session.lock().await;
-                        guard.user_id = Some(user_id.clone());
-                        guard.username = Some(username.clone());
-                        guard.token = Some(token.to_string());
-                    }
-                    {
-                        let mut state_guard = state.lock().await;
-                        state_guard.sessions.remove(&temp_id);
-                        state_guard
-                            .sessions
-                            .insert(token.to_string(), session.clone());
-                        state_guard
-                            .online_users
-                            .entry(username.clone())
-                            .or_insert_with(Vec::new)
-                            .push(token.to_string());
-                    }
-                    {
-                        let db_ls = state.lock().await.db.clone();
-                        let uid_ls = user_id.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let mut st = db_ls.lock().unwrap();
-                            let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
-                        })
-                        .await
-                        .unwrap();
-                    }
-
-                    let msg = format!("[Система] Пользователь {} подключился", username);
-                    broadcast_system_message(&state, &msg, Some(&username)).await;
-                    Ok((user_id, username))
-                }
-                Err(e) => {
-                    error!("Ошибка восстановления сессии: {}", e);
-                    let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
-                    Err(())
-                }
-            }
-        }
-        "login" => {
-            let device_name = if parts.len() > 4 {
-                parts[3].trim().to_string()
-            } else {
-                "unknown".to_string()
-            };
-
-            let db = state.lock().await.db.clone();
-            let ph = phone.clone();
-            let pwd = password.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                AppState::login_user_by_phone(&mut st.conn, &ph, &pwd)
-            })
-            .await
-            .unwrap();
-
-            match result {
-                Ok(user_id) => {
-                    let db3 = state.lock().await.db.clone();
+                if let Some(fcm) = fcm_token {
+                    let db = state.lock().await.db.clone();
                     let uid = user_id.clone();
-                    let username_from_db = tokio::task::spawn_blocking(move || {
-                        let st = db3.lock().unwrap();
-                        let mut stmt = st
-                            .conn
-                            .prepare("SELECT username FROM users WHERE id = ?")
-                            .map_err(|e| e.to_string())?;
-                        let mut rows = stmt.query([&uid]).map_err(|e| e.to_string())?;
-                        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                            Ok(row.get::<_, String>(0).map_err(|e| e.to_string())?)
-                        } else {
-                            Err("Пользователь не найден".to_string())
-                        }
-                    })
-                    .await
-                    .unwrap();
-                    let username = username_from_db.unwrap_or_else(|_| phone.clone());
-
-                    let db2 = state.lock().await.db.clone();
-                    let uid2 = user_id.clone();
-                    let dev = device_name.clone();
-                    let token_result = tokio::task::spawn_blocking(move || {
-                        let mut st = db2.lock().unwrap();
-                        AppState::create_session(&mut st.conn, &uid2, &dev)
-                    })
-                    .await
-                    .unwrap();
-
-                    match token_result {
-                        Ok(token) => {
-                            let msg = format!("Успех|{}|{}|{}", user_id, token, username);
-                            let _ = send_system_message(&tx, &msg).await;
-
-                            if let Some(fcm) = fcm_token {
-                                let db = state.lock().await.db.clone();
-                                let uid = user_id.clone();
-                                let session_tok = token.clone();
-                                let fcm_tok = fcm.clone();
-                                let dev = device_name.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    let _ = AppState::save_fcm_token(
-                                        &mut st.conn,
-                                        &uid,
-                                        &session_tok,
-                                        &fcm_tok,
-                                        &dev,
-                                    );
-                                })
-                                .await
-                                .unwrap();
-                            }
-
-                            {
-                                let mut guard = session.lock().await;
-                                guard.user_id = Some(user_id.clone());
-                                guard.username = Some(username.clone());
-                                guard.token = Some(token.clone());
-                            }
-                            {
-                                let mut state_guard = state.lock().await;
-                                state_guard.sessions.remove(&temp_id);
-                                state_guard.sessions.insert(token.clone(), session.clone());
-                                state_guard
-                                    .online_users
-                                    .entry(username.clone())
-                                    .or_insert_with(Vec::new)
-                                    .push(token.clone());
-                            }
-                            {
-                                let db_ls = state.lock().await.db.clone();
-                                let uid_ls = user_id.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = db_ls.lock().unwrap();
-                                    let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
-                                })
-                                .await
-                                .unwrap();
-                            }
-
-                            let msg = format!("[Система] Пользователь {} подключился", username);
-                            broadcast_system_message(&state, &msg, Some(&username)).await;
-                            Ok((user_id, username))
-                        }
-                        Err(e) => {
-                            error!("Ошибка создания сессии: {}", e);
-                            let _ = send_system_message(
-                                &tx,
-                                &format!("[Система] Ошибка создания сессии: {}", e),
-                            )
-                            .await;
-                            Err(())
-                        }
-                    }
+                    let session_tok = token.to_string();
+                    let dev = device_name.to_string();
+                    tokio::task::spawn_blocking(move || {
+                        let mut st = db.lock().unwrap();
+                        let _ = AppState::save_fcm_token(&mut st.conn, &uid, &session_tok, &fcm, &dev);
+                    }).await.unwrap();
                 }
-                Err(e) => {
-                    error!("Ошибка логина: {}", e);
-                    let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
-                    Err(())
+
+                {
+                    let mut guard = session.lock().await;
+                    guard.user_id = Some(user_id.clone());
+                    guard.username = Some(username.clone());
+                    guard.token = Some(token.to_string());
                 }
+                {
+                    let mut state_guard = state.lock().await;
+                    state_guard.sessions.remove(&temp_id);
+                    state_guard.sessions.insert(token.to_string(), session.clone());
+                    state_guard.online_users.entry(username.clone()).or_insert_with(Vec::new).push(token.to_string());
+                }
+                {
+                    let db_ls = state.lock().await.db.clone();
+                    let uid_ls = user_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let mut st = db_ls.lock().unwrap();
+                        let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
+                    }).await.unwrap();
+                }
+
+                let msg = format!("[Система] Пользователь {} подключился", username);
+                broadcast_system_message(&state, &msg, Some(&username)).await;
+                Ok((user_id, username))
+            }
+            Err(e) => {
+                error!("Ошибка восстановления сессии: {}", e);
+                let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
+                Err(())
             }
         }
-        "register" => {
-            let first_name = if parts.len() > 3 {
-                Some(parts[3].trim())
-            } else {
-                None
-            };
-            let last_name = if parts.len() > 4 {
-                Some(parts[4].trim())
-            } else {
-                None
-            };
-            let username = if parts.len() > 5 && !parts[5].trim().is_empty() {
-                parts[5].trim().to_string()
-            } else {
-                phone.clone()
-            };
-            let device_name = if parts.len() > 6 {
-                parts[6].trim().to_string()
-            } else {
-                "unknown".to_string()
-            };
+    }
+    "login" => {
+        // Формат: login|phone|password|device|fcm
+        let phone = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let password = parts.get(2).map(|s| s.trim()).unwrap_or("");
+        let device_name = parts.get(3).map(|s| s.trim()).unwrap_or("unknown");
+        let fcm_token = parts.get(4)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
 
-            let db = state.lock().await.db.clone();
-            let ph = phone.clone();
-            let pwd = password.clone();
-            let uname = username.clone();
-            let fn_opt = first_name.map(|s| s.to_string());
-            let ln_opt = last_name.map(|s| s.to_string());
+        let db = state.lock().await.db.clone();
+        let ph = phone.to_string();
+        let pwd = password.to_string();
+        let result = tokio::task::spawn_blocking(move || {
+            let mut st = db.lock().unwrap();
+            AppState::login_user_by_phone(&mut st.conn, &ph, &pwd)
+        })
+        .await
+        .unwrap();
 
-            let result = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                AppState::register_user(
-                    &mut st,
-                    &uname,
-                    &ph,
-                    &pwd,
-                    fn_opt.as_deref(),
-                    ln_opt.as_deref(),
-                )
-            })
-            .await
-            .unwrap();
+        match result {
+            Ok(user_id) => {
+                let db3 = state.lock().await.db.clone();
+                let uid = user_id.clone();
+                let username_from_db = tokio::task::spawn_blocking(move || {
+                    let st = db3.lock().unwrap();
+                    let mut stmt = st.conn.prepare("SELECT username FROM users WHERE id = ?").map_err(|e| e.to_string())?;
+                    let mut rows = stmt.query([&uid]).map_err(|e| e.to_string())?;
+                    if let Some(row) = rows.next().map_err(|e| e.to_string())? {
+                        Ok(row.get::<_, String>(0).map_err(|e| e.to_string())?)
+                    } else {
+                        Err("Пользователь не найден".to_string())
+                    }
+                }).await.unwrap();
+                let username = username_from_db.unwrap_or_else(|_| phone.to_string());
 
-            match result {
-                Ok(user_id) => {
-                    let db2 = state.lock().await.db.clone();
-                    let uid = user_id.clone();
-                    let dev = device_name.clone();
-                    let token_result = tokio::task::spawn_blocking(move || {
-                        let mut st = db2.lock().unwrap();
-                        AppState::create_session(&mut st.conn, &uid, &dev)
-                    })
-                    .await
-                    .unwrap();
+                let db2 = state.lock().await.db.clone();
+                let uid2 = user_id.clone();
+                let dev = device_name.to_string();
+                let token_result = tokio::task::spawn_blocking(move || {
+                    let mut st = db2.lock().unwrap();
+                    AppState::create_session(&mut st.conn, &uid2, &dev)
+                }).await.unwrap();
 
-                    match token_result {
-                        Ok(token) => {
-                            let msg = format!("Успех|{}|{}|{}", user_id, token, username);
-                            let _ = send_system_message(&tx, &msg).await;
+                match token_result {
+                    Ok(token) => {
+                        let msg = format!("Успех|{}|{}|{}", user_id, token, username);
+                        let _ = send_system_message(&tx, &msg).await;
 
-                            if let Some(fcm) = fcm_token {
-                                let db = state.lock().await.db.clone();
-                                let uid = user_id.clone();
-                                let session_tok = token.clone();
-                                let fcm_tok = fcm.clone();
-                                let dev = device_name.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    let _ = AppState::save_fcm_token(
-                                        &mut st.conn,
-                                        &uid,
-                                        &session_tok,
-                                        &fcm_tok,
-                                        &dev,
-                                    );
-                                })
-                                .await
-                                .unwrap();
-                            }
-
-                            {
-                                let mut guard = session.lock().await;
-                                guard.user_id = Some(user_id.clone());
-                                guard.username = Some(username.clone());
-                                guard.token = Some(token.clone());
-                            }
-                            {
-                                let mut state_guard = state.lock().await;
-                                state_guard.sessions.remove(&temp_id);
-                                state_guard.sessions.insert(token.clone(), session.clone());
-                                state_guard
-                                    .online_users
-                                    .entry(username.clone())
-                                    .or_insert_with(Vec::new)
-                                    .push(token.clone());
-                            }
-                            {
-                                let db_ls = state.lock().await.db.clone();
-                                let uid_ls = user_id.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = db_ls.lock().unwrap();
-                                    let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
-                                })
-                                .await
-                                .unwrap();
-                            }
-
-                            let msg = format!("[Система] Пользователь {} подключился", username);
-                            broadcast_system_message(&state, &msg, Some(&username)).await;
-                            Ok((user_id, username))
+                        if let Some(fcm) = fcm_token {
+                            let db = state.lock().await.db.clone();
+                            let uid = user_id.clone();
+                            let session_tok = token.clone();
+                            let dev = device_name.to_string();
+                            tokio::task::spawn_blocking(move || {
+                                let mut st = db.lock().unwrap();
+                                let _ = AppState::save_fcm_token(&mut st.conn, &uid, &session_tok, &fcm, &dev);
+                            }).await.unwrap();
                         }
-                        Err(e) => {
-                            error!("Ошибка создания сессии: {}", e);
-                            let _ = send_system_message(
-                                &tx,
-                                &format!("[Система] Ошибка создания сессии: {}", e),
-                            )
-                            .await;
-                            Err(())
+
+                        {
+                            let mut guard = session.lock().await;
+                            guard.user_id = Some(user_id.clone());
+                            guard.username = Some(username.clone());
+                            guard.token = Some(token.clone());
                         }
+                        {
+                            let mut state_guard = state.lock().await;
+                            state_guard.sessions.remove(&temp_id);
+                            state_guard.sessions.insert(token.clone(), session.clone());
+                            state_guard.online_users.entry(username.clone()).or_insert_with(Vec::new).push(token.clone());
+                        }
+                        {
+                            let db_ls = state.lock().await.db.clone();
+                            let uid_ls = user_id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let mut st = db_ls.lock().unwrap();
+                                let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
+                            }).await.unwrap();
+                        }
+
+                        let msg = format!("[Система] Пользователь {} подключился", username);
+                        broadcast_system_message(&state, &msg, Some(&username)).await;
+                        Ok((user_id, username))
+                    }
+                    Err(e) => {
+                        error!("Ошибка создания сессии: {}", e);
+                        let _ = send_system_message(&tx, &format!("[Система] Ошибка создания сессии: {}", e)).await;
+                        Err(())
                     }
                 }
-                Err(e) => {
-                    error!("Ошибка регистрации: {}", e);
-                    let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
-                    Err(())
-                }
+            }
+            Err(e) => {
+                error!("Ошибка логина: {}", e);
+                let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
+                Err(())
             }
         }
-        _ => {
-            error!("Неизвестная команда: {}", command);
-            let _ = send_system_message(
-                &tx,
-                &format!("[Система] Ошибка: Неизвестная команда {}", command),
-            )
-            .await;
-            Err(())
+    }
+    "register" => {
+        // Формат: register|phone|password|firstName|lastName|username|device|fcm
+        let phone = parts.get(1).map(|s| s.trim()).unwrap_or("");
+        let password = parts.get(2).map(|s| s.trim()).unwrap_or("");
+        let first_name = parts.get(3).map(|s| s.trim()).filter(|s| !s.is_empty());
+        let last_name = parts.get(4).map(|s| s.trim()).filter(|s| !s.is_empty());
+        let username_opt = parts.get(5).map(|s| s.trim()).filter(|s| !s.is_empty());
+        let device_name = parts.get(6).map(|s| s.trim()).unwrap_or("unknown");
+        let fcm_token = parts.get(7)
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let username = username_opt.unwrap_or(phone);
+
+        let db = state.lock().await.db.clone();
+        let ph = phone.to_string();
+        let pwd = password.to_string();
+        let uname = username.to_string();
+        let fn_opt = first_name.map(|s| s.to_string());
+        let ln_opt = last_name.map(|s| s.to_string());
+
+        let result = tokio::task::spawn_blocking(move || {
+            let mut st = db.lock().unwrap();
+            AppState::register_user(&mut st, &uname, &ph, &pwd, fn_opt.as_deref(), ln_opt.as_deref())
+        }).await.unwrap();
+
+        match result {
+            Ok(user_id) => {
+                let db2 = state.lock().await.db.clone();
+                let uid = user_id.clone();
+                let dev = device_name.to_string();
+                let token_result = tokio::task::spawn_blocking(move || {
+                    let mut st = db2.lock().unwrap();
+                    AppState::create_session(&mut st.conn, &uid, &dev)
+                }).await.unwrap();
+
+                match token_result {
+                    Ok(token) => {
+                        let msg = format!("Успех|{}|{}|{}", user_id, token, username);
+                        let _ = send_system_message(&tx, &msg).await;
+
+                        if let Some(fcm) = fcm_token {
+                            let db = state.lock().await.db.clone();
+                            let uid = user_id.clone();
+                            let session_tok = token.clone();
+                            let dev = device_name.to_string();
+                            tokio::task::spawn_blocking(move || {
+                                let mut st = db.lock().unwrap();
+                                let _ = AppState::save_fcm_token(&mut st.conn, &uid, &session_tok, &fcm, &dev);
+                            }).await.unwrap();
+                        }
+
+                        {
+                            let mut guard = session.lock().await;
+                            guard.user_id = Some(user_id.clone());
+                            guard.username = Some(username.clone());
+                            guard.token = Some(token.clone());
+                        }
+                        {
+                            let mut state_guard = state.lock().await;
+                            state_guard.sessions.remove(&temp_id);
+                            state_guard.sessions.insert(token.clone(), session.clone());
+                            state_guard.online_users.entry(username.clone()).or_insert_with(Vec::new).push(token.clone());
+                        }
+                        {
+                            let db_ls = state.lock().await.db.clone();
+                            let uid_ls = user_id.clone();
+                            tokio::task::spawn_blocking(move || {
+                                let mut st = db_ls.lock().unwrap();
+                                let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
+                            }).await.unwrap();
+                        }
+
+                        let msg = format!("[Система] Пользователь {} подключился", username);
+                        broadcast_system_message(&state, &msg, Some(&username)).await;
+                        Ok((user_id, username))
+                    }
+                    Err(e) => {
+                        error!("Ошибка создания сессии: {}", e);
+                        let _ = send_system_message(&tx, &format!("[Система] Ошибка создания сессии: {}", e)).await;
+                        Err(())
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Ошибка регистрации: {}", e);
+                let _ = send_system_message(&tx, &format!("[Система] Ошибка: {}", e)).await;
+                Err(())
+            }
         }
-    };
+    }
+    _ => {
+        error!("Неизвестная команда: {}", command);
+        let _ = send_system_message(&tx, &format!("[Система] Ошибка: Неизвестная команда {}", command)).await;
+        Err(())
+    }
+};
 
     let (my_user_id, my_username) = match auth_result {
         Ok((uid, uname)) => (uid, uname),
