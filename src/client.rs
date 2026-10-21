@@ -7,9 +7,10 @@ use log::{debug, error, info, warn};
 use rusqlite::params;
 use serde_json::json;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 use uuid::Uuid;
 
@@ -22,12 +23,8 @@ use crate::senders::{
     send_messages_by_ids, send_system_message, send_to_all_my_sessions, send_to_user_sessions,
 };
 
-pub async fn resolve_display_name(
-    state: &Arc<Mutex<AppState>>,
-    user_id: &str,
-    fallback: &str,
-) -> String {
-    let db = state.lock().await.db.clone();
+pub async fn resolve_display_name(state: &Arc<AppState>, user_id: &str, fallback: &str) -> String {
+    let db = state.db.clone();
     let uid = user_id.to_string();
     let fb = fallback.to_string();
     tokio::task::spawn_blocking(move || {
@@ -42,10 +39,6 @@ pub async fn resolve_display_name(
         } else {
             trimmed.to_string()
         };
-        debug!(
-            "resolve_display_name: user_id={}, raw=[{}], fallback={}, result={}",
-            uid, raw, fb, result
-        );
         result
     })
     .await
@@ -56,15 +49,14 @@ pub async fn resolve_display_name(
 pub async fn process_command(
     cmd: &str,
     my_user_id: &str,
-    my_username: &str,
-    state: &Arc<Mutex<AppState>>,
-    session: &Arc<Mutex<Session>>,
+    _my_username: &str, // Исправлено (warning)
+    state: &Arc<AppState>,
+    _session: &Arc<Session>, // Исправлено (warning)
 ) -> String {
     let cmd_parts: Vec<&str> = cmd.split_whitespace().collect();
     if cmd_parts.is_empty() {
         return String::new();
     }
-    debug!("process_command: {:#?}", cmd_parts);
 
     let cmd_name = cmd_parts[0];
     let args = &cmd_parts[1..];
@@ -75,7 +67,7 @@ pub async fn process_command(
                 "[Система] Использование: /creategroup <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let uid = my_user_id.to_string();
                 let gname = group_name.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -95,7 +87,7 @@ pub async fn process_command(
                 "[Система] Использование: /joingroup <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let uid = my_user_id.to_string();
                 let gname = group_name.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -115,7 +107,7 @@ pub async fn process_command(
                 "[Система] Использование: /leavegroup <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let uid = my_user_id.to_string();
                 let gname = group_name.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -135,7 +127,7 @@ pub async fn process_command(
                 "[Система] Использование: /groupmembers <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let gname = group_name.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let mut st = db.lock().unwrap();
@@ -162,30 +154,32 @@ pub async fn process_command(
             }
         }
         "/listgroups" => {
-            let db = state.lock().await.db.clone();
+            let db = state.db.clone();
+            let uid = my_user_id.to_string();
             let result = tokio::task::spawn_blocking(move || {
                 let mut st = db.lock().unwrap();
-                let mut stmt = st
-                    .conn
-                    .prepare("SELECT name, creator_id FROM groups ORDER BY name")
+                let mut stmt = st.conn
+                    .prepare("SELECT g.name, g.creator_id, \
+                                     (SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = ?) AS is_member \
+                              FROM groups g ORDER BY g.name")
                     .map_err(|e| e.to_string())?;
-                let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+                let mut rows = stmt.query([&uid]).map_err(|e| e.to_string())?;
                 let mut groups = Vec::new();
                 while let Some(row) = rows.next().map_err(|e| e.to_string())? {
                     let name: String = row.get(0).map_err(|e| e.to_string())?;
                     let creator_id: String = row.get(1).map_err(|e| e.to_string())?;
-                    groups.push((name, creator_id));
+                    let is_member: Option<i64> = row.get(2).ok();
+                    groups.push((name, creator_id, is_member.is_some()));
                 }
                 drop(rows);
                 drop(stmt);
                 let out: Vec<String> = groups
                     .into_iter()
-                    .map(|(name, cid)| format!("{}|{}", name, st.resolve_username(&cid)))
+                    .map(|(name, cid, is_member)| format!("{}|{}|{}", name, st.resolve_username(&cid), if is_member { "1" } else { "0" }))
                     .collect();
                 Ok::<_, String>(out)
-            })
-            .await
-            .unwrap();
+            }).await.unwrap();
+
             match result {
                 Ok(groups) => {
                     if groups.is_empty() {
@@ -206,7 +200,7 @@ pub async fn process_command(
                 "[Система] Использование: /createchannel <название>".to_string()
             } else {
                 let channel_name = args.join(" ");
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let uid = my_user_id.to_string();
                 let ch = channel_name.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -226,7 +220,7 @@ pub async fn process_command(
                 "[Система] Использование: /subscribe <название>".to_string()
             } else {
                 let channel_name = args.join(" ");
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let uid = my_user_id.to_string();
                 let ch = channel_name.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -246,7 +240,7 @@ pub async fn process_command(
                 "[Система] Использование: /unsubscribe <название>".to_string()
             } else {
                 let channel_name = args.join(" ");
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let uid = my_user_id.to_string();
                 let ch = channel_name.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -262,7 +256,7 @@ pub async fn process_command(
             }
         }
         "/channels" => {
-            let db = state.lock().await.db.clone();
+            let db = state.db.clone();
             let uid = my_user_id.to_string();
             let result = tokio::task::spawn_blocking(move || {
                 let mut st = db.lock().unwrap();
@@ -317,7 +311,7 @@ pub async fn process_command(
             }
         }
         "/listusers" => {
-            let db = state.lock().await.db.clone();
+            let db = state.db.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let st = db.lock().unwrap();
                 let mut stmt = st.conn
@@ -348,9 +342,8 @@ pub async fn process_command(
             }
         }
         "/onlineusers" => {
-            let state_guard = state.lock().await;
-            let mut users: Vec<String> = state_guard.online_users.keys().cloned().collect();
-            drop(state_guard);
+            let mut users: Vec<String> =
+                state.online_users.iter().map(|r| r.key().clone()).collect();
             users.sort();
             if users.is_empty() {
                 "[Система] Нет пользователей онлайн".to_string()
@@ -363,7 +356,7 @@ pub async fn process_command(
             }
         }
         "/profile" => {
-            let db = state.lock().await.db.clone();
+            let db = state.db.clone();
             let uid = my_user_id.to_string();
             let result = tokio::task::spawn_blocking(move || {
                 let mut st = db.lock().unwrap();
@@ -391,7 +384,7 @@ pub async fn process_command(
                 } else {
                     "".to_string()
                 };
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let uid = my_user_id.to_string();
                 let fn_ = first_name.to_string();
                 let ln_ = last_name.clone();
@@ -412,7 +405,7 @@ pub async fn process_command(
                 "[Система] Использование: /setdisplayname <отображаемое имя>".to_string()
             } else {
                 let display_name = args.join(" ");
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let uid = my_user_id.to_string();
                 let dn = display_name.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -432,7 +425,7 @@ pub async fn process_command(
                 "[Система] Использование: /setusername <новый_username>".to_string()
             } else {
                 let new_username = args[0].to_string();
-                let db = state.lock().await.db.clone();
+                let db = state.db.clone();
                 let uid = my_user_id.to_string();
                 let nu = new_username.clone();
                 let result = tokio::task::spawn_blocking(move || {
@@ -443,10 +436,10 @@ pub async fn process_command(
                 .unwrap();
                 match result {
                     Ok(_old) => {
-                        let mut guard = session.lock().await;
-                        guard.username = Some(new_username.clone());
-                        let _ = my_username;
-                        format!("[Система] Username изменён на {}", new_username)
+                        format!(
+                            "[Система] Username изменён на {}. Переподключитесь для применения.",
+                            new_username
+                        )
                     }
                     Err(e) => format!("[Система] Ошибка: {}", e),
                 }
@@ -457,7 +450,7 @@ pub async fn process_command(
 }
 
 // ==================== handle_client ====================
-pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
+pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
     let start_time = Instant::now();
     info!("Принято TCP-соединение от {:?}", stream.peer_addr().ok());
 
@@ -485,14 +478,11 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
     let (mut sink, mut stream) = ws_stream.split();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let session = Arc::new(Mutex::new(Session::new(tx.clone(), keys.clone())));
+    let session = Arc::new(Session::new(tx.clone(), keys.clone()));
     let temp_id = Uuid::new_v4().to_string();
 
     {
-        let mut state_guard = state.lock().await;
-        state_guard
-            .sessions
-            .insert(temp_id.clone(), session.clone());
+        state.sessions.insert(temp_id.clone(), session.clone());
         info!("Временная сессия создана: {}", temp_id);
     }
 
@@ -544,7 +534,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         return;
     }
 
-    // ---- Расшифровка AUTH (v3) ----
     if auth_data.len() < 1 + 12 + 4 {
         error!("AUTH: пакет слишком короткий для v3");
         let _ = send_task.await;
@@ -572,32 +561,25 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
     info!("Auth string: {}", auth_str);
     let parts: Vec<&str> = auth_str.split('|').collect();
-    if parts.len() < 3 {
+    if parts.is_empty() {
         error!("Неверный формат аутентификации");
         let _ = send_task.await;
         return;
     }
 
     let command = parts[0];
-    let phone = parts[1].trim().to_string();
-    let password = parts[2].trim().to_string();
-
-    let fcm_token = if parts.len() > 4 {
-        Some(parts[parts.len() - 1].trim().to_string())
-    } else {
-        None
-    };
 
     let auth_result = match command {
         "token" => {
-            let token = parts[1].trim();
-            let device_name = if parts.len() > 3 {
-                parts[2].trim().to_string()
-            } else {
-                "unknown".to_string()
-            };
+            let token = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            let device_name = parts.get(2).map(|s| s.trim()).unwrap_or("unknown");
+            let fcm_token = parts
+                .get(3)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
 
-            let db = state.lock().await.db.clone();
+            let db = state.db.clone();
             let token_str = token.to_string();
             let result = tokio::task::spawn_blocking(move || {
                 let mut st = db.lock().unwrap();
@@ -612,18 +594,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     let _ = send_system_message(&tx, &msg).await;
 
                     if let Some(fcm) = fcm_token {
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let uid = user_id.clone();
                         let session_tok = token.to_string();
-                        let fcm_tok = fcm.clone();
-                        let dev = device_name.clone();
+                        let dev = device_name.to_string();
                         tokio::task::spawn_blocking(move || {
                             let mut st = db.lock().unwrap();
                             let _ = AppState::save_fcm_token(
                                 &mut st.conn,
                                 &uid,
                                 &session_tok,
-                                &fcm_tok,
+                                &fcm,
                                 &dev,
                             );
                         })
@@ -631,26 +612,20 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         .unwrap();
                     }
 
+                    session.user_id.set(user_id.clone()).ok();
+                    session.username.set(username.clone()).ok(); // String
+                    session.token.set(token.to_string()).ok();
+
+                    state.sessions.remove(&temp_id);
+                    state.sessions.insert(token.to_string(), session.clone());
+                    state
+                        .online_users
+                        .entry(username.clone())
+                        .or_insert_with(Vec::new)
+                        .push(token.to_string());
+
                     {
-                        let mut guard = session.lock().await;
-                        guard.user_id = Some(user_id.clone());
-                        guard.username = Some(username.clone());
-                        guard.token = Some(token.to_string());
-                    }
-                    {
-                        let mut state_guard = state.lock().await;
-                        state_guard.sessions.remove(&temp_id);
-                        state_guard
-                            .sessions
-                            .insert(token.to_string(), session.clone());
-                        state_guard
-                            .online_users
-                            .entry(username.clone())
-                            .or_insert_with(Vec::new)
-                            .push(token.to_string());
-                    }
-                    {
-                        let db_ls = state.lock().await.db.clone();
+                        let db_ls = state.db.clone();
                         let uid_ls = user_id.clone();
                         tokio::task::spawn_blocking(move || {
                             let mut st = db_ls.lock().unwrap();
@@ -672,15 +647,18 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             }
         }
         "login" => {
-            let device_name = if parts.len() > 4 {
-                parts[3].trim().to_string()
-            } else {
-                "unknown".to_string()
-            };
+            let phone = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            let password = parts.get(2).map(|s| s.trim()).unwrap_or("");
+            let device_name = parts.get(3).map(|s| s.trim()).unwrap_or("unknown");
+            let fcm_token = parts
+                .get(4)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
 
-            let db = state.lock().await.db.clone();
-            let ph = phone.clone();
-            let pwd = password.clone();
+            let db = state.db.clone();
+            let ph = phone.to_string();
+            let pwd = password.to_string();
             let result = tokio::task::spawn_blocking(move || {
                 let mut st = db.lock().unwrap();
                 AppState::login_user_by_phone(&mut st.conn, &ph, &pwd)
@@ -690,7 +668,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
             match result {
                 Ok(user_id) => {
-                    let db3 = state.lock().await.db.clone();
+                    let db3 = state.db.clone();
                     let uid = user_id.clone();
                     let username_from_db = tokio::task::spawn_blocking(move || {
                         let st = db3.lock().unwrap();
@@ -707,11 +685,11 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     })
                     .await
                     .unwrap();
-                    let username = username_from_db.unwrap_or_else(|_| phone.clone());
+                    let username = username_from_db.unwrap_or_else(|_| phone.to_string()); // String
 
-                    let db2 = state.lock().await.db.clone();
+                    let db2 = state.db.clone();
                     let uid2 = user_id.clone();
-                    let dev = device_name.clone();
+                    let dev = device_name.to_string();
                     let token_result = tokio::task::spawn_blocking(move || {
                         let mut st = db2.lock().unwrap();
                         AppState::create_session(&mut st.conn, &uid2, &dev)
@@ -725,18 +703,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let _ = send_system_message(&tx, &msg).await;
 
                             if let Some(fcm) = fcm_token {
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let uid = user_id.clone();
                                 let session_tok = token.clone();
-                                let fcm_tok = fcm.clone();
-                                let dev = device_name.clone();
+                                let dev = device_name.to_string();
                                 tokio::task::spawn_blocking(move || {
                                     let mut st = db.lock().unwrap();
                                     let _ = AppState::save_fcm_token(
                                         &mut st.conn,
                                         &uid,
                                         &session_tok,
-                                        &fcm_tok,
+                                        &fcm,
                                         &dev,
                                     );
                                 })
@@ -744,24 +721,20 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 .unwrap();
                             }
 
+                            session.user_id.set(user_id.clone()).ok();
+                            session.username.set(username.clone()).ok(); // String
+                            session.token.set(token.clone()).ok();
+
+                            state.sessions.remove(&temp_id);
+                            state.sessions.insert(token.clone(), session.clone());
+                            state
+                                .online_users
+                                .entry(username.clone())
+                                .or_insert_with(Vec::new)
+                                .push(token.clone());
+
                             {
-                                let mut guard = session.lock().await;
-                                guard.user_id = Some(user_id.clone());
-                                guard.username = Some(username.clone());
-                                guard.token = Some(token.clone());
-                            }
-                            {
-                                let mut state_guard = state.lock().await;
-                                state_guard.sessions.remove(&temp_id);
-                                state_guard.sessions.insert(token.clone(), session.clone());
-                                state_guard
-                                    .online_users
-                                    .entry(username.clone())
-                                    .or_insert_with(Vec::new)
-                                    .push(token.clone());
-                            }
-                            {
-                                let db_ls = state.lock().await.db.clone();
+                                let db_ls = state.db.clone();
                                 let uid_ls = user_id.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut st = db_ls.lock().unwrap();
@@ -794,31 +767,24 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             }
         }
         "register" => {
-            let first_name = if parts.len() > 3 {
-                Some(parts[3].trim())
-            } else {
-                None
-            };
-            let last_name = if parts.len() > 4 {
-                Some(parts[4].trim())
-            } else {
-                None
-            };
-            let username = if parts.len() > 5 && !parts[5].trim().is_empty() {
-                parts[5].trim().to_string()
-            } else {
-                phone.clone()
-            };
-            let device_name = if parts.len() > 6 {
-                parts[6].trim().to_string()
-            } else {
-                "unknown".to_string()
-            };
+            let phone = parts.get(1).map(|s| s.trim()).unwrap_or("");
+            let password = parts.get(2).map(|s| s.trim()).unwrap_or("");
+            let first_name = parts.get(3).map(|s| s.trim()).filter(|s| !s.is_empty());
+            let last_name = parts.get(4).map(|s| s.trim()).filter(|s| !s.is_empty());
+            let username_opt = parts.get(5).map(|s| s.trim()).filter(|s| !s.is_empty());
+            let device_name = parts.get(6).map(|s| s.trim()).unwrap_or("unknown");
+            let fcm_token = parts
+                .get(7)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
 
-            let db = state.lock().await.db.clone();
-            let ph = phone.clone();
-            let pwd = password.clone();
-            let uname = username.clone();
+            let username = username_opt.unwrap_or(phone).to_string(); // <-- ИСПРАВЛЕНО НА String
+
+            let db = state.db.clone();
+            let ph = phone.to_string();
+            let pwd = password.to_string();
+            let uname = username.clone(); // String
             let fn_opt = first_name.map(|s| s.to_string());
             let ln_opt = last_name.map(|s| s.to_string());
 
@@ -838,9 +804,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
             match result {
                 Ok(user_id) => {
-                    let db2 = state.lock().await.db.clone();
+                    let db2 = state.db.clone();
                     let uid = user_id.clone();
-                    let dev = device_name.clone();
+                    let dev = device_name.to_string();
                     let token_result = tokio::task::spawn_blocking(move || {
                         let mut st = db2.lock().unwrap();
                         AppState::create_session(&mut st.conn, &uid, &dev)
@@ -854,18 +820,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let _ = send_system_message(&tx, &msg).await;
 
                             if let Some(fcm) = fcm_token {
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let uid = user_id.clone();
                                 let session_tok = token.clone();
-                                let fcm_tok = fcm.clone();
-                                let dev = device_name.clone();
+                                let dev = device_name.to_string();
                                 tokio::task::spawn_blocking(move || {
                                     let mut st = db.lock().unwrap();
                                     let _ = AppState::save_fcm_token(
                                         &mut st.conn,
                                         &uid,
                                         &session_tok,
-                                        &fcm_tok,
+                                        &fcm,
                                         &dev,
                                     );
                                 })
@@ -873,24 +838,20 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 .unwrap();
                             }
 
+                            session.user_id.set(user_id.clone()).ok();
+                            session.username.set(username.clone()).ok(); // String
+                            session.token.set(token.clone()).ok();
+
+                            state.sessions.remove(&temp_id);
+                            state.sessions.insert(token.clone(), session.clone());
+                            state
+                                .online_users
+                                .entry(username.clone())
+                                .or_insert_with(Vec::new)
+                                .push(token.clone()); // String
+
                             {
-                                let mut guard = session.lock().await;
-                                guard.user_id = Some(user_id.clone());
-                                guard.username = Some(username.clone());
-                                guard.token = Some(token.clone());
-                            }
-                            {
-                                let mut state_guard = state.lock().await;
-                                state_guard.sessions.remove(&temp_id);
-                                state_guard.sessions.insert(token.clone(), session.clone());
-                                state_guard
-                                    .online_users
-                                    .entry(username.clone())
-                                    .or_insert_with(Vec::new)
-                                    .push(token.clone());
-                            }
-                            {
-                                let db_ls = state.lock().await.db.clone();
+                                let db_ls = state.db.clone();
                                 let uid_ls = user_id.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut st = db_ls.lock().unwrap();
@@ -949,7 +910,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         let state_h = state.clone();
 
         // Личные
-        let db = state_h.lock().await.db.clone();
+        let db = state_h.db.clone();
         let uid = uid_h.clone();
         let personal = tokio::task::spawn_blocking(move || {
             let mut st = db.lock().unwrap();
@@ -971,7 +932,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                 edited,
             ) in msgs
             {
-                let db = state_h.lock().await.db.clone();
+                let db = state_h.db.clone();
                 let sid = sender_id.clone();
                 let rid = recipient_id.clone();
                 let (sender, recipient) = tokio::task::spawn_blocking(move || {
@@ -1003,7 +964,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         }
 
         // Группы
-        let db = state_h.lock().await.db.clone();
+        let db = state_h.db.clone();
         let uid = uid_h.clone();
         let groups = tokio::task::spawn_blocking(move || {
             let mut st = db.lock().unwrap();
@@ -1015,7 +976,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             let count = msgs.len();
             for (msg_id, gname, sender_id, content, ts, reply_id, flag_me, flag_any, edited) in msgs
             {
-                let db = state_h.lock().await.db.clone();
+                let db = state_h.db.clone();
                 let sid = sender_id.clone();
                 let sender = tokio::task::spawn_blocking(move || {
                     let mut st = db.lock().unwrap();
@@ -1050,7 +1011,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
         }
 
         // Каналы
-        let db = state_h.lock().await.db.clone();
+        let db = state_h.db.clone();
         let uid = uid_h.clone();
         let channels = tokio::task::spawn_blocking(move || {
             let mut st = db.lock().unwrap();
@@ -1073,7 +1034,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                 edited,
             ) in msgs
             {
-                let db = state_h.lock().await.db.clone();
+                let db = state_h.db.clone();
                 let sid = sender_id.clone();
                 let sender = tokio::task::spawn_blocking(move || {
                     let mut st = db.lock().unwrap();
@@ -1111,7 +1072,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
     // ---- Основной цикл ----
     info!("Начало основного цикла для {}", my_username);
     loop {
-        if !session.lock().await.connected {
+        if !session.connected.load(Ordering::Relaxed) {
             break;
         }
 
@@ -1134,16 +1095,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
             }
 
             // Rate limit
-            {
-                let mut guard = session.lock().await;
-                if !guard.check_rate_limit() {
-                    let _ = send_system_message(
-                        &guard.tx,
-                        "[Система] Слишком много сообщений, подождите",
-                    )
-                    .await;
-                    continue;
-                }
+            if !session.check_rate_limit() {
+                let _ = send_system_message(
+                    &session.tx,
+                    "[Система] Слишком много сообщений, подождите",
+                )
+                .await;
+                continue;
             }
 
             let msg_type = data[0];
@@ -1278,7 +1236,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     // ---- Личное ----
                     if !recipient_name.starts_with('#') && !recipient_name.starts_with('&') {
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let target_name = recipient_name.clone();
                         let recipient_id_opt = tokio::task::spawn_blocking(move || {
                             let mut st = db.lock().unwrap();
@@ -1299,7 +1257,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             }
                         };
 
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let sender_id = my_user_id.clone();
                         let rec_id = recipient_id.clone();
                         let content_clone = content.clone();
@@ -1338,24 +1296,18 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                         if recipient_id != my_user_id {
                             let target_tokens = {
-                                let state_guard = state.lock().await;
-                                state_guard
+                                state
                                     .online_users
                                     .get(&recipient_name)
-                                    .cloned()
+                                    .map(|r| r.clone())
                                     .unwrap_or_default()
                             };
                             for tok in target_tokens {
-                                let target_session =
-                                    { state.lock().await.sessions.get(&tok).cloned() };
+                                let target_session = state.sessions.get(&tok).map(|r| r.clone());
                                 if let Some(ts) = target_session {
-                                    let (target_tx, target_keys) = {
-                                        let g = ts.lock().await;
-                                        (g.tx.clone(), g.keys.clone())
-                                    };
                                     let _ = send_encrypted_message(
-                                        &target_tx,
-                                        &target_keys,
+                                        &ts.tx,
+                                        &ts.keys,
                                         &my_username,
                                         &recipient_name,
                                         &plaintext,
@@ -1374,7 +1326,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 }
                             }
 
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let rec_id_clone = recipient_id.clone();
                             let fcm_tokens = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
@@ -1386,7 +1338,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                             let sender_display_name =
                                 resolve_display_name(&state, &my_user_id, &my_username).await;
-                            let db_fcm = state.lock().await.db.clone();
+                            let db_fcm = state.db.clone();
+
+                            // ИСПРАВЛЕНО: убрали кортеж
                             for fcm_tok in fcm_tokens {
                                 let title = format!("{}", sender_display_name);
                                 let body = content.chars().take(100).collect::<String>();
@@ -1411,7 +1365,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     // ---- Группа ----
                     if recipient_name.starts_with('#') {
                         let group_name = recipient_name.trim_start_matches('#').to_string();
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let uid = my_user_id.clone();
                         let gname = group_name.clone();
                         let is_member = tokio::task::spawn_blocking(move || {
@@ -1428,7 +1382,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             continue;
                         }
 
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let sender_id = my_user_id.clone();
                         let gname = group_name.clone();
                         let cnt = content.clone();
@@ -1447,7 +1401,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         .unwrap()
                         .unwrap_or(0);
 
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let gname = group_name.clone();
                         let members = tokio::task::spawn_blocking(move || {
                             let mut st = db.lock().unwrap();
@@ -1481,7 +1435,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             if member_id == my_user_id {
                                 continue;
                             }
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let mid = member_id.clone();
                             let member_name_opt = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
@@ -1499,30 +1453,23 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 Some(n) => n,
                                 None => continue,
                             };
-                            let target_online =
-                                { state.lock().await.online_users.contains_key(&member_name) };
+                            let target_online = state.online_users.contains_key(&member_name);
 
                             if target_online {
                                 let target_tokens = {
                                     state
-                                        .lock()
-                                        .await
                                         .online_users
                                         .get(&member_name)
-                                        .cloned()
+                                        .map(|r| r.clone())
                                         .unwrap_or_default()
                                 };
                                 for tok in target_tokens {
                                     let target_session =
-                                        { state.lock().await.sessions.get(&tok).cloned() };
+                                        state.sessions.get(&tok).map(|r| r.clone());
                                     if let Some(ts) = target_session {
-                                        let (target_tx, target_keys) = {
-                                            let g = ts.lock().await;
-                                            (g.tx.clone(), g.keys.clone())
-                                        };
                                         let _ = send_encrypted_message(
-                                            &target_tx,
-                                            &target_keys,
+                                            &ts.tx,
+                                            &ts.keys,
                                             &my_username,
                                             &recip_with_hash,
                                             &plaintext,
@@ -1541,7 +1488,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     }
                                 }
                             } else {
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let mid2 = member_id.clone();
                                 let fcm_tokens = tokio::task::spawn_blocking(move || {
                                     let mut st = db.lock().unwrap();
@@ -1553,7 +1500,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                                 let sender_display_name =
                                     resolve_display_name(&state, &my_user_id, &my_username).await;
-                                let db_fcm = state.lock().await.db.clone();
+                                let db_fcm = state.db.clone();
+
+                                // ИСПРАВЛЕНО: убрали кортеж
                                 for fcm_tok in fcm_tokens {
                                     let title = format!("Новое сообщение в группе {}", group_name);
                                     let body = format!(
@@ -1582,7 +1531,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     // ---- Канал ----
                     if recipient_name.starts_with('&') {
                         let channel_name = recipient_name.trim_start_matches('&').to_string();
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let uid = my_user_id.clone();
                         let ch = channel_name.clone();
                         let is_owner = tokio::task::spawn_blocking(move || {
@@ -1606,7 +1555,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             continue;
                         }
 
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let sender_id = my_user_id.clone();
                         let ch_name = channel_name.clone();
                         let cnt = content.clone();
@@ -1625,7 +1574,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         .unwrap()
                         .unwrap_or(0);
 
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let ch_name2 = channel_name.clone();
                         let subscribers = tokio::task::spawn_blocking(move || {
                             let mut st = db.lock().unwrap();
@@ -1659,7 +1608,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             if sub_id == my_user_id {
                                 continue;
                             }
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let sid = sub_id.clone();
                             let sub_name_opt = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
@@ -1677,30 +1626,23 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 Some(n) => n,
                                 None => continue,
                             };
-                            let target_online =
-                                { state.lock().await.online_users.contains_key(&sub_name) };
+                            let target_online = state.online_users.contains_key(&sub_name);
 
                             if target_online {
                                 let target_tokens = {
                                     state
-                                        .lock()
-                                        .await
                                         .online_users
                                         .get(&sub_name)
-                                        .cloned()
+                                        .map(|r| r.clone())
                                         .unwrap_or_default()
                                 };
                                 for tok in target_tokens {
                                     let target_session =
-                                        { state.lock().await.sessions.get(&tok).cloned() };
+                                        state.sessions.get(&tok).map(|r| r.clone());
                                     if let Some(ts) = target_session {
-                                        let (target_tx, target_keys) = {
-                                            let g = ts.lock().await;
-                                            (g.tx.clone(), g.keys.clone())
-                                        };
                                         let _ = send_encrypted_message(
-                                            &target_tx,
-                                            &target_keys,
+                                            &ts.tx,
+                                            &ts.keys,
                                             &my_username,
                                             &recip_with_amp,
                                             &plaintext,
@@ -1719,7 +1661,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     }
                                 }
                             } else {
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let sid2 = sub_id.clone();
                                 let fcm_tokens = tokio::task::spawn_blocking(move || {
                                     let mut st = db.lock().unwrap();
@@ -1731,7 +1673,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                                 let sender_display_name =
                                     resolve_display_name(&state, &my_user_id, &my_username).await;
-                                let db_fcm = state.lock().await.db.clone();
+                                let db_fcm = state.db.clone();
+
+                                // ИСПРАВЛЕНО: убрали кортеж
                                 for fcm_tok in fcm_tokens {
                                     let title =
                                         format!("Новое сообщение в канале {}", channel_name);
@@ -1789,7 +1733,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     match kind {
                         MSG_KIND_PERSONAL => {
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let new_text_clone = new_text.clone();
                             let upd = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
@@ -1826,13 +1770,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 continue;
                             }
 
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let mid = msg_id;
                             let extra = tokio::task::spawn_blocking(move || {
                                 let st = db.lock().unwrap();
                                 st.conn.query_row(
                                     "SELECT strftime('%s', sent_at) * 1000, reply_to_id, read_at FROM messages WHERE id = ?",
-                                    [mid], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<String>>(2)?)),
+                                    [mid], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<String>>(2)?))
                                 ).ok()
                             }).await.unwrap();
 
@@ -1843,7 +1787,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let reply_id = reply_opt.unwrap_or(0);
                             let read_flag = read_at.is_some();
 
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let sid = sender_id.clone();
                             let rid = recipient_id.clone();
                             let (s_name, r_name) = tokio::task::spawn_blocking(move || {
@@ -1872,7 +1816,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             .await;
 
                             if recipient_id != my_user_id {
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let rid2 = recipient_id.clone();
                                 let mid2 = msg_id;
                                 let hidden = tokio::task::spawn_blocking(move || {
@@ -1883,24 +1827,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 if !hidden {
                                     let tokens = {
                                         state
-                                            .lock()
-                                            .await
                                             .online_users
                                             .get(&r_name)
-                                            .cloned()
+                                            .map(|r| r.clone())
                                             .unwrap_or_default()
                                     };
                                     for tok in tokens {
-                                        let sess =
-                                            { state.lock().await.sessions.get(&tok).cloned() };
+                                        let sess = state.sessions.get(&tok).map(|r| r.clone());
                                         if let Some(s) = sess {
-                                            let (ttx, tkeys) = {
-                                                let g = s.lock().await;
-                                                (g.tx.clone(), g.keys.clone())
-                                            };
                                             let _ = send_encrypted_message(
-                                                &ttx,
-                                                &tkeys,
+                                                &s.tx,
+                                                &s.keys,
                                                 &s_name,
                                                 &r_name,
                                                 new_text.as_bytes(),
@@ -1922,7 +1859,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             }
                         }
                         MSG_KIND_GROUP => {
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let new_text_clone = new_text.clone();
                             let upd = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
@@ -1959,7 +1896,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 continue;
                             }
 
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let mid = msg_id;
                             let extra = tokio::task::spawn_blocking(move || {
                                 let st = db.lock().unwrap();
@@ -2011,7 +1948,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             )
                             .await;
 
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let gname2 = gname.clone();
                             let members = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
@@ -2025,7 +1962,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 if member_id == my_user_id {
                                     continue;
                                 }
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let mid_c = member_id.clone();
                                 let hidden = tokio::task::spawn_blocking(move || {
                                     let st = db.lock().unwrap();
@@ -2035,7 +1972,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     continue;
                                 }
 
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let mid_c = member_id.clone();
                                 let member_name_opt = tokio::task::spawn_blocking(move || {
                                     let mut st = db.lock().unwrap();
@@ -2056,23 +1993,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                                 let tokens = {
                                     state
-                                        .lock()
-                                        .await
                                         .online_users
                                         .get(&member_name)
-                                        .cloned()
+                                        .map(|r| r.clone())
                                         .unwrap_or_default()
                                 };
                                 for tok in tokens {
-                                    let sess = { state.lock().await.sessions.get(&tok).cloned() };
+                                    let sess = state.sessions.get(&tok).map(|r| r.clone());
                                     if let Some(s) = sess {
-                                        let (ttx, tkeys) = {
-                                            let g = s.lock().await;
-                                            (g.tx.clone(), g.keys.clone())
-                                        };
                                         let _ = send_encrypted_message(
-                                            &ttx,
-                                            &tkeys,
+                                            &s.tx,
+                                            &s.keys,
                                             &my_username,
                                             &recip_with_hash,
                                             new_text.as_bytes(),
@@ -2094,7 +2025,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             info!("Групповое сообщение id={} отредактировано", msg_id);
                         }
                         MSG_KIND_CHANNEL => {
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let new_text_clone = new_text.clone();
                             let upd = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
@@ -2127,7 +2058,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 continue;
                             }
 
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let mid = msg_id;
                             let extra = tokio::task::spawn_blocking(move || {
                                 let st = db.lock().unwrap();
@@ -2177,7 +2108,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             )
                             .await;
 
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let cname2 = cname.clone();
                             let subscribers = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
@@ -2191,7 +2122,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 if sub_id == my_user_id {
                                     continue;
                                 }
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let sid_c = sub_id.clone();
                                 let hidden = tokio::task::spawn_blocking(move || {
                                     let st = db.lock().unwrap();
@@ -2201,7 +2132,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     continue;
                                 }
 
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let sid_c = sub_id.clone();
                                 let sub_name_opt = tokio::task::spawn_blocking(move || {
                                     let mut st = db.lock().unwrap();
@@ -2222,23 +2153,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                                 let tokens = {
                                     state
-                                        .lock()
-                                        .await
                                         .online_users
                                         .get(&sub_name)
-                                        .cloned()
+                                        .map(|r| r.clone())
                                         .unwrap_or_default()
                                 };
                                 for tok in tokens {
-                                    let sess = { state.lock().await.sessions.get(&tok).cloned() };
+                                    let sess = state.sessions.get(&tok).map(|r| r.clone());
                                     if let Some(s) = sess {
-                                        let (ttx, tkeys) = {
-                                            let g = s.lock().await;
-                                            (g.tx.clone(), g.keys.clone())
-                                        };
                                         let _ = send_encrypted_message(
-                                            &ttx,
-                                            &tkeys,
+                                            &s.tx,
+                                            &s.keys,
                                             &my_username,
                                             &recip_with_amp,
                                             new_text.as_bytes(),
@@ -2298,7 +2223,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     // --- Личные ---
                     if !personal_ids.is_empty() {
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let me = my_user_id.clone();
                         let ids = personal_ids.clone();
                         let by_author = tokio::task::spawn_blocking(move || {
@@ -2307,7 +2232,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             for msg_id in ids {
                                 let row: Option<(String, String)> = st.conn.query_row(
                                     "SELECT sender_id, recipient_id FROM messages WHERE id = ?",
-                                    [msg_id], |row| Ok((row.get(0)?, row.get(1)?)),
+                                    [msg_id], |row| Ok((row.get(0)?, row.get(1)?))
                                 ).ok();
                                 if let Some((sender_id, recipient_id)) = row {
                                     if recipient_id == me {
@@ -2324,7 +2249,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 continue;
                             }
                             let author_name = {
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let aid = author_id.clone();
                                 tokio::task::spawn_blocking(move || {
                                     let mut st = db.lock().unwrap();
@@ -2335,21 +2260,18 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             };
                             let tokens = {
                                 state
-                                    .lock()
-                                    .await
                                     .online_users
                                     .get(&author_name)
-                                    .cloned()
+                                    .map(|r| r.clone())
                                     .unwrap_or_default()
                             };
                             let items: Vec<(u8, i64)> =
                                 ids.iter().map(|id| (MSG_KIND_PERSONAL, *id)).collect();
                             let pkt = crate::senders::build_read_packet(&items);
                             for tok in tokens {
-                                let sess = { state.lock().await.sessions.get(&tok).cloned() };
+                                let sess = state.sessions.get(&tok).map(|r| r.clone());
                                 if let Some(s) = sess {
-                                    let ttx = s.lock().await.tx.clone();
-                                    let _ = ttx.send(Message::Binary(pkt.clone().into()));
+                                    let _ = s.tx.send(Message::Binary(pkt.clone().into()));
                                 }
                             }
                         }
@@ -2357,8 +2279,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     // --- Группы ---
                     if !group_ids.is_empty() {
-                        let db = state.lock().await.db.clone();
-                        let me = my_user_id.clone();
+                        let db = state.db.clone();
                         let ids = group_ids.clone();
                         let by_group = tokio::task::spawn_blocking(move || {
                             let st = db.lock().unwrap();
@@ -2370,12 +2291,11 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     map.entry(gid).or_default().push(msg_id);
                                 }
                             }
-                            let _ = me;
                             map
                         }).await.unwrap();
 
                         for (group_id, ids) in by_group {
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let gid = group_id.clone();
                             let members = tokio::task::spawn_blocking(move || {
                                 let st = db.lock().unwrap();
@@ -2405,7 +2325,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     continue;
                                 }
                                 let name = {
-                                    let db = state.lock().await.db.clone();
+                                    let db = state.db.clone();
                                     let m = mid.clone();
                                     tokio::task::spawn_blocking(move || {
                                         let mut st = db.lock().unwrap();
@@ -2416,18 +2336,15 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                 };
                                 let tokens = {
                                     state
-                                        .lock()
-                                        .await
                                         .online_users
                                         .get(&name)
-                                        .cloned()
+                                        .map(|r| r.clone())
                                         .unwrap_or_default()
                                 };
                                 for tok in tokens {
-                                    let sess = { state.lock().await.sessions.get(&tok).cloned() };
+                                    let sess = state.sessions.get(&tok).map(|r| r.clone());
                                     if let Some(s) = sess {
-                                        let ttx = s.lock().await.tx.clone();
-                                        let _ = ttx.send(Message::Binary(pkt.clone().into()));
+                                        let _ = s.tx.send(Message::Binary(pkt.clone().into()));
                                     }
                                 }
                             }
@@ -2436,7 +2353,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     // --- Каналы ---
                     if !channel_ids.is_empty() {
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let me = my_user_id.clone();
                         let ids = channel_ids.clone();
                         let _ = tokio::task::spawn_blocking(move || {
@@ -2480,7 +2397,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                         match kind {
                             MSG_KIND_PERSONAL => {
-                                let db = state.lock().await.db.clone();
+                                let db = state.db.clone();
                                 let target_name = name.clone();
                                 let peer_id_opt = tokio::task::spawn_blocking(move || {
                                     let mut st = db.lock().unwrap();
@@ -2491,7 +2408,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                                 if let Some(peer_id) = peer_id_opt {
                                     if dtype == MSG_DELETE_FOR_ME {
-                                        let db = state.lock().await.db.clone();
+                                        let db = state.db.clone();
                                         let uid = my_user_id.clone();
                                         let pid = peer_id.clone();
                                         let _ = tokio::task::spawn_blocking(move || {
@@ -2500,7 +2417,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         })
                                         .await;
                                     } else {
-                                        let db = state.lock().await.db.clone();
+                                        let db = state.db.clone();
                                         let uid = my_user_id.clone();
                                         let pid = peer_id.clone();
                                         let _ = tokio::task::spawn_blocking(move || {
@@ -2518,7 +2435,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             }
                             MSG_KIND_GROUP => {
                                 if dtype == MSG_DELETE_FOR_ME {
-                                    let db = state.lock().await.db.clone();
+                                    let db = state.db.clone();
                                     let uid = my_user_id.clone();
                                     let gname = name.clone();
                                     let _ = tokio::task::spawn_blocking(move || {
@@ -2527,7 +2444,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     })
                                     .await;
                                 } else {
-                                    let db = state.lock().await.db.clone();
+                                    let db = state.db.clone();
                                     let uid = my_user_id.clone();
                                     let gname = name.clone();
                                     let del_res = tokio::task::spawn_blocking(move || {
@@ -2540,7 +2457,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     match del_res {
                                         Ok(true) => {
                                             let pkt = build_delete_chat_packet(kind, &name, 0);
-                                            let db = state.lock().await.db.clone();
+                                            let db = state.db.clone();
                                             let gname2 = name.clone();
                                             let members = tokio::task::spawn_blocking(move || {
                                                 let mut st = db.lock().unwrap();
@@ -2551,7 +2468,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             .unwrap_or_default();
 
                                             for m_id in members {
-                                                let db = state.lock().await.db.clone();
+                                                let db = state.db.clone();
                                                 let m = m_id.clone();
                                                 let m_name =
                                                     tokio::task::spawn_blocking(move || {
@@ -2583,7 +2500,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             }
                             MSG_KIND_CHANNEL => {
                                 if dtype == MSG_DELETE_FOR_ME {
-                                    let db = state.lock().await.db.clone();
+                                    let db = state.db.clone();
                                     let uid = my_user_id.clone();
                                     let cname = name.clone();
                                     let _ = tokio::task::spawn_blocking(move || {
@@ -2592,7 +2509,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     })
                                     .await;
                                 } else {
-                                    let db = state.lock().await.db.clone();
+                                    let db = state.db.clone();
                                     let uid = my_user_id.clone();
                                     let cname = name.clone();
                                     let del_res = tokio::task::spawn_blocking(move || {
@@ -2605,7 +2522,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     match del_res {
                                         Ok(true) => {
                                             let pkt = build_delete_chat_packet(kind, &name, 0);
-                                            let db = state.lock().await.db.clone();
+                                            let db = state.db.clone();
                                             let cname2 = name.clone();
                                             let subs = tokio::task::spawn_blocking(move || {
                                                 let mut st = db.lock().unwrap();
@@ -2619,7 +2536,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                             .unwrap_or_default();
 
                                             for sub_id in subs {
-                                                let db = state.lock().await.db.clone();
+                                                let db = state.db.clone();
                                                 let s = sub_id.clone();
                                                 let s_name =
                                                     tokio::task::spawn_blocking(move || {
@@ -2657,7 +2574,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                     // ---- УДАЛЕНИЕ ОДНОГО СООБЩЕНИЯ ----
                     let dtype = if rest.len() >= 10 { rest[9] } else { 0 };
                     if dtype == MSG_DELETE_FOR_ME {
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let uid = my_user_id.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             let mut st = db.lock().unwrap();
@@ -2677,7 +2594,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     match kind {
                         MSG_KIND_PERSONAL => {
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let lookup = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
                                 AppState::lookup_personal_message(&mut st.conn, msg_id)
@@ -2695,7 +2612,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         .await;
                                         continue;
                                     }
-                                    let db = state.lock().await.db.clone();
+                                    let db = state.db.clone();
                                     let del = tokio::task::spawn_blocking(move || {
                                         let mut st = db.lock().unwrap();
                                         AppState::delete_message(&mut st.conn, msg_id)
@@ -2719,7 +2636,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                     let _ = tx.send(Message::Binary(pkt.clone().into()));
 
                                     if recipient_id != my_user_id {
-                                        let db = state.lock().await.db.clone();
+                                        let db = state.db.clone();
                                         let rid = recipient_id.clone();
                                         let rec_name_opt = tokio::task::spawn_blocking(move || {
                                             let mut st = db.lock().unwrap();
@@ -2736,20 +2653,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         if let Some(rec_name) = rec_name_opt {
                                             let tokens = {
                                                 state
-                                                    .lock()
-                                                    .await
                                                     .online_users
                                                     .get(&rec_name)
-                                                    .cloned()
+                                                    .map(|r| r.clone())
                                                     .unwrap_or_default()
                                             };
                                             for tok in tokens {
-                                                let target = {
-                                                    state.lock().await.sessions.get(&tok).cloned()
-                                                };
+                                                let target =
+                                                    state.sessions.get(&tok).map(|r| r.clone());
                                                 if let Some(ts) = target {
-                                                    let ttx = { ts.lock().await.tx.clone() };
-                                                    let _ = ttx
+                                                    let _ = ts
+                                                        .tx
                                                         .send(Message::Binary(pkt.clone().into()));
                                                 }
                                             }
@@ -2775,7 +2689,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             .await;
                         }
                         MSG_KIND_CHANNEL => {
-                            let db = state.lock().await.db.clone();
+                            let db = state.db.clone();
                             let lookup = tokio::task::spawn_blocking(move || {
                                 let mut st = db.lock().unwrap();
                                 AppState::lookup_channel_message(&mut st.conn, msg_id)
@@ -2789,7 +2703,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         let _ = send_system_message(&tx, "[Система] Только владелец канала может удалять сообщения").await;
                                         continue;
                                     }
-                                    let db = state.lock().await.db.clone();
+                                    let db = state.db.clone();
                                     let del = tokio::task::spawn_blocking(move || {
                                         let mut st = db.lock().unwrap();
                                         AppState::delete_channel_message(&mut st.conn, msg_id)
@@ -2805,7 +2719,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         continue;
                                     }
 
-                                    let db = state.lock().await.db.clone();
+                                    let db = state.db.clone();
                                     let ch = channel_name.clone();
                                     let subs_ids = tokio::task::spawn_blocking(move || {
                                         let mut st = db.lock().unwrap();
@@ -2821,28 +2735,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                                         MSG_DELETE_FOR_ALL,
                                     );
 
-                                    let mut tokens: Vec<String> = Vec::new();
-                                    {
-                                        let g = state.lock().await;
-                                        for (tok, sess) in &g.sessions {
-                                            let uid = {
-                                                let guard = sess.lock().await;
-                                                guard.user_id.clone()
-                                            };
-                                            if let Some(uid) = uid {
-                                                if subs_ids.contains(&uid) {
-                                                    tokens.push(tok.clone());
-                                                }
+                                    let sessions: Vec<Arc<Session>> =
+                                        state.sessions.iter().map(|r| r.value().clone()).collect();
+                                    for s in sessions {
+                                        if let Some(uid) = s.user_id.get() {
+                                            if subs_ids.contains(uid) {
+                                                let _ =
+                                                    s.tx.send(Message::Binary(pkt.clone().into()));
                                             }
-                                        }
-                                    }
-
-                                    for tok in tokens {
-                                        let target =
-                                            { state.lock().await.sessions.get(&tok).cloned() };
-                                        if let Some(ts) = target {
-                                            let ttx = { ts.lock().await.tx.clone() };
-                                            let _ = ttx.send(Message::Binary(pkt.clone().into()));
                                         }
                                     }
                                 }
@@ -2907,7 +2807,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             let _ = send_system_message(&tx, "[Система] Неверный пароль").await;
                             continue;
                         }
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let uid = my_user_id.clone();
                         let pwd = password.to_string();
                         let pwd_check = tokio::task::spawn_blocking(move || {
@@ -2931,7 +2831,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                             }
                         }
 
-                        let db = state.lock().await.db.clone();
+                        let db = state.db.clone();
                         let uid = my_user_id.clone();
                         let result = tokio::task::spawn_blocking(move || {
                             let mut st = db.lock().unwrap();
@@ -2967,34 +2867,27 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
                         pkt.extend_from_slice(rb);
 
                         for tok in &tokens_to_kill {
-                            let sess = { state.lock().await.sessions.get(tok).cloned() };
+                            let sess = state.sessions.get(tok).map(|r| r.clone());
                             if let Some(s) = sess {
-                                let ttx = s.lock().await.tx.clone();
-                                let _ = ttx.send(Message::Binary(pkt.clone().into()));
+                                let _ = s.tx.send(Message::Binary(pkt.clone().into()));
                             }
                         }
 
-                        {
-                            let mut g = state.lock().await;
-                            g.online_users.remove(&my_username);
-                            for tok in &tokens_to_kill {
-                                g.sessions.remove(tok);
-                            }
+                        state.online_users.remove(&my_username);
+                        for tok in &tokens_to_kill {
+                            state.sessions.remove(tok);
                         }
 
                         let msg = format!("[Система] Пользователь {} удалил аккаунт", my_username);
                         broadcast_system_message(&state, &msg, Some(&my_username)).await;
 
-                        {
-                            let mut guard = session.lock().await;
-                            guard.connected = false;
-                        }
+                        session.connected.store(false, Ordering::Relaxed);
                         continue;
                     }
 
                     // Обычный logout (exit)
                     info!("Logout: EXIT, token={}", token);
-                    let db = state.lock().await.db.clone();
+                    let db = state.db.clone();
                     let tok = token.to_string();
                     let result = tokio::task::spawn_blocking(move || {
                         let mut st = db.lock().unwrap();
@@ -3005,21 +2898,20 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
                     match result {
                         Ok(_) => {
-                            {
-                                let mut state_guard = state.lock().await;
-                                state_guard.sessions.remove(token);
-                                let uname = my_username.clone();
-                                if let Some(tokens) = state_guard.online_users.get_mut(&uname) {
-                                    tokens.retain(|t| t != token);
-                                    if tokens.is_empty() {
-                                        state_guard.online_users.remove(&uname);
-                                    }
+                            state.sessions.remove(token);
+
+                            let mut should_remove = false;
+                            if let Some(mut tokens) = state.online_users.get_mut(&my_username) {
+                                tokens.retain(|t| t != token);
+                                if tokens.is_empty() {
+                                    should_remove = true;
                                 }
                             }
-                            {
-                                let mut guard = session.lock().await;
-                                guard.connected = false;
+                            if should_remove {
+                                state.online_users.remove(&my_username);
                             }
+
+                            session.connected.store(false, Ordering::Relaxed);
                             let _ = send_system_message(&tx, "[Система] Вы вышли из системы").await;
                             info!("Сессия {} завершена по logout", token);
                         }
@@ -3109,31 +3001,30 @@ pub async fn handle_client(stream: TcpStream, state: Arc<Mutex<AppState>>) {
 
     // ---- Закрытие сессии ----
     {
-        let username = {
-            let guard = session.lock().await;
-            guard.username.clone().unwrap_or_default()
-        };
-        let token = {
-            let guard = session.lock().await;
-            guard.token.clone().unwrap_or_default()
-        };
-        let mut state_guard = state.lock().await;
+        let username = session.username.get().cloned().unwrap_or_default();
+        let token = session.token.get().cloned().unwrap_or_default();
+
         if !username.is_empty() {
-            if let Some(tokens) = state_guard.online_users.get_mut(&username) {
+            let mut should_remove = false;
+            if let Some(mut tokens) = state.online_users.get_mut(&username) {
                 tokens.retain(|t| t != &token);
                 if tokens.is_empty() {
-                    state_guard.online_users.remove(&username);
+                    should_remove = true;
                 }
             }
+            if should_remove {
+                state.online_users.remove(&username);
+            }
         }
+
         if !token.is_empty() {
-            state_guard.sessions.remove(&token);
+            state.sessions.remove(&token);
         }
+
         let msg = format!("[Система] Пользователь {} отключился", username);
-        drop(state_guard);
 
         if !my_user_id.is_empty() {
-            let db_ls = state.lock().await.db.clone();
+            let db_ls = state.db.clone();
             let uid_ls = my_user_id.clone();
             tokio::task::spawn_blocking(move || {
                 let mut st = db_ls.lock().unwrap();

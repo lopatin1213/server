@@ -14,9 +14,10 @@ use tokio::sync::Mutex;
 
 use app_state::{AppState, DbState};
 
+// Замени функцию run_server:
 async fn run_server(
     listener: TcpListener,
-    state: Arc<Mutex<AppState>>,
+    state: Arc<AppState>, // <-- Убрали Mutex
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -26,6 +27,8 @@ async fn run_server(
         });
     }
 }
+
+// В функции main, в блоке воркера очистки, замени:
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -49,7 +52,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if fk_enabled != 1 {
         eprintln!("ВНИМАНИЕ: foreign_keys не включены!");
     }
-    
 
     AppState::init_db(&mut conn)?;
 
@@ -72,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         username_to_id,
         id_to_username,
     };
-    let state = Arc::new(Mutex::new(AppState::new(db_state)));
+    let state = Arc::new(AppState::new(db_state));
 
     let ctrl_c = tokio::signal::ctrl_c();
     let terminate = async {
@@ -95,7 +97,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
             loop {
                 interval.tick().await;
-                let db = state_cleanup.lock().await.db.clone();
+                let db = state_cleanup.db.clone(); // <-- Убрали .lock().await
                 let _ = tokio::task::spawn_blocking(move || {
                     let mut st = db.lock().unwrap();
                     AppState::purge_expired(&mut st.conn)

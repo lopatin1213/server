@@ -115,30 +115,26 @@ pub async fn send_encrypted_message(
         .map_err(|e| format!("send error: {}", e))
 }
 pub async fn send_to_all_my_sessions(
-    state: &Arc<Mutex<AppState>>,
+    state: &Arc<AppState>, // <-- Без Mutex
     my_username: &str,
     recipient_name: &str,
     plaintext: &[u8],
     fields: MsgFields,
-    client_msg_id: Option<i64>, // <--- ДОБАВЛЕНО
+    client_msg_id: Option<i64>,
 ) {
     let tokens = {
-        let g = state.lock().await;
-        g.online_users.get(my_username).cloned().unwrap_or_default()
+        state
+            .online_users
+            .get(my_username)
+            .map(|r| r.clone())
+            .unwrap_or_default()
     };
     for tok in tokens {
-        let sess = {
-            let g = state.lock().await;
-            g.sessions.get(&tok).cloned()
-        };
+        let sess = state.sessions.get(&tok).map(|r| r.clone());
         if let Some(s) = sess {
-            let (tx, keys) = {
-                let guard = s.lock().await;
-                (guard.tx.clone(), guard.keys.clone())
-            };
             let _ = send_encrypted_message(
-                &tx,
-                &keys,
+                &s.tx,
+                &s.keys,
                 my_username,
                 recipient_name,
                 plaintext,
@@ -150,42 +146,41 @@ pub async fn send_to_all_my_sessions(
     }
 }
 
-/// Разослать сырой пакет (например, 0x05 при удалении) всем активным сессиям пользователя.
-pub async fn send_to_user_sessions(state: &Arc<Mutex<AppState>>, username: &str, packet: Vec<u8>) {
+pub async fn send_to_user_sessions(
+    state: &Arc<AppState>, // <-- Без Mutex
+    username: &str,
+    packet: Vec<u8>,
+) {
     let tokens = {
-        let g = state.lock().await;
-        g.online_users.get(username).cloned().unwrap_or_default()
+        state
+            .online_users
+            .get(username)
+            .map(|r| r.clone())
+            .unwrap_or_default()
     };
     for tok in tokens {
-        let sess = {
-            let g = state.lock().await;
-            g.sessions.get(&tok).cloned()
-        };
+        let sess = state.sessions.get(&tok).map(|r| r.clone());
         if let Some(s) = sess {
-            let tx = s.lock().await.tx.clone();
-            let _ = tx.send(Message::Binary(packet.clone().into()));
+            let _ = s.tx.send(Message::Binary(packet.clone().into()));
         }
     }
 }
 
 pub async fn broadcast_system_message(
-    state: &Arc<Mutex<AppState>>,
+    state: &Arc<AppState>, // <-- Без Mutex
     message: &str,
     exclude_username: Option<&str>,
 ) {
-    let state_guard = state.lock().await;
-    for (_, session) in &state_guard.sessions {
-        let (connected, tx, username) = {
-            let guard = session.lock().await;
-            (guard.connected, guard.tx.clone(), guard.username.clone())
-        };
+    for entry in state.sessions.iter() {
+        let session = entry.value();
+        let connected = session.connected.load(std::sync::atomic::Ordering::Relaxed);
         if connected {
-            if let Some(uname) = username {
+            if let Some(uname) = session.username.get() {
                 if Some(uname.as_str()) == exclude_username {
                     continue;
                 }
             }
-            let _ = send_system_message(&tx, message).await;
+            let _ = send_system_message(&session.tx, message).await;
         }
     }
 }
@@ -197,10 +192,12 @@ pub async fn send_chat_history(
     chat: &str,
     before_id: Option<i64>,
     limit: i64,
-    state: &Arc<Mutex<AppState>>,
+    state: &Arc<AppState>, // <-- Без Mutex
 ) {
+    let db = state.db.clone(); // <-- Берем только db
+
     let cursor = before_id.unwrap_or(i64::MAX);
-    let db = state.lock().await.db.clone();
+
     let me = my_user_id.to_string();
     let chat_owned = chat.to_string();
 
@@ -360,13 +357,13 @@ pub async fn send_messages_by_ids(
     my_user_id: &str,
     kind: u8,
     ids: Vec<i64>,
-    state: &Arc<Mutex<AppState>>,
+    state: &Arc<AppState>, // <-- Без Mutex
 ) {
     if ids.is_empty() {
         return;
     }
     let requested = ids.len();
-    let db = state.lock().await.db.clone();
+    let db = state.db.clone();
     let me = my_user_id.to_string();
 
     let result = tokio::task::spawn_blocking(move || {

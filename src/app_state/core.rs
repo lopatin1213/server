@@ -1,7 +1,8 @@
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use dashmap::DashMap;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Instant;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::constants::*;
@@ -24,16 +25,16 @@ pub struct MsgFields {
     pub edited: bool,
 }
 
-// ==================== Сессия ====================
+// ==================== Сессия (без Mutex!) ====================
 pub struct Session {
     pub tx: mpsc::UnboundedSender<Message>,
     pub keys: SessionKeys,
-    pub connected: bool,
-    pub user_id: Option<String>,
-    pub username: Option<String>,
-    pub token: Option<String>,
-    pub last_msg_time: Instant,
-    pub msg_count: usize,
+    pub connected: AtomicBool,
+    pub user_id: OnceLock<String>,
+    pub username: OnceLock<String>,
+    pub token: OnceLock<String>,
+    pub last_msg_time: StdMutex<Instant>, // Маленький лок только для времени
+    pub msg_count: AtomicUsize,
 }
 
 impl Session {
@@ -41,33 +42,34 @@ impl Session {
         Self {
             tx,
             keys,
-            connected: true,
-            user_id: None,
-            username: None,
-            token: None,
-            last_msg_time: Instant::now(),
-            msg_count: 0,
+            connected: AtomicBool::new(true),
+            user_id: OnceLock::new(),
+            username: OnceLock::new(),
+            token: OnceLock::new(),
+            last_msg_time: StdMutex::new(Instant::now()),
+            msg_count: AtomicUsize::new(0),
         }
     }
 
-    pub fn check_rate_limit(&mut self) -> bool {
+    pub fn check_rate_limit(&self) -> bool {
         let now = Instant::now();
-        if now - self.last_msg_time > RATE_LIMIT_WINDOW {
-            self.last_msg_time = now;
-            self.msg_count = 1;
+        let mut last = self.last_msg_time.lock().unwrap();
+        if now.duration_since(*last) > RATE_LIMIT_WINDOW {
+            *last = now;
+            self.msg_count.store(1, Ordering::Relaxed);
             true
         } else {
-            self.msg_count += 1;
-            self.msg_count <= RATE_LIMIT_MAX
+            let count = self.msg_count.fetch_add(1, Ordering::Relaxed) + 1;
+            count <= RATE_LIMIT_MAX
         }
     }
 }
 
-// ==================== DbState ====================
+// ==================== DbState (не трогаем, пока SQLite) ====================
 pub struct DbState {
     pub conn: rusqlite::Connection,
-    pub username_to_id: HashMap<String, String>,
-    pub id_to_username: HashMap<String, String>,
+    pub username_to_id: std::collections::HashMap<String, String>,
+    pub id_to_username: std::collections::HashMap<String, String>,
 }
 
 impl DbState {
@@ -110,19 +112,19 @@ impl DbState {
     }
 }
 
-// ==================== AppState ====================
+// ==================== AppState (DashMap) ====================
 pub struct AppState {
     pub db: Arc<StdMutex<DbState>>,
-    pub sessions: HashMap<String, Arc<Mutex<Session>>>,
-    pub online_users: HashMap<String, Vec<String>>,
+    pub sessions: DashMap<String, Arc<Session>>,
+    pub online_users: DashMap<String, Vec<String>>,
 }
 
 impl AppState {
     pub fn new(db: DbState) -> Self {
         Self {
             db: Arc::new(StdMutex::new(db)),
-            sessions: HashMap::new(),
-            online_users: HashMap::new(),
+            sessions: DashMap::new(),
+            online_users: DashMap::new(),
         }
     }
 }
