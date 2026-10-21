@@ -48,9 +48,8 @@ jobs:
           override: true
 
       - name: Build release binary
-        env:
-          PYO3_PYTHON: /usr/bin/python3.13
-          RUSTFLAGS: "-C link-args=-lpython3.13"
+
+
         run: cargo build --release
 
       - name: Copy Python helper
