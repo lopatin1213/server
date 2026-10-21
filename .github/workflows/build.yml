@@ -14,42 +14,34 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y software-properties-common
-          
-          sudo apt-get update
-          sudo apt-get install -y  pkg-config libssl-dev curl
+          sudo apt-get install -y pkg-config libssl-dev curl
 
       - name: Setup Python 3.13
         uses: actions/setup-python@v5
         with:
           python-version: '3.13'
 
-      - name: Set PyO3 Env Vars
+      - name: Configure PyO3 and linker paths
         run: |
           # Указываем PyO3, какой питон использовать
           echo "PYO3_PYTHON=$(which python3.13)" >> $GITHUB_ENV
+          
+          # Надежно получаем путь к libpython3.13.so прямо из Python
+          LIB_DIR=$(python3.13 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+          echo "LD_LIBRARY_PATH=${LIB_DIR}:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+          
+          # Передаем флаги линкеру (чтобы он нашел библиотеку)
+          echo "RUSTFLAGS=-C link-arg=-L${LIB_DIR} -C link-arg=-lpython3.13" >> $GITHUB_ENV
 
-          # Находим, куда setup-python положил libpython3.13.so, и добавляем в LD_LIBRARY_PATH
-          LIB_DIR=$(dirname $(find /opt/hostedtoolcache/Python -name "libpython3.13.so" | head -n 1))
-          echo "LD_LIBRARY_PATH=$LIB_DIR" >> $GITHUB_ENV
-
-
-      - name: Install pip and firebase-admin
+      - name: Install Python packages
         run: |
-          curl -sS https://bootstrap.pypa.io/get-pip.py | python3.13
           python3.13 -m pip install --upgrade pip
           python3.13 -m pip install firebase-admin
 
       - name: Install Rust
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: stable
-          profile: minimal
-          override: true
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Build release binary
-
-
         run: cargo build --release
 
       - name: Copy Python helper
