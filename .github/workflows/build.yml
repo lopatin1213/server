@@ -19,9 +19,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y  pkg-config libssl-dev curl
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
         with:
           python-version: '3.13'
+
+      - name: Set PyO3 Env Vars
+        run: |
+          # Указываем PyO3, какой питон использовать
+          echo "PYO3_PYTHON=$(which python3.13)" >> $GITHUB_ENV
+
+          # Находим, куда setup-python положил libpython3.13.so, и добавляем в LD_LIBRARY_PATH
+          LIB_DIR=$(dirname $(find /opt/hostedtoolcache/Python -name "libpython3.13.so" | head -n 1))
+          echo "LD_LIBRARY_PATH=$LIB_DIR" >> $GITHUB_ENV
 
 
       - name: Install pip and firebase-admin
