@@ -11,13 +11,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Add official Python backports PPA
         run: |
+          sudo add-apt-repository -y ppa:canonical-python-maintainers/python-backports
           sudo apt-get update
-          sudo apt-get install -y software-properties-common
-          sudo add-apt-repository ppa:deadsnakes/ppa -y
-          sudo apt-get update
-          sudo apt-get install -y python3.13-dev libpython3.13-dev pkg-config libssl-dev curl
+          sudo apt-get install -y python3.13-dev libpython3.13-dev
 
       - name: Install pip and firebase-admin
         run: |
