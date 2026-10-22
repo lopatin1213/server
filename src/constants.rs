@@ -2,7 +2,7 @@ use std::time::Duration as StdDuration;
 
 // ==================== Версия протокола ====================
 pub const MIN_PROTO_VERSION: u16 = 3;
-pub const CURRENT_PROTO_VERSION: u16 = 3;
+pub const CURRENT_PROTO_VERSION: u16 = 4;
 
 pub const HANDSHAKE_OK: u8 = 0x00;
 pub const HANDSHAKE_REJECT: u8 = 0xFF;
@@ -16,6 +16,7 @@ pub const MSG_TYPE_DELETE: u8 = 0x05;
 pub const MSG_TYPE_LOGOUT: u8 = 0x06;
 pub const MSG_TYPE_READ: u8 = 0x07;
 pub const MSG_TYPE_EDIT: u8 = 0x08;
+pub const MSG_TYPE_TYPING: u8 = 0x09;
 
 pub const MSG_KIND_PERSONAL: u8 = 1;
 pub const MSG_KIND_GROUP: u8 = 2;

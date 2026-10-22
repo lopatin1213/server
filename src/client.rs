@@ -2984,6 +2984,90 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         let _ = send_system_message(&tx, &response).await;
                     }
                 }
+                MSG_TYPE_TYPING => {
+                    debug!("Получен пакет TYPING от {}", my_username); // <--- ДОБАВИТЬ
+                    // [0x09][kind u8][sender_len u32][sender][recipient_len u32][recipient]
+                    if rest.len() < 1 + 4 + 4 {
+                        continue;
+                    }
+                    let kind = rest[0];
+                    let mut offset = 1;
+
+                    let sender_len =
+                        u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    if rest.len() < offset + sender_len {
+                        continue;
+                    }
+                    let _sender_name =
+                        String::from_utf8_lossy(&rest[offset..offset + sender_len]).to_string();
+                    offset += sender_len;
+
+                    let recipient_len =
+                        u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    if rest.len() < offset + recipient_len {
+                        continue;
+                    }
+                    let recipient_name =
+                        String::from_utf8_lossy(&rest[offset..offset + recipient_len]).to_string();
+
+                    // Рассылаем дальше
+                    if kind == MSG_KIND_PERSONAL {
+                        let target_tokens = {
+                            state
+                                .online_users
+                                .get(&recipient_name)
+                                .map(|r| r.clone())
+                                .unwrap_or_default()
+                        };
+                        for tok in target_tokens {
+                            let target_session = state.sessions.get(&tok).map(|r| r.clone());
+                            if let Some(ts) = target_session {
+                                debug!("Пересылаю TYPING от {} к {}", my_username, recipient_name);
+                                let _ = ts.tx.send(Message::Binary(data.clone().into())); // Пересылаем как есть
+                            }
+                        }
+                    } else if kind == MSG_KIND_GROUP {
+                        let group_name = recipient_name.trim_start_matches('#').to_string();
+                        let db = state.db.clone();
+                        let gname = group_name.clone();
+                        let members = tokio::task::spawn_blocking(move || {
+                            let mut st = db.lock().unwrap();
+                            AppState::get_group_members(&mut st.conn, &gname)
+                        })
+                        .await
+                        .unwrap()
+                        .unwrap_or_default();
+
+                        for member_id in members {
+                            if member_id == my_user_id {
+                                continue;
+                            }
+                            let db = state.db.clone();
+                            let mid = member_id.clone();
+                            let member_name = tokio::task::spawn_blocking(move || {
+                                let mut st = db.lock().unwrap();
+                                st.resolve_username(&mid)
+                            })
+                            .await
+                            .unwrap();
+
+                            let tokens = state
+                                .online_users
+                                .get(&member_name)
+                                .map(|r| r.clone())
+                                .unwrap_or_default();
+                            for tok in tokens {
+                                let target_session = state.sessions.get(&tok).map(|r| r.clone());
+                                if let Some(ts) = target_session {
+                                    let _ = ts.tx.send(Message::Binary(data.clone().into()));
+                                }
+                            }
+                        }
+                    }
+                    // В каналах не пересылаем
+                }
 
                 _ => {
                     warn!("Неизвестный тип сообщения: {}", msg_type);
