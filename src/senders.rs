@@ -3,9 +3,8 @@ use aes_gcm::{
     aead::{Aead, AeadCore, KeyInit, OsRng},
 };
 use log::{info, warn};
-use rusqlite::params;
 use std::sync::Arc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::app_state::{AppState, MsgFields, SessionKeys};
@@ -75,7 +74,7 @@ pub async fn send_encrypted_message(
     recipient_name: &str,
     plaintext: &[u8],
     fields: MsgFields,
-    client_msg_id: Option<i64>, // <--- ДОБАВЛЕНО
+    client_msg_id: Option<i64>,
 ) -> Result<(), String> {
     if plaintext.len() > MAX_MESSAGE_SIZE {
         return Err("Message too large".to_string());
@@ -108,14 +107,14 @@ pub async fn send_encrypted_message(
     data.extend_from_slice(&views_val.to_be_bytes());
     data.push(if fields.edited { 1 } else { 0 });
 
-    // ДОБАВЛЕНО: Сериализация client_msg_id (0, если это не ACK)
     data.extend_from_slice(&client_msg_id.unwrap_or(0).to_be_bytes());
 
     tx.send(Message::Binary(data.into()))
         .map_err(|e| format!("send error: {}", e))
 }
+
 pub async fn send_to_all_my_sessions(
-    state: &Arc<AppState>, // <-- Без Mutex
+    state: &Arc<AppState>,
     my_username: &str,
     recipient_name: &str,
     plaintext: &[u8],
@@ -146,11 +145,7 @@ pub async fn send_to_all_my_sessions(
     }
 }
 
-pub async fn send_to_user_sessions(
-    state: &Arc<AppState>, // <-- Без Mutex
-    username: &str,
-    packet: Vec<u8>,
-) {
+pub async fn send_to_user_sessions(state: &Arc<AppState>, username: &str, packet: Vec<u8>) {
     let tokens = {
         state
             .online_users
@@ -167,7 +162,7 @@ pub async fn send_to_user_sessions(
 }
 
 pub async fn broadcast_system_message(
-    state: &Arc<AppState>, // <-- Без Mutex
+    state: &Arc<AppState>,
     message: &str,
     exclude_username: Option<&str>,
 ) {
@@ -192,21 +187,18 @@ pub async fn send_chat_history(
     chat: &str,
     before_id: Option<i64>,
     limit: i64,
-    state: &Arc<AppState>, // <-- Без Mutex
+    state: &Arc<AppState>,
 ) {
-    let db = state.db.clone(); // <-- Берем только db
-
     let cursor = before_id.unwrap_or(i64::MAX);
-
     let me = my_user_id.to_string();
     let chat_owned = chat.to_string();
 
     type HistRow = (
         i64,
-        String,
-        String,
-        String,
-        i64,
+        String, // sender_id (пока что)
+        String, // recipient_name (с префиксом # или &)
+        String, // content
+        i64,    // ts
         Option<i64>,
         bool,
         bool,
@@ -214,124 +206,170 @@ pub async fn send_chat_history(
         bool,
     );
 
-    let result: Result<Vec<HistRow>, String> = tokio::task::spawn_blocking(move || {
-        let mut st = db.lock().unwrap();
-
-        let raw: Vec<HistRow> = if chat_owned.starts_with('#') {
-            let gname = chat_owned.trim_start_matches('#').to_string();
-            let rows: Vec<(i64, String, String, i64, Option<i64>, Option<String>, i64)> = {
-                let mut stmt = st.conn.prepare(
-                    "SELECT gm.id, gm.sender_id, gm.content,
-                            strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, gm.first_read_at,
-                            COALESCE(gm.edited, 0)
-                     FROM group_messages gm
-                     JOIN groups g ON gm.group_id = g.id
-                     LEFT JOIN hidden_messages h ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = ?1
-                     WHERE g.name = ?2 AND gm.id < ?3 AND h.msg_id IS NULL
-                     ORDER BY gm.id DESC LIMIT ?4",
-                ).map_err(|e| e.to_string())?;
-                let iter = stmt.query_map(params![me, gname, cursor, limit], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, i64>(6).unwrap_or(0)))
-                }).map_err(|e| e.to_string())?;
-                let mut v = Vec::new();
-                for r in iter { v.push(r.map_err(|e| e.to_string())?); }
-                v
-            };
-            let mut out = Vec::with_capacity(rows.len());
-            for (id, sender_id, content, ts, reply_id, first_read_at, edited) in rows {
-                let sender = st.resolve_username(&sender_id);
-                let is_sender = sender_id == me;
-                out.push((id, sender, chat_owned.clone(), content, ts, reply_id, is_sender, first_read_at.is_some(), None, edited != 0));
-            }
-            out
-        } else if chat_owned.starts_with('&') {
-            let cname = chat_owned.trim_start_matches('&').to_string();
-            let rows: Vec<(i64, String, String, i64, Option<i64>, i64, i64)> = {
-                let mut stmt = st.conn.prepare(
-                    "SELECT cm.id, cm.sender_id, cm.content,
-                            strftime('%s', cm.sent_at) * 1000, cm.reply_to_id,
-                            (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id),
-                            COALESCE(cm.edited, 0)
-                     FROM channel_messages cm
-                     JOIN channels c ON cm.channel_id = c.id
-                     LEFT JOIN hidden_messages h ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
-                     WHERE c.name = ?2 AND cm.id < ?3 AND h.msg_id IS NULL
-                     ORDER BY cm.id DESC LIMIT ?4",
-                ).map_err(|e| e.to_string())?;
-                let iter = stmt.query_map(params![me, cname, cursor, limit], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, i64>(3)?, row.get::<_, Option<i64>>(4)?, row.get::<_, i64>(5).unwrap_or(0), row.get::<_, i64>(6).unwrap_or(0)))
-                }).map_err(|e| e.to_string())?;
-                let mut v = Vec::new();
-                for r in iter { v.push(r.map_err(|e| e.to_string())?); }
-                v
-            };
-            let mut out = Vec::with_capacity(rows.len());
-            for (id, sender_id, content, ts, reply_id, views, edited) in rows {
-                let sender = st.resolve_username(&sender_id);
-                let v = views as u32;
-                out.push((id, sender, chat_owned.clone(), content, ts, reply_id, true, v > 0, Some(v), edited != 0));
-            }
-            out
-        } else {
-            let peer_id = match st.resolve_id(&chat_owned) {
-                Some(id) => id,
-                None => return Ok(Vec::new()),
-            };
-            let rows: Vec<(i64, String, String, String, i64, Option<i64>, Option<String>, i64)> = {
-                let mut stmt = st.conn.prepare(
-                    "SELECT m.id, m.sender_id, m.recipient_id, m.content,
-                            strftime('%s', m.sent_at) * 1000, m.reply_to_id, m.read_at,
-                            COALESCE(m.edited, 0)
-                     FROM messages m
-                     LEFT JOIN hidden_messages h ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = ?1
-                     WHERE ((m.sender_id = ?1 AND m.recipient_id = ?2) OR (m.sender_id = ?2 AND m.recipient_id = ?1))
-                       AND m.id < ?3 AND h.msg_id IS NULL
-                     ORDER BY m.id DESC LIMIT ?4",
-                ).map_err(|e| e.to_string())?;
-                let iter = stmt.query_map(params![me, peer_id, cursor, limit], |row| {
-                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, Option<i64>>(5)?, row.get::<_, Option<String>>(6)?, row.get::<_, i64>(7).unwrap_or(0)))
-                }).map_err(|e| e.to_string())?;
-                let mut v = Vec::new();
-                for r in iter { v.push(r.map_err(|e| e.to_string())?); }
-                v
-            };
-            let mut out = Vec::with_capacity(rows.len());
-            for (id, sender_id, recipient_id, content, ts, reply_id, read_at, edited) in rows {
-                let sender = st.resolve_username(&sender_id);
-                let recipient = st.resolve_username(&recipient_id);
-                let is_sender = sender_id == me;
-                let read_flag = read_at.is_some();
-                let flag_me = if is_sender { true } else { read_flag };
-                let flag_any = if is_sender { read_flag } else { true };
-                out.push((id, sender, recipient, content, ts, reply_id, flag_me, flag_any, None, edited != 0));
-            }
-            out
-        };
-
-        let mut v = raw;
-        v.reverse();
-        Ok(v)
-    })
-        .await
-        .unwrap_or_else(|e| Err(format!("join: {}", e)));
-
-    let msgs = match result {
-        Ok(v) => v,
+    // Асинхронно получаем данные из Postgres
+    let client = match state.db.get().await {
+        Ok(c) => c,
         Err(e) => {
-            let _ = send_system_message(tx, &format!("[Система] Ошибка истории: {}", e)).await;
-            let _ = send_system_message(tx, &format!("[Система] history_done|{}|0", chat)).await;
+            let _ = send_system_message(tx, &format!("[Система] Ошибка пула БД: {}", e)).await;
             return;
         }
     };
 
+    let raw: Vec<HistRow> = if chat_owned.starts_with('#') {
+        let gname = chat_owned.trim_start_matches('#').to_string();
+        let query = client.prepare_cached(
+            "SELECT gm.id, gm.sender_id, gm.content,
+                    (EXTRACT(EPOCH FROM gm.sent_at) * 1000)::bigint, gm.reply_to_id, gm.first_read_at,
+                    gm.edited
+             FROM group_messages gm
+             JOIN groups g ON gm.group_id = g.id
+             LEFT JOIN hidden_messages h ON h.kind = 2 AND h.msg_id = gm.id AND h.user_id = $1
+             WHERE g.name = $2 AND gm.id < $3 AND h.msg_id IS NULL
+             ORDER BY gm.id DESC LIMIT $4"
+        ).await.unwrap();
+
+        let rows = client
+            .query(&query, &[&me, &gname, &cursor, &limit])
+            .await
+            .unwrap_or_default();
+
+        rows.into_iter()
+            .map(|row| {
+                let id: i64 = row.get(0);
+                let sender_id: String = row.get(1);
+                let content: String = row.get(2);
+                let ts: i64 = row.get(3);
+                let reply_id: Option<i64> = row.get(4);
+                let first_read_at: Option<chrono::DateTime<chrono::Utc>> = row.get(5);
+                let edited: bool = row.get(6);
+                (
+                    id,
+                    sender_id,
+                    chat_owned.clone(),
+                    content,
+                    ts,
+                    reply_id,
+                    first_read_at.is_some(),
+                    false,
+                    None,
+                    edited,
+                )
+            })
+            .collect()
+    } else if chat_owned.starts_with('&') {
+        let cname = chat_owned.trim_start_matches('&').to_string();
+        let query = client
+            .prepare_cached(
+                "SELECT cm.id, cm.sender_id, cm.content,
+                    (EXTRACT(EPOCH FROM cm.sent_at) * 1000)::bigint, cm.reply_to_id,
+                    (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id),
+                    cm.edited
+             FROM channel_messages cm
+             JOIN channels c ON cm.channel_id = c.id
+             LEFT JOIN hidden_messages h ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = $1
+             WHERE c.name = $2 AND cm.id < $3 AND h.msg_id IS NULL
+             ORDER BY cm.id DESC LIMIT $4",
+            )
+            .await
+            .unwrap();
+
+        let rows = client
+            .query(&query, &[&me, &cname, &cursor, &limit])
+            .await
+            .unwrap_or_default();
+
+        rows.into_iter()
+            .map(|row| {
+                let id: i64 = row.get(0);
+                let sender_id: String = row.get(1);
+                let content: String = row.get(2);
+                let ts: i64 = row.get(3);
+                let reply_id: Option<i64> = row.get(4);
+                let views: i64 = row.get(5);
+                let edited: bool = row.get(6);
+                let v = views as u32;
+                (
+                    id,
+                    sender_id,
+                    chat_owned.clone(),
+                    content,
+                    ts,
+                    reply_id,
+                    true,
+                    v > 0,
+                    Some(v),
+                    edited,
+                )
+            })
+            .collect()
+    } else {
+        let peer_id_opt = state.resolve_id(&chat_owned).await;
+        let peer_id = match peer_id_opt {
+            Some(id) => id,
+            None => return,
+        };
+        let query = client.prepare_cached(
+            "SELECT m.id, m.sender_id, m.content,
+                    (EXTRACT(EPOCH FROM m.sent_at) * 1000)::bigint, m.reply_to_id, m.read_at,
+                    m.edited
+             FROM messages m
+             LEFT JOIN hidden_messages h ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = $1
+             WHERE ((m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1))
+               AND m.id < $3 AND h.msg_id IS NULL
+             ORDER BY m.id DESC LIMIT $4"
+        ).await.unwrap();
+
+        let rows = client
+            .query(&query, &[&me, &peer_id, &cursor, &limit])
+            .await
+            .unwrap_or_default();
+
+        rows.into_iter()
+            .map(|row| {
+                let id: i64 = row.get(0);
+                let sender_id: String = row.get(1);
+                let content: String = row.get(2);
+                let ts: i64 = row.get(3);
+                let reply_id: Option<i64> = row.get(4);
+                let read_at: Option<chrono::DateTime<chrono::Utc>> = row.get(5);
+                let edited: bool = row.get(6);
+
+                let is_sender = sender_id == me;
+                let read_flag = read_at.is_some();
+                let flag_me = if is_sender { true } else { read_flag };
+                let flag_any = if is_sender { read_flag } else { true };
+
+                (
+                    id,
+                    sender_id,
+                    chat_owned.clone(),
+                    content,
+                    ts,
+                    reply_id,
+                    flag_me,
+                    flag_any,
+                    None,
+                    edited,
+                )
+            })
+            .collect()
+    };
+
+    let mut msgs = raw;
+    msgs.reverse(); // В хронологическом порядке
+
     let count = msgs.len();
     info!("История {}: отдано {} сообщений", chat, count);
-    for (msg_id, sender, recipient, content, ts, reply_id, flag_me, flag_any, views, edited) in msgs
+
+    for (msg_id, sender_id, recipient, content, ts, reply_id, flag_me, flag_any, views, edited) in
+        msgs
     {
+        let sender_name = state.resolve_username(&sender_id).await;
+
         let _ = send_encrypted_message(
             tx,
             keys,
-            &sender,
+            &sender_name,
             &recipient,
             content.as_bytes(),
             MsgFields {
@@ -343,7 +381,7 @@ pub async fn send_chat_history(
                 views,
                 edited,
             },
-            None, // <--- ДОБАВИТЬ СЮДА
+            None,
         )
         .await;
     }
@@ -357,21 +395,15 @@ pub async fn send_messages_by_ids(
     my_user_id: &str,
     kind: u8,
     ids: Vec<i64>,
-    state: &Arc<AppState>, // <-- Без Mutex
+    state: &Arc<AppState>,
 ) {
     if ids.is_empty() {
         return;
     }
     let requested = ids.len();
-    let db = state.db.clone();
     let me = my_user_id.to_string();
 
-    let result = tokio::task::spawn_blocking(move || {
-        let mut st = db.lock().unwrap();
-        AppState::get_messages_by_ids(&mut st, kind, &ids, &me)
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("join: {}", e)));
+    let result = state.get_messages_by_ids(kind, &ids, &me).await;
 
     let msgs = match result {
         Ok(v) => v,
@@ -404,7 +436,7 @@ pub async fn send_messages_by_ids(
                 views,
                 edited,
             },
-            None, // <--- ДОБАВИТЬ СЮДА
+            None,
         )
         .await;
     }

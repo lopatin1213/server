@@ -1,4 +1,5 @@
 use dashmap::DashMap;
+use deadpool_postgres::Pool;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Instant;
@@ -65,66 +66,80 @@ impl Session {
     }
 }
 
-// ==================== DbState (не трогаем, пока SQLite) ====================
-pub struct DbState {
-    pub conn: rusqlite::Connection,
-    pub username_to_id: std::collections::HashMap<String, String>,
-    pub id_to_username: std::collections::HashMap<String, String>,
-}
-
-impl DbState {
-    pub fn resolve_username(&mut self, id: &str) -> String {
-        if let Some(name) = self.id_to_username.get(id) {
-            return name.clone();
-        }
-        let r: Result<String, _> =
-            self.conn
-                .query_row("SELECT username FROM users WHERE id = ?", [id], |row| {
-                    row.get(0)
-                });
-        match r {
-            Ok(name) => {
-                self.id_to_username.insert(id.to_string(), name.clone());
-                self.username_to_id.insert(name.clone(), id.to_string());
-                name
-            }
-            Err(_) => DELETED_LABEL.to_string(),
-        }
-    }
-
-    pub fn resolve_id(&mut self, username: &str) -> Option<String> {
-        if let Some(id) = self.username_to_id.get(username) {
-            return Some(id.clone());
-        }
-        let r: Result<String, _> = self.conn.query_row(
-            "SELECT id FROM users WHERE username = ?",
-            [username],
-            |row| row.get(0),
-        );
-        match r {
-            Ok(id) => {
-                self.username_to_id.insert(username.to_string(), id.clone());
-                self.id_to_username.insert(id.clone(), username.to_string());
-                Some(id)
-            }
-            Err(_) => None,
-        }
-    }
-}
-
-// ==================== AppState (DashMap) ====================
+// ==================== AppState (Postgres Pool + DashMap) ====================
 pub struct AppState {
-    pub db: Arc<StdMutex<DbState>>,
+    pub db: Pool,
     pub sessions: DashMap<String, Arc<Session>>,
     pub online_users: DashMap<String, Vec<String>>,
+    // Кэши для быстрого поиска без запросов в БД
+    pub username_to_id: DashMap<String, String>,
+    pub id_to_username: DashMap<String, String>,
 }
 
 impl AppState {
-    pub fn new(db: DbState) -> Self {
+    pub fn new(db: Pool) -> Self {
         Self {
-            db: Arc::new(StdMutex::new(db)),
+            db,
             sessions: DashMap::new(),
             online_users: DashMap::new(),
+            username_to_id: DashMap::new(),
+            id_to_username: DashMap::new(),
+        }
+    }
+
+    // Асинхронный аналог старого метода из DbState
+    pub async fn resolve_username(&self, id: &str) -> String {
+        // 1. Пытаемся найти в кэше
+        if let Some(name) = self.id_to_username.get(id) {
+            return name.clone();
+        }
+
+        // 2. Если нет — идем в базу
+        match self.db.get().await {
+            Ok(client) => {
+                match client
+                    .query_opt("SELECT username FROM users WHERE id = $1", &[&id])
+                    .await
+                {
+                    Ok(Some(row)) => {
+                        let name: String = row.get(0);
+                        // Обновляем кэш
+                        self.id_to_username.insert(id.to_string(), name.clone());
+                        self.username_to_id.insert(name.clone(), id.to_string());
+                        name
+                    }
+                    _ => DELETED_LABEL.to_string(), // Если юзер удален или ошибка
+                }
+            }
+            Err(_) => DELETED_LABEL.to_string(), // Если нет коннекта к БД
+        }
+    }
+
+    // Асинхронный аналог старого метода из DbState
+    pub async fn resolve_id(&self, username: &str) -> Option<String> {
+        // 1. Пытаемся найти в кэше
+        if let Some(id) = self.username_to_id.get(username) {
+            return Some(id.clone());
+        }
+
+        // 2. Если нет — идем в базу
+        match self.db.get().await {
+            Ok(client) => {
+                match client
+                    .query_opt("SELECT id FROM users WHERE username = $1", &[&username])
+                    .await
+                {
+                    Ok(Some(row)) => {
+                        let id: String = row.get(0);
+                        // Обновляем кэш
+                        self.username_to_id.insert(username.to_string(), id.clone());
+                        self.id_to_username.insert(id.clone(), username.to_string());
+                        Some(id)
+                    }
+                    _ => None,
+                }
+            }
+            Err(_) => None,
         }
     }
 }

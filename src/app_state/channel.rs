@@ -1,71 +1,77 @@
-use rusqlite::{Connection, params};
+use chrono::TimeZone;
 use uuid::Uuid;
 
 use super::core::AppState;
 
 impl AppState {
     // ---- Каналы ----
-    pub fn create_channel(
-        conn: &mut Connection,
-        name: &str,
-        creator_id: &str,
-    ) -> Result<(), String> {
+    pub async fn create_channel(&self, name: &str, creator_id: &str) -> Result<(), String> {
         let channel_id = Uuid::new_v4().to_string();
-        conn.execute(
-            "INSERT INTO channels (id, name, creator_id) VALUES (?, ?, ?)",
-            params![channel_id, name, creator_id],
+        let mut client = self.db.get().await.map_err(|e| e.to_string())?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(|e| format!("Ошибка старта транзакции: {}", e))?;
+
+        tx.execute(
+            "INSERT INTO channels (id, name, creator_id) VALUES ($1, $2, $3)",
+            &[&channel_id, &name, &creator_id],
         )
+        .await
         .map_err(|e| format!("Ошибка создания канала: {}", e))?;
-        conn.execute(
-            "INSERT INTO channel_subscribers (channel_id, user_id) VALUES (?, ?)",
-            params![channel_id, creator_id],
+
+        tx.execute(
+            "INSERT INTO channel_subscribers (channel_id, user_id) VALUES ($1, $2)",
+            &[&channel_id, &creator_id],
         )
+        .await
         .map_err(|e| format!("Ошибка подписки создателя: {}", e))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| format!("Ошибка коммита транзакции: {}", e))?;
         Ok(())
     }
 
-    pub fn subscribe_channel(
-        conn: &mut Connection,
-        channel_name: &str,
-        user_id: &str,
-    ) -> Result<(), String> {
-        let mut stmt = conn
-            .prepare("SELECT id FROM channels WHERE name = ?")
-            .map_err(|e| format!("Ошибка запроса канала: {}", e))?;
-        let mut rows = stmt
-            .query([channel_name])
+    pub async fn subscribe_channel(&self, channel_name: &str, user_id: &str) -> Result<(), String> {
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let row_opt = client
+            .query_opt("SELECT id FROM channels WHERE name = $1", &[&channel_name])
+            .await
             .map_err(|e| format!("Ошибка выполнения: {}", e))?;
-        if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let channel_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
-            conn.execute(
-                "INSERT OR IGNORE INTO channel_subscribers (channel_id, user_id) VALUES (?, ?)",
-                params![channel_id, user_id],
-            )
-            .map_err(|e| format!("Ошибка подписки: {}", e))?;
+
+        if let Some(row) = row_opt {
+            let channel_id: String = row.get(0);
+            client.execute(
+                "INSERT INTO channel_subscribers (channel_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                &[&channel_id, &user_id],
+            ).await.map_err(|e| format!("Ошибка подписки: {}", e))?;
             Ok(())
         } else {
             Err("Канал не найден".to_string())
         }
     }
 
-    pub fn unsubscribe_channel(
-        conn: &mut Connection,
+    pub async fn unsubscribe_channel(
+        &self,
         channel_name: &str,
         user_id: &str,
     ) -> Result<(), String> {
-        let mut stmt = conn
-            .prepare("SELECT id FROM channels WHERE name = ?")
-            .map_err(|e| format!("Ошибка запроса канала: {}", e))?;
-        let mut rows = stmt
-            .query([channel_name])
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let row_opt = client
+            .query_opt("SELECT id FROM channels WHERE name = $1", &[&channel_name])
+            .await
             .map_err(|e| format!("Ошибка выполнения: {}", e))?;
-        if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let channel_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
-            conn.execute(
-                "DELETE FROM channel_subscribers WHERE channel_id = ? AND user_id = ?",
-                params![channel_id, user_id],
-            )
-            .map_err(|e| format!("Ошибка отписки: {}", e))?;
+
+        if let Some(row) = row_opt {
+            let channel_id: String = row.get(0);
+            client
+                .execute(
+                    "DELETE FROM channel_subscribers WHERE channel_id = $1 AND user_id = $2",
+                    &[&channel_id, &user_id],
+                )
+                .await
+                .map_err(|e| format!("Ошибка отписки: {}", e))?;
             Ok(())
         } else {
             Err("Канал не найден".to_string())
@@ -73,25 +79,24 @@ impl AppState {
     }
 
     /// Полное удаление канала (только владелец).
-    /// Возвращает true, если удалено, false если нет прав.
-    pub fn delete_channel(
-        conn: &mut Connection,
-        channel_name: &str,
-        user_id: &str,
-    ) -> Result<bool, String> {
-        let mut stmt = conn
-            .prepare("SELECT creator_id FROM channels WHERE name = ?")
-            .map_err(|e| format!("Ошибка запроса канала: {}", e))?;
-        let mut rows = stmt
-            .query([channel_name])
+    pub async fn delete_channel(&self, channel_name: &str, user_id: &str) -> Result<bool, String> {
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let row_opt = client
+            .query_opt(
+                "SELECT creator_id FROM channels WHERE name = $1",
+                &[&channel_name],
+            )
+            .await
             .map_err(|e| format!("Ошибка выполнения: {}", e))?;
 
-        if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let creator_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
+        if let Some(row) = row_opt {
+            let creator_id: String = row.get(0);
             if creator_id != user_id {
                 return Ok(false); // Не владелец
             }
-            conn.execute("DELETE FROM channels WHERE name = ?", [channel_name])
+            client
+                .execute("DELETE FROM channels WHERE name = $1", &[&channel_name])
+                .await
                 .map_err(|e| format!("Ошибка удаления канала: {}", e))?;
             Ok(true)
         } else {
@@ -99,57 +104,48 @@ impl AppState {
         }
     }
 
-    pub fn get_channel_subscribers(
-        conn: &mut Connection,
-        channel_name: &str,
-    ) -> Result<Vec<String>, String> {
-        let mut stmt = conn.prepare(
-            "SELECT cs.user_id FROM channel_subscribers cs JOIN channels c ON cs.channel_id = c.id WHERE c.name = ?"
-        ).map_err(|e| format!("Ошибка запроса подписчиков: {}", e))?;
-        let mut rows = stmt
-            .query([channel_name])
-            .map_err(|e| format!("Ошибка выполнения: {}", e))?;
-        let mut subscribers = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))?
-        {
-            let user_id: String = row
-                .get(0)
-                .map_err(|e| format!("Ошибка чтения user_id: {}", e))?;
-            subscribers.push(user_id);
-        }
-        Ok(subscribers)
+    pub async fn get_channel_subscribers(&self, channel_name: &str) -> Result<Vec<String>, String> {
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let rows = client.query(
+            "SELECT cs.user_id FROM channel_subscribers cs JOIN channels c ON cs.channel_id = c.id WHERE c.name = $1",
+            &[&channel_name],
+        ).await.map_err(|e| format!("Ошибка выполнения: {}", e))?;
+
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
     }
 
-    pub fn store_channel_message(
-        conn: &mut Connection,
+    pub async fn store_channel_message(
+        &self,
         channel_name: &str,
         sender_id: &str,
         content: &str,
         timestamp: i64,
         reply_to_id: Option<i64>,
     ) -> Result<i64, String> {
-        let mut stmt = conn
-            .prepare("SELECT id FROM channels WHERE name = ?")
-            .map_err(|e| format!("Ошибка запроса канала: {}", e))?;
-        let mut rows = stmt
-            .query([channel_name])
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let row_opt = client
+            .query_opt("SELECT id FROM channels WHERE name = $1", &[&channel_name])
+            .await
             .map_err(|e| format!("Ошибка выполнения: {}", e))?;
-        if let Some(row) = rows.next().map_err(|e| format!("Ошибка чтения: {}", e))? {
-            let channel_id: String = row.get(0).map_err(|e| format!("Ошибка чтения id: {}", e))?;
-            conn.execute(
+
+        if let Some(row) = row_opt {
+            let channel_id: String = row.get(0);
+            let dt = chrono::Utc.timestamp_millis_opt(timestamp).unwrap();
+
+            let inserted = client.query_one(
                 "INSERT INTO channel_messages (channel_id, sender_id, content, sent_at, reply_to_id) \
-                 VALUES (?, ?, ?, datetime(?/1000, 'unixepoch'), ?)",
-                params![channel_id, sender_id, content, &timestamp, reply_to_id],
-            )
-                .map_err(|e| format!("Ошибка сохранения сообщения канала: {}", e))?;
-            Ok(conn.last_insert_rowid())
+                 VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                &[&channel_id, &sender_id, &content, &dt, &reply_to_id],
+            ).await.map_err(|e| format!("Ошибка сохранения сообщения канала: {}", e))?;
+
+            Ok(inserted.get(0))
         } else {
             Err("Канал не найден".to_string())
         }
     }
 
-    pub fn get_recent_channels(
-        conn: &mut Connection,
+    pub async fn get_recent_channels(
+        &self,
         user_id: &str,
         per_chat: i64,
     ) -> Result<
@@ -167,112 +163,113 @@ impl AppState {
         )>,
         String,
     > {
-        let mut stmt = conn
-            .prepare(
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let stmt = client
+            .prepare_cached(
                 "WITH ranked AS (
-                    SELECT cm.id, c.name AS channel_name,
-                           cm.sender_id, cm.content,
-                           strftime('%s', cm.sent_at) * 1000 AS ts,
-                           cm.reply_to_id,
-                           COALESCE(cm.edited, 0) AS edited,
-                           (SELECT COUNT(*) FROM channel_message_views v
-                            WHERE v.channel_msg_id = cm.id) AS views,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY cm.channel_id ORDER BY cm.id DESC
-                           ) AS rn
-                    FROM channel_messages cm
-                    JOIN channels c ON cm.channel_id = c.id
-                    JOIN channel_subscribers cs ON cs.channel_id = c.id AND cs.user_id = ?1
-                    LEFT JOIN hidden_messages h
-                           ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = ?1
-                    WHERE h.msg_id IS NULL
-                )
-                SELECT id, channel_name, sender_id, content, ts, reply_to_id, views, edited
-                FROM ranked
-                WHERE rn <= ?2
-                ORDER BY id ASC",
+                SELECT cm.id, c.name AS channel_name,
+                       cm.sender_id, cm.content,
+                       (EXTRACT(EPOCH FROM cm.sent_at) * 1000)::bigint AS ts,
+                       cm.reply_to_id,
+                       cm.edited,
+                       (SELECT COUNT(*) FROM channel_message_views v
+                        WHERE v.channel_msg_id = cm.id) AS views,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY cm.channel_id ORDER BY cm.id DESC
+                       ) AS rn
+                FROM channel_messages cm
+                JOIN channels c ON cm.channel_id = c.id
+                JOIN channel_subscribers cs ON cs.channel_id = c.id AND cs.user_id = $1
+                LEFT JOIN hidden_messages h
+                       ON h.kind = 3 AND h.msg_id = cm.id AND h.user_id = $1
+                WHERE h.msg_id IS NULL
             )
+            SELECT id, channel_name, sender_id, content, ts, reply_to_id, views, edited
+            FROM ranked
+            WHERE rn <= $2
+            ORDER BY id ASC",
+            )
+            .await
             .map_err(|e| e.to_string())?;
-        let iter = stmt
-            .query_map(params![user_id, per_chat], |row| {
-                let views: i64 = row.get(6).unwrap_or(0);
-                let edited: i64 = row.get(7).unwrap_or(0);
-                let v = views as u32;
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, Option<i64>>(5)?,
-                    true,
-                    v > 0,
-                    v,
-                    edited != 0,
-                ))
-            })
+
+        let rows = client
+            .query(&stmt, &[&user_id, &per_chat])
+            .await
             .map_err(|e| e.to_string())?;
+
         let mut out = Vec::new();
-        for r in iter {
-            out.push(r.map_err(|e| e.to_string())?);
+        for row in rows {
+            let views: i64 = row.get(6);
+            let v = views as u32;
+
+            out.push((
+                row.get(0),
+                row.get(1),
+                row.get(2),
+                row.get(3),
+                row.get(4),
+                row.get(5),
+                true,
+                v > 0,
+                v,
+                row.get(7),
+            ));
         }
         Ok(out)
     }
 
-    pub fn lookup_channel_message(
-        conn: &mut Connection,
+    pub async fn lookup_channel_message(
+        &self,
         msg_id: i64,
     ) -> Result<Option<(String, String, String)>, String> {
-        let mut stmt = conn
-            .prepare(
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let row_opt = client
+            .query_opt(
                 "SELECT c.name, c.creator_id, cm.sender_id \
-                 FROM channel_messages cm JOIN channels c ON cm.channel_id = c.id \
-                 WHERE cm.id = ?",
+             FROM channel_messages cm JOIN channels c ON cm.channel_id = c.id \
+             WHERE cm.id = $1",
+                &[&msg_id],
             )
+            .await
             .map_err(|e| e.to_string())?;
-        let mut rows = stmt.query([msg_id]).map_err(|e| e.to_string())?;
-        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            Ok(Some((
-                row.get(0).map_err(|e| e.to_string())?,
-                row.get(1).map_err(|e| e.to_string())?,
-                row.get(2).map_err(|e| e.to_string())?,
-            )))
+
+        if let Some(row) = row_opt {
+            Ok(Some((row.get(0), row.get(1), row.get(2))))
         } else {
             Ok(None)
         }
     }
 
-    pub fn delete_channel_message(conn: &mut Connection, msg_id: i64) -> Result<(), String> {
-        conn.execute("DELETE FROM channel_messages WHERE id = ?", [msg_id])
+    pub async fn delete_channel_message(&self, msg_id: i64) -> Result<(), String> {
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        client
+            .execute("DELETE FROM channel_messages WHERE id = $1", &[&msg_id])
+            .await
             .map_err(|e| format!("Ошибка удаления: {}", e))?;
         Ok(())
     }
 
-    pub fn update_channel_message_content(
-        conn: &mut Connection,
+    pub async fn update_channel_message_content(
+        &self,
         msg_id: i64,
         new_text: &str,
     ) -> Result<Option<(String, String, String)>, String> {
-        let meta: Option<(String, String, String)> = conn
-            .query_row(
-                "SELECT c.name, c.creator_id, cm.sender_id \
-                 FROM channel_messages cm JOIN channels c ON cm.channel_id = c.id \
-                 WHERE cm.id = ?",
-                [msg_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let row_opt = client
+            .query_opt(
+                "UPDATE channel_messages SET content = $1, edited = true WHERE id = $2 \
+             RETURNING (SELECT name FROM channels WHERE id = channel_id), \
+                       (SELECT creator_id FROM channels WHERE id = channel_id), \
+                       sender_id",
+                &[&new_text, &msg_id],
             )
-            .ok();
+            .await
+            .map_err(|e| format!("Ошибка обновления сообщения канала: {}", e))?;
 
-        if meta.is_none() {
-            return Ok(None);
+        if let Some(row) = row_opt {
+            Ok(Some((row.get(0), row.get(1), row.get(2))))
+        } else {
+            Ok(None)
         }
-
-        conn.execute(
-            "UPDATE channel_messages SET content = ?, edited = 1 WHERE id = ?",
-            params![new_text, msg_id],
-        )
-        .map_err(|e| format!("Ошибка обновления сообщения канала: {}", e))?;
-
-        Ok(meta)
     }
 }

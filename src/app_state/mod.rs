@@ -4,4 +4,4 @@ pub mod group;
 pub mod migrate;
 pub mod user;
 
-pub use core::{AppState, DbState, MsgFields, Session, SessionKeys};
+pub use core::{AppState, MsgFields, Session, SessionKeys};

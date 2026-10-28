@@ -4,7 +4,6 @@ use aes_gcm::{
 };
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
-use rusqlite::params;
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,34 +23,25 @@ use crate::senders::{
 };
 
 pub async fn resolve_display_name(state: &Arc<AppState>, user_id: &str, fallback: &str) -> String {
-    let db = state.db.clone();
-    let uid = user_id.to_string();
-    let fb = fallback.to_string();
-    tokio::task::spawn_blocking(move || {
-        let mut st = db.lock().unwrap();
-        let raw = match AppState::get_display_name(&mut st.conn, &uid) {
-            Ok(name) => name,
-            _ => String::new(),
-        };
-        let trimmed = raw.trim();
-        let result = if trimmed.is_empty() {
-            fb.clone()
-        } else {
-            trimmed.to_string()
-        };
-        result
-    })
-    .await
-    .unwrap()
+    let raw = match state.get_display_name(user_id).await {
+        Ok(name) => name,
+        _ => String::new(),
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 // ==================== process_command ====================
 pub async fn process_command(
     cmd: &str,
     my_user_id: &str,
-    _my_username: &str, // Исправлено (warning)
+    _my_username: &str,
     state: &Arc<AppState>,
-    _session: &Arc<Session>, // Исправлено (warning)
+    _session: &Arc<Session>,
 ) -> String {
     let cmd_parts: Vec<&str> = cmd.split_whitespace().collect();
     if cmd_parts.is_empty() {
@@ -67,15 +57,7 @@ pub async fn process_command(
                 "[Система] Использование: /creategroup <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let db = state.db.clone();
-                let uid = my_user_id.to_string();
-                let gname = group_name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::create_group(&mut st.conn, &gname, &uid)
-                })
-                .await
-                .unwrap();
+                let result = state.create_group(&group_name, my_user_id).await;
                 match result {
                     Ok(_) => format!("[Система] Группа {} создана", group_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -87,15 +69,7 @@ pub async fn process_command(
                 "[Система] Использование: /joingroup <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let db = state.db.clone();
-                let uid = my_user_id.to_string();
-                let gname = group_name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::join_group(&mut st.conn, &gname, &uid)
-                })
-                .await
-                .unwrap();
+                let result = state.join_group(&group_name, my_user_id).await;
                 match result {
                     Ok(_) => format!("[Система] Вы присоединились к группе {}", group_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -107,15 +81,7 @@ pub async fn process_command(
                 "[Система] Использование: /leavegroup <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let db = state.db.clone();
-                let uid = my_user_id.to_string();
-                let gname = group_name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::leave_group(&mut st.conn, &gname, &uid)
-                })
-                .await
-                .unwrap();
+                let result = state.leave_group(&group_name, my_user_id).await;
                 match result {
                     Ok(_) => format!("[Система] Вы покинули группу {}", group_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -127,25 +93,20 @@ pub async fn process_command(
                 "[Система] Использование: /groupmembers <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let db = state.db.clone();
-                let gname = group_name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    let ids = AppState::get_group_members(&mut st.conn, &gname)?;
-                    let names: Vec<String> = ids.iter().map(|id| st.resolve_username(id)).collect();
-                    Ok::<_, String>(names)
-                })
-                .await
-                .unwrap();
+                let result = state.get_group_members(&group_name).await;
                 match result {
-                    Ok(members) => {
-                        if members.is_empty() {
+                    Ok(ids) => {
+                        let mut names = Vec::new();
+                        for id in ids {
+                            names.push(state.resolve_username(&id).await);
+                        }
+                        if names.is_empty() {
                             format!("[Система] В группе {} нет участников", group_name)
                         } else {
                             format!(
                                 "[Система] Участники группы {}: {}",
                                 group_name,
-                                members.join(", ")
+                                names.join(", ")
                             )
                         }
                     }
@@ -154,31 +115,31 @@ pub async fn process_command(
             }
         }
         "/listgroups" => {
-            let db = state.db.clone();
             let uid = my_user_id.to_string();
-            let result = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                let mut stmt = st.conn
-                    .prepare("SELECT g.name, g.creator_id, \
-                                     (SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = ?) AS is_member \
-                              FROM groups g ORDER BY g.name")
-                    .map_err(|e| e.to_string())?;
-                let mut rows = stmt.query([&uid]).map_err(|e| e.to_string())?;
+            let result: Result<Vec<String>, String> = async {
+                let client = state.db.get().await.map_err(|e| e.to_string())?;
+                let rows = client.query(
+                    "SELECT g.name, g.creator_id, \
+                            (SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = $1) AS is_member \
+                     FROM groups g ORDER BY g.name",
+                    &[&uid],
+                ).await.map_err(|e| e.to_string())?;
+
                 let mut groups = Vec::new();
-                while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                    let name: String = row.get(0).map_err(|e| e.to_string())?;
-                    let creator_id: String = row.get(1).map_err(|e| e.to_string())?;
-                    let is_member: Option<i64> = row.get(2).ok();
+                for row in rows {
+                    let name: String = row.get(0);
+                    let creator_id: String = row.get(1);
+                    let is_member: Option<i32> = row.get(2);
                     groups.push((name, creator_id, is_member.is_some()));
                 }
-                drop(rows);
-                drop(stmt);
-                let out: Vec<String> = groups
-                    .into_iter()
-                    .map(|(name, cid, is_member)| format!("{}|{}|{}", name, st.resolve_username(&cid), if is_member { "1" } else { "0" }))
-                    .collect();
-                Ok::<_, String>(out)
-            }).await.unwrap();
+
+                let mut out = Vec::new();
+                for (name, cid, is_member) in groups {
+                    let creator_name = state.resolve_username(&cid).await;
+                    out.push(format!("{}|{}|{}", name, creator_name, if is_member { "1" } else { "0" }));
+                }
+                Ok(out)
+            }.await;
 
             match result {
                 Ok(groups) => {
@@ -200,15 +161,7 @@ pub async fn process_command(
                 "[Система] Использование: /createchannel <название>".to_string()
             } else {
                 let channel_name = args.join(" ");
-                let db = state.db.clone();
-                let uid = my_user_id.to_string();
-                let ch = channel_name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::create_channel(&mut st.conn, &ch, &uid)
-                })
-                .await
-                .unwrap();
+                let result = state.create_channel(&channel_name, my_user_id).await;
                 match result {
                     Ok(_) => format!("[Система] Канал {} создан", channel_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -220,15 +173,7 @@ pub async fn process_command(
                 "[Система] Использование: /subscribe <название>".to_string()
             } else {
                 let channel_name = args.join(" ");
-                let db = state.db.clone();
-                let uid = my_user_id.to_string();
-                let ch = channel_name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::subscribe_channel(&mut st.conn, &ch, &uid)
-                })
-                .await
-                .unwrap();
+                let result = state.subscribe_channel(&channel_name, my_user_id).await;
                 match result {
                     Ok(_) => format!("[Система] Вы подписались на канал {}", channel_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -240,15 +185,7 @@ pub async fn process_command(
                 "[Система] Использование: /unsubscribe <название>".to_string()
             } else {
                 let channel_name = args.join(" ");
-                let db = state.db.clone();
-                let uid = my_user_id.to_string();
-                let ch = channel_name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::unsubscribe_channel(&mut st.conn, &ch, &uid)
-                })
-                .await
-                .unwrap();
+                let result = state.unsubscribe_channel(&channel_name, my_user_id).await;
                 match result {
                     Ok(_) => format!("[Система] Вы отписались от канала {}", channel_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -256,45 +193,43 @@ pub async fn process_command(
             }
         }
         "/channels" => {
-            let db = state.db.clone();
             let uid = my_user_id.to_string();
-            let result = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                let mut stmt = st
-                    .conn
-                    .prepare(
+            let result: Result<Vec<String>, String> = async {
+                let client = state.db.get().await.map_err(|e| e.to_string())?;
+                let rows = client
+                    .query(
                         "SELECT c.name, c.creator_id,
-                                (SELECT 1 FROM channel_subscribers cs
-                                 WHERE cs.channel_id = c.id AND cs.user_id = ?) AS subscribed
-                         FROM channels c
-                         ORDER BY c.name",
+                            (SELECT 1 FROM channel_subscribers cs
+                             WHERE cs.channel_id = c.id AND cs.user_id = $1) AS subscribed
+                     FROM channels c
+                     ORDER BY c.name",
+                        &[&uid],
                     )
+                    .await
                     .map_err(|e| e.to_string())?;
-                let mut rows = stmt.query([&uid]).map_err(|e| e.to_string())?;
+
                 let mut raw = Vec::new();
-                while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                    let name: String = row.get(0).map_err(|e| e.to_string())?;
-                    let creator_id: String = row.get(1).map_err(|e| e.to_string())?;
-                    let subscribed: Option<i64> = row.get(2).ok();
+                for row in rows {
+                    let name: String = row.get(0);
+                    let creator_id: String = row.get(1);
+                    let subscribed: Option<i32> = row.get(2);
                     raw.push((name, creator_id, subscribed.is_some()));
                 }
-                drop(rows);
-                drop(stmt);
-                let out: Vec<String> = raw
-                    .into_iter()
-                    .map(|(name, cid, sub)| {
-                        format!(
-                            "{}|{}|{}",
-                            name,
-                            st.resolve_username(&cid),
-                            if sub { "1" } else { "0" }
-                        )
-                    })
-                    .collect();
-                Ok::<_, String>(out)
-            })
-            .await
-            .unwrap();
+
+                let mut out = Vec::new();
+                for (name, cid, sub) in raw {
+                    let creator_name = state.resolve_username(&cid).await;
+                    out.push(format!(
+                        "{}|{}|{}",
+                        name,
+                        creator_name,
+                        if sub { "1" } else { "0" }
+                    ));
+                }
+                Ok(out)
+            }
+            .await;
+
             match result {
                 Ok(channels) => {
                     if channels.is_empty() {
@@ -311,25 +246,32 @@ pub async fn process_command(
             }
         }
         "/listusers" => {
-            let db = state.db.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let st = db.lock().unwrap();
-                let mut stmt = st.conn
-                    .prepare("SELECT phone, username, display_name, last_seen FROM users ORDER BY username")
-                    .map_err(|e| e.to_string())?;
-                let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+            let result: Result<Vec<String>, String> = async {
+                let client = state.db.get().await.map_err(|e| e.to_string())?;
+                let rows = client.query(
+                    "SELECT phone, username, display_name, last_seen FROM users ORDER BY username",
+                    &[],
+                ).await.map_err(|e| e.to_string())?;
+
                 let mut users = Vec::new();
-                while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                    let phone: String = row.get(0).map_err(|e| e.to_string())?;
-                    let username: String = row.get(1).map_err(|e| e.to_string())?;
-                    let display_name: String = row.get(2).unwrap_or_default();
-                    let last_seen: i64 = row.get(3).unwrap_or(0);
-                    users.push(format!("{}|{}|{}|{}", phone, username, display_name, last_seen));
+                for row in rows {
+                    let phone: String = row.get(0);
+                    let username: String = row.get(1);
+                    let display_name: Option<String> = row.get(2);
+                    let last_seen: Option<i64> = row.get(3);
+
+                    users.push(format!(
+                        "{}|{}|{}|{}",
+                        phone,
+                        username,
+                        display_name.unwrap_or_default(),
+                        last_seen.unwrap_or(0)
+                    ));
                 }
-                Ok::<_, String>(users)
-            })
-                .await
-                .unwrap();
+                Ok(users)
+            }
+            .await;
+
             match result {
                 Ok(users) => {
                     if users.is_empty() {
@@ -356,14 +298,7 @@ pub async fn process_command(
             }
         }
         "/profile" => {
-            let db = state.db.clone();
-            let uid = my_user_id.to_string();
-            let result = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                AppState::get_profile(&mut st.conn, &uid)
-            })
-            .await
-            .unwrap();
+            let result = state.get_profile(my_user_id).await;
             match result {
                 Ok((username, phone, first_name, last_name, display_name)) => {
                     format!(
@@ -384,16 +319,7 @@ pub async fn process_command(
                 } else {
                     "".to_string()
                 };
-                let db = state.db.clone();
-                let uid = my_user_id.to_string();
-                let fn_ = first_name.to_string();
-                let ln_ = last_name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::set_name(&mut st.conn, &uid, &fn_, &ln_)
-                })
-                .await
-                .unwrap();
+                let result = state.set_name(my_user_id, first_name, &last_name).await;
                 match result {
                     Ok(_) => format!("[Система] Имя обновлено: {} {}", first_name, last_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -405,15 +331,7 @@ pub async fn process_command(
                 "[Система] Использование: /setdisplayname <отображаемое имя>".to_string()
             } else {
                 let display_name = args.join(" ");
-                let db = state.db.clone();
-                let uid = my_user_id.to_string();
-                let dn = display_name.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::set_display_name(&mut st.conn, &uid, &dn)
-                })
-                .await
-                .unwrap();
+                let result = state.set_display_name(my_user_id, &display_name).await;
                 match result {
                     Ok(_) => format!("[Система] Отображаемое имя обновлено: {}", display_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
@@ -424,16 +342,8 @@ pub async fn process_command(
             if args.is_empty() {
                 "[Система] Использование: /setusername <новый_username>".to_string()
             } else {
-                let new_username = args[0].to_string();
-                let db = state.db.clone();
-                let uid = my_user_id.to_string();
-                let nu = new_username.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::set_username(&mut st, &uid, &nu)
-                })
-                .await
-                .unwrap();
+                let new_username = args[0];
+                let result = state.set_username(my_user_id, new_username).await;
                 match result {
                     Ok(_old) => {
                         format!(
@@ -579,14 +489,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
 
-            let db = state.db.clone();
-            let token_str = token.to_string();
-            let result = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                AppState::check_session(&mut st.conn, &token_str)
-            })
-            .await
-            .unwrap();
+            let result = state.check_session(token).await;
 
             match result {
                 Ok((user_id, username)) => {
@@ -594,26 +497,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     let _ = send_system_message(&tx, &msg).await;
 
                     if let Some(fcm) = fcm_token {
-                        let db = state.db.clone();
-                        let uid = user_id.clone();
-                        let session_tok = token.to_string();
-                        let dev = device_name.to_string();
-                        tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            let _ = AppState::save_fcm_token(
-                                &mut st.conn,
-                                &uid,
-                                &session_tok,
-                                &fcm,
-                                &dev,
-                            );
-                        })
-                        .await
-                        .unwrap();
+                        let _ = state
+                            .save_fcm_token(&user_id, token, &fcm, device_name)
+                            .await;
                     }
 
                     session.user_id.set(user_id.clone()).ok();
-                    session.username.set(username.clone()).ok(); // String
+                    session.username.set(username.clone()).ok();
                     session.token.set(token.to_string()).ok();
 
                     state.sessions.remove(&temp_id);
@@ -624,16 +514,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         .or_insert_with(Vec::new)
                         .push(token.to_string());
 
-                    {
-                        let db_ls = state.db.clone();
-                        let uid_ls = user_id.clone();
-                        tokio::task::spawn_blocking(move || {
-                            let mut st = db_ls.lock().unwrap();
-                            let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
-                        })
-                        .await
-                        .unwrap();
-                    }
+                    let _ = state.update_last_seen(&user_id).await;
 
                     let msg = format!("[Система] Пользователь {} подключился", username);
                     broadcast_system_message(&state, &msg, Some(&username)).await;
@@ -656,46 +537,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
 
-            let db = state.db.clone();
-            let ph = phone.to_string();
-            let pwd = password.to_string();
-            let result = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                AppState::login_user_by_phone(&mut st.conn, &ph, &pwd)
-            })
-            .await
-            .unwrap();
+            let result = state.login_user_by_phone(phone, password).await;
 
             match result {
                 Ok(user_id) => {
-                    let db3 = state.db.clone();
-                    let uid = user_id.clone();
-                    let username_from_db = tokio::task::spawn_blocking(move || {
-                        let st = db3.lock().unwrap();
-                        let mut stmt = st
-                            .conn
-                            .prepare("SELECT username FROM users WHERE id = ?")
-                            .map_err(|e| e.to_string())?;
-                        let mut rows = stmt.query([&uid]).map_err(|e| e.to_string())?;
-                        if let Some(row) = rows.next().map_err(|e| e.to_string())? {
-                            Ok(row.get::<_, String>(0).map_err(|e| e.to_string())?)
-                        } else {
-                            Err("Пользователь не найден".to_string())
-                        }
-                    })
-                    .await
-                    .unwrap();
-                    let username = username_from_db.unwrap_or_else(|_| phone.to_string()); // String
+                    // Получаем username (в оригинале был кастомный запрос, сделаем через get_profile)
+                    let username = match state.get_profile(&user_id).await {
+                        Ok((uname, _, _, _, _)) => uname,
+                        Err(_) => phone.to_string(),
+                    };
 
-                    let db2 = state.db.clone();
-                    let uid2 = user_id.clone();
-                    let dev = device_name.to_string();
-                    let token_result = tokio::task::spawn_blocking(move || {
-                        let mut st = db2.lock().unwrap();
-                        AppState::create_session(&mut st.conn, &uid2, &dev)
-                    })
-                    .await
-                    .unwrap();
+                    let token_result = state.create_session(&user_id, device_name).await;
 
                     match token_result {
                         Ok(token) => {
@@ -703,26 +555,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let _ = send_system_message(&tx, &msg).await;
 
                             if let Some(fcm) = fcm_token {
-                                let db = state.db.clone();
-                                let uid = user_id.clone();
-                                let session_tok = token.clone();
-                                let dev = device_name.to_string();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    let _ = AppState::save_fcm_token(
-                                        &mut st.conn,
-                                        &uid,
-                                        &session_tok,
-                                        &fcm,
-                                        &dev,
-                                    );
-                                })
-                                .await
-                                .unwrap();
+                                let _ = state
+                                    .save_fcm_token(&user_id, &token, &fcm, device_name)
+                                    .await;
                             }
 
                             session.user_id.set(user_id.clone()).ok();
-                            session.username.set(username.clone()).ok(); // String
+                            session.username.set(username.clone()).ok();
                             session.token.set(token.clone()).ok();
 
                             state.sessions.remove(&temp_id);
@@ -733,16 +572,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 .or_insert_with(Vec::new)
                                 .push(token.clone());
 
-                            {
-                                let db_ls = state.db.clone();
-                                let uid_ls = user_id.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = db_ls.lock().unwrap();
-                                    let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
-                                })
-                                .await
-                                .unwrap();
-                            }
+                            let _ = state.update_last_seen(&user_id).await;
 
                             let msg = format!("[Система] Пользователь {} подключился", username);
                             broadcast_system_message(&state, &msg, Some(&username)).await;
@@ -779,40 +609,15 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
 
-            let username = username_opt.unwrap_or(phone).to_string(); // <-- ИСПРАВЛЕНО НА String
+            let username = username_opt.unwrap_or(phone).to_string();
 
-            let db = state.db.clone();
-            let ph = phone.to_string();
-            let pwd = password.to_string();
-            let uname = username.clone(); // String
-            let fn_opt = first_name.map(|s| s.to_string());
-            let ln_opt = last_name.map(|s| s.to_string());
-
-            let result = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                AppState::register_user(
-                    &mut st,
-                    &uname,
-                    &ph,
-                    &pwd,
-                    fn_opt.as_deref(),
-                    ln_opt.as_deref(),
-                )
-            })
-            .await
-            .unwrap();
+            let result = state
+                .register_user(&username, phone, password, first_name, last_name)
+                .await;
 
             match result {
                 Ok(user_id) => {
-                    let db2 = state.db.clone();
-                    let uid = user_id.clone();
-                    let dev = device_name.to_string();
-                    let token_result = tokio::task::spawn_blocking(move || {
-                        let mut st = db2.lock().unwrap();
-                        AppState::create_session(&mut st.conn, &uid, &dev)
-                    })
-                    .await
-                    .unwrap();
+                    let token_result = state.create_session(&user_id, device_name).await;
 
                     match token_result {
                         Ok(token) => {
@@ -820,26 +625,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let _ = send_system_message(&tx, &msg).await;
 
                             if let Some(fcm) = fcm_token {
-                                let db = state.db.clone();
-                                let uid = user_id.clone();
-                                let session_tok = token.clone();
-                                let dev = device_name.to_string();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    let _ = AppState::save_fcm_token(
-                                        &mut st.conn,
-                                        &uid,
-                                        &session_tok,
-                                        &fcm,
-                                        &dev,
-                                    );
-                                })
-                                .await
-                                .unwrap();
+                                let _ = state
+                                    .save_fcm_token(&user_id, &token, &fcm, device_name)
+                                    .await;
                             }
 
                             session.user_id.set(user_id.clone()).ok();
-                            session.username.set(username.clone()).ok(); // String
+                            session.username.set(username.clone()).ok();
                             session.token.set(token.clone()).ok();
 
                             state.sessions.remove(&temp_id);
@@ -848,18 +640,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 .online_users
                                 .entry(username.clone())
                                 .or_insert_with(Vec::new)
-                                .push(token.clone()); // String
+                                .push(token.clone());
 
-                            {
-                                let db_ls = state.db.clone();
-                                let uid_ls = user_id.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = db_ls.lock().unwrap();
-                                    let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
-                                })
-                                .await
-                                .unwrap();
-                            }
+                            let _ = state.update_last_seen(&user_id).await;
 
                             let msg = format!("[Система] Пользователь {} подключился", username);
                             broadcast_system_message(&state, &msg, Some(&username)).await;
@@ -910,14 +693,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         let state_h = state.clone();
 
         // Личные
-        let db = state_h.db.clone();
-        let uid = uid_h.clone();
-        let personal = tokio::task::spawn_blocking(move || {
-            let mut st = db.lock().unwrap();
-            AppState::get_recent_personal(&mut st.conn, &uid, LOGIN_PER_CHAT)
-        })
-        .await
-        .unwrap();
+        let personal = state_h.get_recent_personal(&uid_h, LOGIN_PER_CHAT).await;
         if let Ok(msgs) = personal {
             let count = msgs.len();
             for (
@@ -932,15 +708,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 edited,
             ) in msgs
             {
-                let db = state_h.db.clone();
-                let sid = sender_id.clone();
-                let rid = recipient_id.clone();
-                let (sender, recipient) = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    (st.resolve_username(&sid), st.resolve_username(&rid))
-                })
-                .await
-                .unwrap();
+                let sender = state_h.resolve_username(&sender_id).await;
+                let recipient = state_h.resolve_username(&recipient_id).await;
+
                 let _ = send_encrypted_message(
                     &tx_h,
                     &keys_h,
@@ -964,27 +734,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         }
 
         // Группы
-        let db = state_h.db.clone();
-        let uid = uid_h.clone();
-        let groups = tokio::task::spawn_blocking(move || {
-            let mut st = db.lock().unwrap();
-            AppState::get_recent_groups(&mut st.conn, &uid, LOGIN_PER_CHAT)
-        })
-        .await
-        .unwrap();
+        let groups = state_h.get_recent_groups(&uid_h, LOGIN_PER_CHAT).await;
         if let Ok(msgs) = groups {
             let count = msgs.len();
             for (msg_id, gname, sender_id, content, ts, reply_id, flag_me, flag_any, edited) in msgs
             {
-                let db = state_h.db.clone();
-                let sid = sender_id.clone();
-                let sender = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    st.resolve_username(&sid)
-                })
-                .await
-                .unwrap();
+                let sender = state_h.resolve_username(&sender_id).await;
                 let recipient = format!("#{}", gname);
+
                 let _ = send_encrypted_message(
                     &tx_h,
                     &keys_h,
@@ -1011,14 +768,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         }
 
         // Каналы
-        let db = state_h.db.clone();
-        let uid = uid_h.clone();
-        let channels = tokio::task::spawn_blocking(move || {
-            let mut st = db.lock().unwrap();
-            AppState::get_recent_channels(&mut st.conn, &uid, LOGIN_PER_CHAT)
-        })
-        .await
-        .unwrap();
+        let channels = state_h.get_recent_channels(&uid_h, LOGIN_PER_CHAT).await;
         if let Ok(msgs) = channels {
             let count = msgs.len();
             for (
@@ -1034,15 +784,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 edited,
             ) in msgs
             {
-                let db = state_h.db.clone();
-                let sid = sender_id.clone();
-                let sender = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    st.resolve_username(&sid)
-                })
-                .await
-                .unwrap();
+                let sender = state_h.resolve_username(&sender_id).await;
                 let recipient = format!("&{}", cname);
+
                 let _ = send_encrypted_message(
                     &tx_h,
                     &keys_h,
@@ -1068,7 +812,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             );
         }
     }
-
     // ---- Основной цикл ----
     info!("Начало основного цикла для {}", my_username);
     loop {
@@ -1109,6 +852,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match msg_type {
                 MSG_TYPE_USER => {
+                    debug!("Получен MSG_TYPE_USER");
                     if rest.len() < 4 + 4 + 12 + 4 + 24 {
                         warn!("0x01: мало данных");
                         continue;
@@ -1236,14 +980,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     // ---- Личное ----
                     if !recipient_name.starts_with('#') && !recipient_name.starts_with('&') {
-                        let db = state.db.clone();
-                        let target_name = recipient_name.clone();
-                        let recipient_id_opt = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            st.resolve_id(&target_name)
-                        })
-                        .await
-                        .unwrap();
+                        let recipient_id_opt = state.resolve_id(&recipient_name).await;
 
                         let recipient_id = match recipient_id_opt {
                             Some(id) => id,
@@ -1256,26 +993,31 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
                         };
+                        debug!(
+                            "Сохраняю сообщение от {} client_msg_id: {}",
+                            my_user_id, client_msg_id
+                        );
 
-                        let db = state.db.clone();
-                        let sender_id = my_user_id.clone();
-                        let rec_id = recipient_id.clone();
-                        let content_clone = content.clone();
-                        let stored_id: i64 = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            AppState::store_message(
-                                &mut st.conn,
-                                &sender_id,
-                                &rec_id,
-                                &content_clone,
+                        let stored_id = match state
+                            .store_message(
+                                &my_user_id,
+                                &recipient_id,
+                                &content,
                                 timestamp,
                                 reply_opt,
                             )
-                        })
-                        .await
-                        .unwrap()
-                        .unwrap_or(0);
-
+                            .await
+                        {
+                            Ok(id) => {
+                                info!("Сообщение успешно сохранено в БД, ID: {}", id);
+                                id
+                            }
+                            Err(e) => {
+                                error!("ОШИБКА сохранения сообщения в БД: {}", e);
+                                continue; // Пропускаем отправку, если база не сохранила
+                            }
+                        };
+                        debug!("Пересылаю сообщение");
                         send_to_all_my_sessions(
                             &state,
                             &my_username,
@@ -1326,30 +1068,23 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 }
                             }
 
-                            let db = state.db.clone();
-                            let rec_id_clone = recipient_id.clone();
-                            let fcm_tokens = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                AppState::get_fcm_tokens_for_user(&mut st.conn, &rec_id_clone)
-                            })
-                            .await
-                            .unwrap()
-                            .unwrap_or_default();
+                            let fcm_tokens = state
+                                .get_fcm_tokens_for_user(&recipient_id)
+                                .await
+                                .unwrap_or_default();
 
                             let sender_display_name =
                                 resolve_display_name(&state, &my_user_id, &my_username).await;
-                            let db_fcm = state.db.clone();
 
-                            // ИСПРАВЛЕНО: убрали кортеж
                             for fcm_tok in fcm_tokens {
                                 let title = format!("{}", sender_display_name);
                                 let body = content.chars().take(100).collect::<String>();
                                 let data_payload =
                                     json!({ "sender": sender_display_name, "type": "private" });
-                                let db_clone = db_fcm.clone();
+                                let state_fcm = state.clone();
                                 tokio::spawn(async move {
                                     send_fcm_push_and_cleanup(
-                                        db_clone,
+                                        state_fcm,
                                         &fcm_tok,
                                         &title,
                                         &body,
@@ -1365,15 +1100,19 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     // ---- Группа ----
                     if recipient_name.starts_with('#') {
                         let group_name = recipient_name.trim_start_matches('#').to_string();
-                        let db = state.db.clone();
-                        let uid = my_user_id.clone();
-                        let gname = group_name.clone();
-                        let is_member = tokio::task::spawn_blocking(move || {
-                            let st = db.lock().unwrap();
-                            let mut stmt = st.conn.prepare("SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id WHERE g.name = ? AND gm.user_id = ?").unwrap();
-                            let mut rows = stmt.query(params![gname, uid]).unwrap();
-                            rows.next().unwrap().is_some()
-                        }).await.unwrap_or(false);
+
+                        // Проверка на членство в группе через асинхронный запрос
+                        let is_member = {
+                            match state.db.get().await {
+                                Ok(client) => {
+                                    client.query_opt(
+                                        "SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id WHERE g.name = $1 AND gm.user_id = $2",
+                                        &[&group_name, &my_user_id],
+                                    ).await.map(|opt| opt.is_some()).unwrap_or(false)
+                                }
+                                Err(_) => false,
+                            }
+                        };
 
                         if !is_member {
                             let _ =
@@ -1382,35 +1121,21 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             continue;
                         }
 
-                        let db = state.db.clone();
-                        let sender_id = my_user_id.clone();
-                        let gname = group_name.clone();
-                        let cnt = content.clone();
-                        let stored_id: i64 = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            AppState::store_group_message(
-                                &mut st.conn,
-                                &gname,
-                                &sender_id,
-                                &cnt,
+                        let stored_id = state
+                            .store_group_message(
+                                &group_name,
+                                &my_user_id,
+                                &content,
                                 timestamp,
                                 reply_opt,
                             )
-                        })
-                        .await
-                        .unwrap()
-                        .unwrap_or(0);
+                            .await
+                            .unwrap_or(0);
 
-                        let db = state.db.clone();
-                        let gname = group_name.clone();
-                        let members = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            AppState::get_group_members(&mut st.conn, &gname)
-                        })
-                        .await
-                        .unwrap()
-                        .unwrap_or_default();
-
+                        let members = state
+                            .get_group_members(&group_name)
+                            .await
+                            .unwrap_or_default();
                         let recip_with_hash = format!("#{}", group_name);
 
                         send_to_all_my_sessions(
@@ -1435,24 +1160,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             if member_id == my_user_id {
                                 continue;
                             }
-                            let db = state.db.clone();
-                            let mid = member_id.clone();
-                            let member_name_opt = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                let name = st.resolve_username(&mid);
-                                if name == DELETED_LABEL {
-                                    None
-                                } else {
-                                    Some(name)
-                                }
-                            })
-                            .await
-                            .unwrap();
 
-                            let member_name = match member_name_opt {
-                                Some(n) => n,
-                                None => continue,
-                            };
+                            let member_name = state.resolve_username(&member_id).await;
+                            if member_name == DELETED_LABEL {
+                                continue;
+                            }
+
                             let target_online = state.online_users.contains_key(&member_name);
 
                             if target_online {
@@ -1488,21 +1201,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     }
                                 }
                             } else {
-                                let db = state.db.clone();
-                                let mid2 = member_id.clone();
-                                let fcm_tokens = tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    AppState::get_fcm_tokens_for_user(&mut st.conn, &mid2)
-                                })
-                                .await
-                                .unwrap()
-                                .unwrap_or_default();
+                                let fcm_tokens = state
+                                    .get_fcm_tokens_for_user(&member_id)
+                                    .await
+                                    .unwrap_or_default();
 
                                 let sender_display_name =
                                     resolve_display_name(&state, &my_user_id, &my_username).await;
-                                let db_fcm = state.db.clone();
 
-                                // ИСПРАВЛЕНО: убрали кортеж
                                 for fcm_tok in fcm_tokens {
                                     let title = format!("Новое сообщение в группе {}", group_name);
                                     let body = format!(
@@ -1511,10 +1217,10 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         content.chars().take(100).collect::<String>()
                                     );
                                     let data_payload = json!({ "sender": sender_display_name, "group": group_name, "type": "group" });
-                                    let db_clone = db_fcm.clone();
+                                    let state_fcm = state.clone();
                                     tokio::spawn(async move {
                                         send_fcm_push_and_cleanup(
-                                            db_clone,
+                                            state_fcm,
                                             &fcm_tok,
                                             &title,
                                             &body,
@@ -1531,20 +1237,18 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     // ---- Канал ----
                     if recipient_name.starts_with('&') {
                         let channel_name = recipient_name.trim_start_matches('&').to_string();
-                        let db = state.db.clone();
-                        let uid = my_user_id.clone();
-                        let ch = channel_name.clone();
-                        let is_owner = tokio::task::spawn_blocking(move || {
-                            let st = db.lock().unwrap();
-                            let mut stmt = st
-                                .conn
-                                .prepare("SELECT 1 FROM channels WHERE name = ? AND creator_id = ?")
-                                .unwrap();
-                            let mut rows = stmt.query(params![ch, uid]).unwrap();
-                            rows.next().unwrap().is_some()
-                        })
-                        .await
-                        .unwrap_or(false);
+
+                        let is_owner = {
+                            match state.db.get().await {
+                                Ok(client) => {
+                                    client.query_opt(
+                                        "SELECT 1 FROM channels WHERE name = $1 AND creator_id = $2",
+                                        &[&channel_name, &my_user_id],
+                                    ).await.map(|opt| opt.is_some()).unwrap_or(false)
+                                }
+                                Err(_) => false,
+                            }
+                        };
 
                         if !is_owner {
                             let _ = send_system_message(
@@ -1555,35 +1259,21 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             continue;
                         }
 
-                        let db = state.db.clone();
-                        let sender_id = my_user_id.clone();
-                        let ch_name = channel_name.clone();
-                        let cnt = content.clone();
-                        let stored_id: i64 = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            AppState::store_channel_message(
-                                &mut st.conn,
-                                &ch_name,
-                                &sender_id,
-                                &cnt,
+                        let stored_id = state
+                            .store_channel_message(
+                                &channel_name,
+                                &my_user_id,
+                                &content,
                                 timestamp,
                                 reply_opt,
                             )
-                        })
-                        .await
-                        .unwrap()
-                        .unwrap_or(0);
+                            .await
+                            .unwrap_or(0);
 
-                        let db = state.db.clone();
-                        let ch_name2 = channel_name.clone();
-                        let subscribers = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            AppState::get_channel_subscribers(&mut st.conn, &ch_name2)
-                        })
-                        .await
-                        .unwrap()
-                        .unwrap_or_default();
-
+                        let subscribers = state
+                            .get_channel_subscribers(&channel_name)
+                            .await
+                            .unwrap_or_default();
                         let recip_with_amp = format!("&{}", channel_name);
 
                         send_to_all_my_sessions(
@@ -1608,24 +1298,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             if sub_id == my_user_id {
                                 continue;
                             }
-                            let db = state.db.clone();
-                            let sid = sub_id.clone();
-                            let sub_name_opt = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                let name = st.resolve_username(&sid);
-                                if name == DELETED_LABEL {
-                                    None
-                                } else {
-                                    Some(name)
-                                }
-                            })
-                            .await
-                            .unwrap();
 
-                            let sub_name = match sub_name_opt {
-                                Some(n) => n,
-                                None => continue,
-                            };
+                            let sub_name = state.resolve_username(&sub_id).await;
+                            if sub_name == DELETED_LABEL {
+                                continue;
+                            }
+
                             let target_online = state.online_users.contains_key(&sub_name);
 
                             if target_online {
@@ -1661,30 +1339,23 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     }
                                 }
                             } else {
-                                let db = state.db.clone();
-                                let sid2 = sub_id.clone();
-                                let fcm_tokens = tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    AppState::get_fcm_tokens_for_user(&mut st.conn, &sid2)
-                                })
-                                .await
-                                .unwrap()
-                                .unwrap_or_default();
+                                let fcm_tokens = state
+                                    .get_fcm_tokens_for_user(&sub_id)
+                                    .await
+                                    .unwrap_or_default();
 
                                 let sender_display_name =
                                     resolve_display_name(&state, &my_user_id, &my_username).await;
-                                let db_fcm = state.db.clone();
 
-                                // ИСПРАВЛЕНО: убрали кортеж
                                 for fcm_tok in fcm_tokens {
                                     let title =
                                         format!("Новое сообщение в канале {}", channel_name);
                                     let body = content.chars().take(100).collect::<String>();
                                     let data_payload = json!({ "sender": sender_display_name, "channel": channel_name, "type": "channel" });
-                                    let db_clone = db_fcm.clone();
+                                    let state_fcm = state.clone();
                                     tokio::spawn(async move {
                                         send_fcm_push_and_cleanup(
-                                            db_clone,
+                                            state_fcm,
                                             &fcm_tok,
                                             &title,
                                             &body,
@@ -1698,7 +1369,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         continue;
                     }
                 }
-
                 MSG_TYPE_EDIT => {
                     if rest.len() < 8 + 1 + 12 + 4 {
                         warn!("0x08: мало данных");
@@ -1733,20 +1403,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     match kind {
                         MSG_KIND_PERSONAL => {
-                            let db = state.db.clone();
-                            let new_text_clone = new_text.clone();
-                            let upd = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                AppState::update_personal_message_content(
-                                    &mut st.conn,
-                                    msg_id,
-                                    &new_text_clone,
-                                )
-                            })
-                            .await
-                            .unwrap();
-
-                            let (sender_id, recipient_id) = match upd {
+                            // 1. СНАЧАЛА ПРОВЕРКА ПРАВ
+                            let lookup = state.lookup_personal_message(msg_id).await;
+                            let (sender_id, recipient_id) = match lookup {
                                 Ok(Some(v)) => v,
                                 Ok(None) => {
                                     let _ =
@@ -1770,32 +1429,37 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
 
-                            let db = state.db.clone();
-                            let mid = msg_id;
-                            let extra = tokio::task::spawn_blocking(move || {
-                                let st = db.lock().unwrap();
-                                st.conn.query_row(
-                                    "SELECT strftime('%s', sent_at) * 1000, reply_to_id, read_at FROM messages WHERE id = ?",
-                                    [mid], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<String>>(2)?))
-                                ).ok()
-                            }).await.unwrap();
-
-                            let (ts, reply_opt, read_at) = match extra {
-                                Some(v) => v,
-                                None => continue,
+                            // 2. Получаем доп. данные для рассылки (время, reply, прочитано)
+                            let (ts, reply_opt, read_flag) = {
+                                match state.db.get().await {
+                                    Ok(client) => {
+                                        match client.query_opt(
+                                            "SELECT (EXTRACT(EPOCH FROM sent_at) * 1000)::bigint, reply_to_id, read_at FROM messages WHERE id = $1",
+                                            &[&msg_id],
+                                        ).await {
+                                            Ok(Some(row)) => {
+                                                let ts: i64 = row.get(0);
+                                                let rt: Option<i64> = row.get(1);
+                                                let ra: Option<chrono::DateTime<chrono::Utc>> = row.get(2);
+                                                (ts, rt, ra.is_some())
+                                            }
+                                            _ => (0, None, false),
+                                        }
+                                    }
+                                    Err(_) => (0, None, false),
+                                }
                             };
-                            let reply_id = reply_opt.unwrap_or(0);
-                            let read_flag = read_at.is_some();
 
-                            let db = state.db.clone();
-                            let sid = sender_id.clone();
-                            let rid = recipient_id.clone();
-                            let (s_name, r_name) = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                (st.resolve_username(&sid), st.resolve_username(&rid))
-                            })
-                            .await
-                            .unwrap();
+                            // 3. ОБНОВЛЯЕМ В БД
+                            let _ = state
+                                .update_personal_message_content(msg_id, &new_text)
+                                .await;
+
+                            let reply_id = reply_opt.unwrap_or(0);
+                            let (s_name, r_name) = (
+                                state.resolve_username(&sender_id).await,
+                                state.resolve_username(&recipient_id).await,
+                            );
 
                             send_to_all_my_sessions(
                                 &state,
@@ -1816,13 +1480,15 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             .await;
 
                             if recipient_id != my_user_id {
-                                let db = state.db.clone();
-                                let rid2 = recipient_id.clone();
-                                let mid2 = msg_id;
-                                let hidden = tokio::task::spawn_blocking(move || {
-                                    let st = db.lock().unwrap();
-                                    st.conn.query_row("SELECT 1 FROM hidden_messages WHERE user_id = ? AND kind = 1 AND msg_id = ?", params![rid2, mid2], |_| Ok(())).is_ok()
-                                }).await.unwrap();
+                                let hidden = {
+                                    match state.db.get().await {
+                                        Ok(client) => client.query_opt(
+                                            "SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 1 AND msg_id = $2",
+                                            &[&recipient_id, &msg_id],
+                                        ).await.map(|opt| opt.is_some()).unwrap_or(false),
+                                        Err(_) => false,
+                                    }
+                                };
 
                                 if !hidden {
                                     let tokens = {
@@ -1859,30 +1525,33 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             }
                         }
                         MSG_KIND_GROUP => {
-                            let db = state.db.clone();
-                            let new_text_clone = new_text.clone();
-                            let upd = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                AppState::update_group_message_content(
-                                    &mut st.conn,
-                                    msg_id,
-                                    &new_text_clone,
-                                )
-                            })
-                            .await
-                            .unwrap();
+                            // 1. ПОЛУЧАЕМ ИНФУ И ПРОВЕРЯЕМ ПРАВА
+                            let mut sender_id_opt = None;
+                            let mut ts = 0;
+                            let mut reply_id = 0;
+                            let mut flag_any = false;
+                            let mut gname = String::new();
 
-                            let sender_id = match upd {
-                                Ok(Some(v)) => v,
-                                Ok(None) => {
+                            if let Ok(client) = state.db.get().await {
+                                if let Ok(Some(row)) = client.query_opt(
+                                    "SELECT gm.sender_id, (EXTRACT(EPOCH FROM gm.sent_at) * 1000)::bigint, gm.reply_to_id, gm.first_read_at, g.name \
+                                     FROM group_messages gm JOIN groups g ON gm.group_id = g.id WHERE gm.id = $1",
+                                    &[&msg_id],
+                                ).await {
+                                    sender_id_opt = Some(row.get::<_, String>(0));
+                                    ts = row.get(1);
+                                    reply_id = row.get::<_, Option<i64>>(2).unwrap_or(0);
+                                    flag_any = row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(3).is_some();
+                                    gname = row.get(4);
+                                }
+                            }
+
+                            let sender_id = match sender_id_opt {
+                                Some(v) => v,
+                                None => {
                                     let _ =
                                         send_system_message(&tx, "[Система] Сообщение не найдено")
                                             .await;
-                                    continue;
-                                }
-                                Err(e) => {
-                                    let _ =
-                                        send_system_message(&tx, &format!("[Система] {}", e)).await;
                                     continue;
                                 }
                             };
@@ -1896,38 +1565,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
 
-                            let db = state.db.clone();
-                            let mid = msg_id;
-                            let extra = tokio::task::spawn_blocking(move || {
-                                let st = db.lock().unwrap();
-                                st.conn
-                                    .query_row(
-                                        "SELECT strftime('%s', gm.sent_at) * 1000, gm.reply_to_id, \
-                                            gm.first_read_at, g.name \
-                                     FROM group_messages gm \
-                                     JOIN groups g ON gm.group_id = g.id \
-                                     WHERE gm.id = ?",
-                                        [mid],
-                                        |row| {
-                                            Ok((
-                                                row.get::<_, i64>(0)?,
-                                                row.get::<_, Option<i64>>(1)?,
-                                                row.get::<_, Option<String>>(2)?,
-                                                row.get::<_, String>(3)?,
-                                            ))
-                                        },
-                                    )
-                                    .ok()
-                            })
-                            .await
-                            .unwrap();
+                            // 2. ОБНОВЛЯЕМ В БД
+                            let _ = state.update_group_message_content(msg_id, &new_text).await;
 
-                            let (ts, reply_opt, first_read_at, gname) = match extra {
-                                Some(v) => v,
-                                None => continue,
-                            };
-                            let reply_id = reply_opt.unwrap_or(0);
-                            let flag_any = first_read_at.is_some();
                             let recip_with_hash = format!("#{}", gname);
 
                             send_to_all_my_sessions(
@@ -1948,48 +1588,30 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             )
                             .await;
 
-                            let db = state.db.clone();
-                            let gname2 = gname.clone();
-                            let members = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                AppState::get_group_members(&mut st.conn, &gname2)
-                            })
-                            .await
-                            .unwrap()
-                            .unwrap_or_default();
+                            let members = state.get_group_members(&gname).await.unwrap_or_default();
 
                             for member_id in members {
                                 if member_id == my_user_id {
                                     continue;
                                 }
-                                let db = state.db.clone();
-                                let mid_c = member_id.clone();
-                                let hidden = tokio::task::spawn_blocking(move || {
-                                    let st = db.lock().unwrap();
-                                    st.conn.query_row("SELECT 1 FROM hidden_messages WHERE user_id = ? AND kind = 2 AND msg_id = ?", params![mid_c, msg_id], |_| Ok(())).is_ok()
-                                }).await.unwrap();
+
+                                let hidden = {
+                                    match state.db.get().await {
+                                        Ok(client) => client.query_opt(
+                                            "SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 2 AND msg_id = $2",
+                                            &[&member_id, &msg_id],
+                                        ).await.map(|opt| opt.is_some()).unwrap_or(false),
+                                        Err(_) => false,
+                                    }
+                                };
                                 if hidden {
                                     continue;
                                 }
 
-                                let db = state.db.clone();
-                                let mid_c = member_id.clone();
-                                let member_name_opt = tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    let name = st.resolve_username(&mid_c);
-                                    if name == DELETED_LABEL {
-                                        None
-                                    } else {
-                                        Some(name)
-                                    }
-                                })
-                                .await
-                                .unwrap();
-
-                                let member_name = match member_name_opt {
-                                    Some(n) => n,
-                                    None => continue,
-                                };
+                                let member_name = state.resolve_username(&member_id).await;
+                                if member_name == DELETED_LABEL {
+                                    continue;
+                                }
 
                                 let tokens = {
                                     state
@@ -2025,20 +1647,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             info!("Групповое сообщение id={} отредактировано", msg_id);
                         }
                         MSG_KIND_CHANNEL => {
-                            let db = state.db.clone();
-                            let new_text_clone = new_text.clone();
-                            let upd = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                AppState::update_channel_message_content(
-                                    &mut st.conn,
-                                    msg_id,
-                                    &new_text_clone,
-                                )
-                            })
-                            .await
-                            .unwrap();
-
-                            let (cname, creator_id, _sender_id) = match upd {
+                            // 1. ПРОВЕРКА ПРАВ
+                            let lookup = state.lookup_channel_message(msg_id).await;
+                            let (cname, creator_id, _sender_id) = match lookup {
                                 Ok(Some(v)) => v,
                                 Ok(None) => {
                                     let _ =
@@ -2058,36 +1669,34 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
 
-                            let db = state.db.clone();
-                            let mid = msg_id;
-                            let extra = tokio::task::spawn_blocking(move || {
-                                let st = db.lock().unwrap();
-                                st.conn
-                                    .query_row(
-                                        "SELECT strftime('%s', cm.sent_at) * 1000, cm.reply_to_id, \
-                                            (SELECT COUNT(*) FROM channel_message_views v \
-                                             WHERE v.channel_msg_id = cm.id) \
-                                     FROM channel_messages cm WHERE cm.id = ?",
-                                        [mid],
-                                        |row| {
-                                            Ok((
-                                                row.get::<_, i64>(0)?,
-                                                row.get::<_, Option<i64>>(1)?,
-                                                row.get::<_, i64>(2).unwrap_or(0),
-                                            ))
-                                        },
-                                    )
-                                    .ok()
-                            })
-                            .await
-                            .unwrap();
-
-                            let (ts, reply_opt, views) = match extra {
-                                Some(v) => v,
-                                None => continue,
+                            // 2. ПОЛУЧАЕМ ДОП. ДАННЫЕ
+                            let (ts, reply_id, views_u) = {
+                                match state.db.get().await {
+                                    Ok(client) => {
+                                        match client.query_opt(
+                                            "SELECT (EXTRACT(EPOCH FROM sent_at) * 1000)::bigint, reply_to_id, \
+                                                    (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id) \
+                                             FROM channel_messages cm WHERE cm.id = $1",
+                                            &[&msg_id],
+                                        ).await {
+                                            Ok(Some(row)) => {
+                                                let t: i64 = row.get(0);
+                                                let r: i64 = row.get::<_, Option<i64>>(1).unwrap_or(0);
+                                                let v: i64 = row.get(2);
+                                                (t, r, v as u32)
+                                            }
+                                            _ => (0, 0, 0),
+                                        }
+                                    }
+                                    Err(_) => (0, 0, 0),
+                                }
                             };
-                            let reply_id = reply_opt.unwrap_or(0);
-                            let views_u = views as u32;
+
+                            // 3. ОБНОВЛЯЕМ В БД
+                            let _ = state
+                                .update_channel_message_content(msg_id, &new_text)
+                                .await;
+
                             let recip_with_amp = format!("&{}", cname);
 
                             send_to_all_my_sessions(
@@ -2108,48 +1717,33 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             )
                             .await;
 
-                            let db = state.db.clone();
-                            let cname2 = cname.clone();
-                            let subscribers = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                AppState::get_channel_subscribers(&mut st.conn, &cname2)
-                            })
-                            .await
-                            .unwrap()
-                            .unwrap_or_default();
+                            let subscribers = state
+                                .get_channel_subscribers(&cname)
+                                .await
+                                .unwrap_or_default();
 
                             for sub_id in subscribers {
                                 if sub_id == my_user_id {
                                     continue;
                                 }
-                                let db = state.db.clone();
-                                let sid_c = sub_id.clone();
-                                let hidden = tokio::task::spawn_blocking(move || {
-                                    let st = db.lock().unwrap();
-                                    st.conn.query_row("SELECT 1 FROM hidden_messages WHERE user_id = ? AND kind = 3 AND msg_id = ?", params![sid_c, msg_id], |_| Ok(())).is_ok()
-                                }).await.unwrap();
+
+                                let hidden = {
+                                    match state.db.get().await {
+                                        Ok(client) => client.query_opt(
+                                            "SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 3 AND msg_id = $2",
+                                            &[&sub_id, &msg_id],
+                                        ).await.map(|opt| opt.is_some()).unwrap_or(false),
+                                        Err(_) => false,
+                                    }
+                                };
                                 if hidden {
                                     continue;
                                 }
 
-                                let db = state.db.clone();
-                                let sid_c = sub_id.clone();
-                                let sub_name_opt = tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    let name = st.resolve_username(&sid_c);
-                                    if name == DELETED_LABEL {
-                                        None
-                                    } else {
-                                        Some(name)
-                                    }
-                                })
-                                .await
-                                .unwrap();
-
-                                let sub_name = match sub_name_opt {
-                                    Some(n) => n,
-                                    None => continue,
-                                };
+                                let sub_name = state.resolve_username(&sub_id).await;
+                                if sub_name == DELETED_LABEL {
+                                    continue;
+                                }
 
                                 let tokens = {
                                     state
@@ -2189,7 +1783,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                     }
                 }
-
                 MSG_TYPE_READ => {
                     if rest.len() < 2 {
                         continue;
@@ -2223,124 +1816,44 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     // --- Личные ---
                     if !personal_ids.is_empty() {
-                        let db = state.db.clone();
-                        let me = my_user_id.clone();
-                        let ids = personal_ids.clone();
-                        let by_author = tokio::task::spawn_blocking(move || {
-                            let st = db.lock().unwrap();
-                            let mut map: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
-                            for msg_id in ids {
-                                let row: Option<(String, String)> = st.conn.query_row(
-                                    "SELECT sender_id, recipient_id FROM messages WHERE id = ?",
-                                    [msg_id], |row| Ok((row.get(0)?, row.get(1)?))
-                                ).ok();
-                                if let Some((sender_id, recipient_id)) = row {
-                                    if recipient_id == me {
-                                        let _ = st.conn.execute("UPDATE messages SET read_at = CURRENT_TIMESTAMP WHERE id = ? AND read_at IS NULL", [msg_id]);
-                                        map.entry(sender_id).or_default().push(msg_id);
-                                    }
-                                }
+                        if let Ok(client) = state.db.get().await {
+                            // 1. Получаем авторов для всех запрошенных ID
+                            let rows = client.query(
+                                "SELECT id, sender_id FROM messages WHERE id = ANY($1) AND recipient_id = $2",
+                                &[&personal_ids, &my_user_id],
+                            ).await.unwrap_or_default();
+
+                            let mut by_author: std::collections::HashMap<String, Vec<i64>> =
+                                std::collections::HashMap::new();
+                            for row in rows {
+                                let id: i64 = row.get(0);
+                                let sender_id: String = row.get(1);
+                                by_author.entry(sender_id).or_default().push(id);
                             }
-                            map
-                        }).await.unwrap();
 
-                        for (author_id, ids) in by_author {
-                            if author_id == my_user_id {
-                                continue;
-                            }
-                            let author_name = {
-                                let db = state.db.clone();
-                                let aid = author_id.clone();
-                                tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    st.resolve_username(&aid)
-                                })
-                                .await
-                                .unwrap()
-                            };
-                            let tokens = {
-                                state
-                                    .online_users
-                                    .get(&author_name)
-                                    .map(|r| r.clone())
-                                    .unwrap_or_default()
-                            };
-                            let items: Vec<(u8, i64)> =
-                                ids.iter().map(|id| (MSG_KIND_PERSONAL, *id)).collect();
-                            let pkt = crate::senders::build_read_packet(&items);
-                            for tok in tokens {
-                                let sess = state.sessions.get(&tok).map(|r| r.clone());
-                                if let Some(s) = sess {
-                                    let _ = s.tx.send(Message::Binary(pkt.clone().into()));
-                                }
-                            }
-                        }
-                    }
+                            // 2. Массово обновляем read_at
+                            let _ = client.execute(
+                                "UPDATE messages SET read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND read_at IS NULL",
+                                &[&personal_ids],
+                            ).await;
 
-                    // --- Группы ---
-                    if !group_ids.is_empty() {
-                        let db = state.db.clone();
-                        let ids = group_ids.clone();
-                        let by_group = tokio::task::spawn_blocking(move || {
-                            let st = db.lock().unwrap();
-                            let mut map: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
-                            for msg_id in ids {
-                                let gid: Option<String> = st.conn.query_row("SELECT group_id FROM group_messages WHERE id = ?", [msg_id], |row| row.get(0)).ok();
-                                if let Some(gid) = gid {
-                                    let _ = st.conn.execute("UPDATE group_messages SET first_read_at = CURRENT_TIMESTAMP WHERE id = ? AND first_read_at IS NULL", [msg_id]);
-                                    map.entry(gid).or_default().push(msg_id);
-                                }
-                            }
-                            map
-                        }).await.unwrap();
-
-                        for (group_id, ids) in by_group {
-                            let db = state.db.clone();
-                            let gid = group_id.clone();
-                            let members = tokio::task::spawn_blocking(move || {
-                                let st = db.lock().unwrap();
-                                let mut stmt = st
-                                    .conn
-                                    .prepare("SELECT user_id FROM group_members WHERE group_id = ?")
-                                    .map_err(|e| e.to_string())?;
-                                let iter = stmt
-                                    .query_map([&gid], |row| row.get::<_, String>(0))
-                                    .map_err(|e| e.to_string())?;
-                                let mut v = Vec::new();
-                                for r in iter {
-                                    v.push(r.map_err(|e| e.to_string())?);
-                                }
-                                Ok::<_, String>(v)
-                            })
-                            .await
-                            .unwrap()
-                            .unwrap_or_default();
-
-                            let items: Vec<(u8, i64)> =
-                                ids.iter().map(|id| (MSG_KIND_GROUP, *id)).collect();
-                            let pkt = crate::senders::build_read_packet(&items);
-
-                            for mid in members {
-                                if mid == my_user_id {
+                            // 3. Рассылаем пакеты
+                            for (author_id, ids) in by_author {
+                                if author_id == my_user_id {
                                     continue;
                                 }
-                                let name = {
-                                    let db = state.db.clone();
-                                    let m = mid.clone();
-                                    tokio::task::spawn_blocking(move || {
-                                        let mut st = db.lock().unwrap();
-                                        st.resolve_username(&m)
-                                    })
-                                    .await
-                                    .unwrap()
-                                };
+                                let author_name = state.resolve_username(&author_id).await;
                                 let tokens = {
                                     state
                                         .online_users
-                                        .get(&name)
+                                        .get(&author_name)
                                         .map(|r| r.clone())
                                         .unwrap_or_default()
                                 };
+                                let items: Vec<(u8, i64)> =
+                                    ids.iter().map(|id| (MSG_KIND_PERSONAL, *id)).collect();
+                                let pkt = crate::senders::build_read_packet(&items);
+
                                 for tok in tokens {
                                     let sess = state.sessions.get(&tok).map(|r| r.clone());
                                     if let Some(s) = sess {
@@ -2351,23 +1864,87 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                     }
 
+                    // --- Группы ---
+                    if !group_ids.is_empty() {
+                        if let Ok(client) = state.db.get().await {
+                            // 1. Получаем group_id для всех запрошенных сообщений
+                            let rows = client
+                                .query(
+                                    "SELECT id, group_id FROM group_messages WHERE id = ANY($1)",
+                                    &[&group_ids],
+                                )
+                                .await
+                                .unwrap_or_default();
+
+                            let mut by_group: std::collections::HashMap<String, Vec<i64>> =
+                                std::collections::HashMap::new();
+                            for row in rows {
+                                let id: i64 = row.get(0);
+                                let group_id: String = row.get(1);
+                                by_group.entry(group_id).or_default().push(id);
+                            }
+
+                            // 2. Массово обновляем first_read_at
+                            let _ = client.execute(
+                                "UPDATE group_messages SET first_read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND first_read_at IS NULL",
+                                &[&group_ids],
+                            ).await;
+
+                            // 3. Рассылаем пакеты участникам
+                            for (group_id, ids) in by_group {
+                                // Получаем участников группы по её ID
+                                let members = match client
+                                    .query(
+                                        "SELECT user_id FROM group_members WHERE group_id = $1",
+                                        &[&group_id],
+                                    )
+                                    .await
+                                {
+                                    Ok(rows) => rows
+                                        .into_iter()
+                                        .map(|r| r.get::<_, String>(0))
+                                        .collect::<Vec<String>>(),
+                                    Err(_) => Vec::new(),
+                                };
+
+                                let items: Vec<(u8, i64)> =
+                                    ids.iter().map(|id| (MSG_KIND_GROUP, *id)).collect();
+                                let pkt = crate::senders::build_read_packet(&items);
+
+                                for mid in members {
+                                    if mid == my_user_id {
+                                        continue;
+                                    }
+                                    let name = state.resolve_username(&mid).await;
+                                    let tokens = {
+                                        state
+                                            .online_users
+                                            .get(&name)
+                                            .map(|r| r.clone())
+                                            .unwrap_or_default()
+                                    };
+                                    for tok in tokens {
+                                        let sess = state.sessions.get(&tok).map(|r| r.clone());
+                                        if let Some(s) = sess {
+                                            let _ = s.tx.send(Message::Binary(pkt.clone().into()));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // --- Каналы ---
                     if !channel_ids.is_empty() {
-                        let db = state.db.clone();
-                        let me = my_user_id.clone();
-                        let ids = channel_ids.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let st = db.lock().unwrap();
-                            for msg_id in ids {
-                                let _ = st.conn.execute(
-                                    "INSERT OR IGNORE INTO channel_message_views (channel_msg_id, user_id) VALUES (?, ?)",
-                                    params![msg_id, me],
-                                );
-                            }
-                        }).await;
+                        if let Ok(client) = state.db.get().await {
+                            // В Postgres мы можем вставить массив значений одной командой
+                            let _ = client.execute(
+                                "INSERT INTO channel_message_views (channel_msg_id, user_id) SELECT unnest($1::bigint[]), $2 ON CONFLICT DO NOTHING",
+                                &[&channel_ids, &my_user_id],
+                            ).await;
+                        }
                     }
                 }
-
                 MSG_TYPE_DELETE => {
                     if rest.len() < 9 {
                         warn!("0x05: мало данных");
@@ -2397,34 +1974,15 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                         match kind {
                             MSG_KIND_PERSONAL => {
-                                let db = state.db.clone();
-                                let target_name = name.clone();
-                                let peer_id_opt = tokio::task::spawn_blocking(move || {
-                                    let mut st = db.lock().unwrap();
-                                    st.resolve_id(&target_name)
-                                })
-                                .await
-                                .unwrap();
+                                let peer_id_opt = state.resolve_id(&name).await;
 
                                 if let Some(peer_id) = peer_id_opt {
                                     if dtype == MSG_DELETE_FOR_ME {
-                                        let db = state.db.clone();
-                                        let uid = my_user_id.clone();
-                                        let pid = peer_id.clone();
-                                        let _ = tokio::task::spawn_blocking(move || {
-                                            let mut st = db.lock().unwrap();
-                                            AppState::hide_personal_chat(&mut st.conn, &uid, &pid)
-                                        })
-                                        .await;
+                                        let _ =
+                                            state.hide_personal_chat(&my_user_id, &peer_id).await;
                                     } else {
-                                        let db = state.db.clone();
-                                        let uid = my_user_id.clone();
-                                        let pid = peer_id.clone();
-                                        let _ = tokio::task::spawn_blocking(move || {
-                                            let mut st = db.lock().unwrap();
-                                            AppState::delete_personal_chat(&mut st.conn, &uid, &pid)
-                                        })
-                                        .await;
+                                        let _ =
+                                            state.delete_personal_chat(&my_user_id, &peer_id).await;
 
                                         let pkt = build_delete_chat_packet(kind, &name, 0);
                                         send_to_user_sessions(&state, &my_username, pkt.clone())
@@ -2435,48 +1993,19 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             }
                             MSG_KIND_GROUP => {
                                 if dtype == MSG_DELETE_FOR_ME {
-                                    let db = state.db.clone();
-                                    let uid = my_user_id.clone();
-                                    let gname = name.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        let mut st = db.lock().unwrap();
-                                        AppState::leave_group(&mut st.conn, &gname, &uid)
-                                    })
-                                    .await;
+                                    let _ = state.leave_group(&name, &my_user_id).await;
                                 } else {
-                                    let db = state.db.clone();
-                                    let uid = my_user_id.clone();
-                                    let gname = name.clone();
-                                    let del_res = tokio::task::spawn_blocking(move || {
-                                        let mut st = db.lock().unwrap();
-                                        AppState::delete_group(&mut st.conn, &gname, &uid)
-                                    })
-                                    .await
-                                    .unwrap();
+                                    // СНАЧАЛА ПОЛУЧАЕМ УЧАСТНИКОВ (пока группа не удалена каскадом)
+                                    let members =
+                                        state.get_group_members(&name).await.unwrap_or_default();
+
+                                    let del_res = state.delete_group(&name, &my_user_id).await;
 
                                     match del_res {
                                         Ok(true) => {
                                             let pkt = build_delete_chat_packet(kind, &name, 0);
-                                            let db = state.db.clone();
-                                            let gname2 = name.clone();
-                                            let members = tokio::task::spawn_blocking(move || {
-                                                let mut st = db.lock().unwrap();
-                                                AppState::get_group_members(&mut st.conn, &gname2)
-                                            })
-                                            .await
-                                            .unwrap()
-                                            .unwrap_or_default();
-
                                             for m_id in members {
-                                                let db = state.db.clone();
-                                                let m = m_id.clone();
-                                                let m_name =
-                                                    tokio::task::spawn_blocking(move || {
-                                                        let mut st = db.lock().unwrap();
-                                                        st.resolve_username(&m)
-                                                    })
-                                                    .await
-                                                    .unwrap();
+                                                let m_name = state.resolve_username(&m_id).await;
                                                 send_to_user_sessions(&state, &m_name, pkt.clone())
                                                     .await;
                                             }
@@ -2500,51 +2029,21 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             }
                             MSG_KIND_CHANNEL => {
                                 if dtype == MSG_DELETE_FOR_ME {
-                                    let db = state.db.clone();
-                                    let uid = my_user_id.clone();
-                                    let cname = name.clone();
-                                    let _ = tokio::task::spawn_blocking(move || {
-                                        let mut st = db.lock().unwrap();
-                                        AppState::unsubscribe_channel(&mut st.conn, &cname, &uid)
-                                    })
-                                    .await;
+                                    let _ = state.unsubscribe_channel(&name, &my_user_id).await;
                                 } else {
-                                    let db = state.db.clone();
-                                    let uid = my_user_id.clone();
-                                    let cname = name.clone();
-                                    let del_res = tokio::task::spawn_blocking(move || {
-                                        let mut st = db.lock().unwrap();
-                                        AppState::delete_channel(&mut st.conn, &cname, &uid)
-                                    })
-                                    .await
-                                    .unwrap();
+                                    // СНАЧАЛА ПОЛУЧАЕМ ПОДПИСЧИКОВ
+                                    let subs = state
+                                        .get_channel_subscribers(&name)
+                                        .await
+                                        .unwrap_or_default();
+
+                                    let del_res = state.delete_channel(&name, &my_user_id).await;
 
                                     match del_res {
                                         Ok(true) => {
                                             let pkt = build_delete_chat_packet(kind, &name, 0);
-                                            let db = state.db.clone();
-                                            let cname2 = name.clone();
-                                            let subs = tokio::task::spawn_blocking(move || {
-                                                let mut st = db.lock().unwrap();
-                                                AppState::get_channel_subscribers(
-                                                    &mut st.conn,
-                                                    &cname2,
-                                                )
-                                            })
-                                            .await
-                                            .unwrap()
-                                            .unwrap_or_default();
-
                                             for sub_id in subs {
-                                                let db = state.db.clone();
-                                                let s = sub_id.clone();
-                                                let s_name =
-                                                    tokio::task::spawn_blocking(move || {
-                                                        let mut st = db.lock().unwrap();
-                                                        st.resolve_username(&s)
-                                                    })
-                                                    .await
-                                                    .unwrap();
+                                                let s_name = state.resolve_username(&sub_id).await;
                                                 send_to_user_sessions(&state, &s_name, pkt.clone())
                                                     .await;
                                             }
@@ -2574,14 +2073,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     // ---- УДАЛЕНИЕ ОДНОГО СООБЩЕНИЯ ----
                     let dtype = if rest.len() >= 10 { rest[9] } else { 0 };
                     if dtype == MSG_DELETE_FOR_ME {
-                        let db = state.db.clone();
-                        let uid = my_user_id.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            AppState::hide_message(&mut st.conn, &uid, kind, msg_id)
-                        })
-                        .await
-                        .unwrap();
+                        let result = state.hide_message(&my_user_id, kind, msg_id).await;
                         if let Err(e) = result {
                             let _ = send_system_message(
                                 &tx,
@@ -2594,13 +2086,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     match kind {
                         MSG_KIND_PERSONAL => {
-                            let db = state.db.clone();
-                            let lookup = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                AppState::lookup_personal_message(&mut st.conn, msg_id)
-                            })
-                            .await
-                            .unwrap();
+                            let lookup = state.lookup_personal_message(msg_id).await;
 
                             match lookup {
                                 Ok(Some((sender_id, recipient_id))) => {
@@ -2612,13 +2098,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         .await;
                                         continue;
                                     }
-                                    let db = state.db.clone();
-                                    let del = tokio::task::spawn_blocking(move || {
-                                        let mut st = db.lock().unwrap();
-                                        AppState::delete_message(&mut st.conn, msg_id)
-                                    })
-                                    .await
-                                    .unwrap();
+
+                                    let del = state.delete_message(msg_id).await;
                                     if let Err(e) = del {
                                         let _ = send_system_message(
                                             &tx,
@@ -2636,21 +2117,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     let _ = tx.send(Message::Binary(pkt.clone().into()));
 
                                     if recipient_id != my_user_id {
-                                        let db = state.db.clone();
-                                        let rid = recipient_id.clone();
-                                        let rec_name_opt = tokio::task::spawn_blocking(move || {
-                                            let mut st = db.lock().unwrap();
-                                            let name = st.resolve_username(&rid);
-                                            if name == DELETED_LABEL {
-                                                None
-                                            } else {
-                                                Some(name)
-                                            }
-                                        })
-                                        .await
-                                        .unwrap();
+                                        //let rec_name_opt = state.resolve_id(&recipient_id).await;
+                                        // Было resolve_username, но тут нужен username для поиска сессии.
+                                        // Используем resolve_username, чтобы получить имя для DashMap.
+                                        let rec_name = state.resolve_username(&recipient_id).await;
 
-                                        if let Some(rec_name) = rec_name_opt {
+                                        if rec_name != DELETED_LABEL {
                                             let tokens = {
                                                 state
                                                     .online_users
@@ -2689,13 +2161,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             .await;
                         }
                         MSG_KIND_CHANNEL => {
-                            let db = state.db.clone();
-                            let lookup = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                AppState::lookup_channel_message(&mut st.conn, msg_id)
-                            })
-                            .await
-                            .unwrap();
+                            let lookup = state.lookup_channel_message(msg_id).await;
 
                             match lookup {
                                 Ok(Some((channel_name, creator_id, _sender_id))) => {
@@ -2703,13 +2169,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         let _ = send_system_message(&tx, "[Система] Только владелец канала может удалять сообщения").await;
                                         continue;
                                     }
-                                    let db = state.db.clone();
-                                    let del = tokio::task::spawn_blocking(move || {
-                                        let mut st = db.lock().unwrap();
-                                        AppState::delete_channel_message(&mut st.conn, msg_id)
-                                    })
-                                    .await
-                                    .unwrap();
+
+                                    let del = state.delete_channel_message(msg_id).await;
                                     if let Err(e) = del {
                                         let _ = send_system_message(
                                             &tx,
@@ -2719,15 +2180,10 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         continue;
                                     }
 
-                                    let db = state.db.clone();
-                                    let ch = channel_name.clone();
-                                    let subs_ids = tokio::task::spawn_blocking(move || {
-                                        let mut st = db.lock().unwrap();
-                                        AppState::get_channel_subscribers(&mut st.conn, &ch)
-                                    })
-                                    .await
-                                    .unwrap()
-                                    .unwrap_or_default();
+                                    let subs_ids = state
+                                        .get_channel_subscribers(&channel_name)
+                                        .await
+                                        .unwrap_or_default();
 
                                     let pkt = crate::senders::build_delete_packet(
                                         msg_id,
@@ -2763,7 +2219,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                     }
                 }
-
+                // ==========================================
+                // 0x06: LOGOUT / DELETE ACCOUNT
+                // ==========================================
                 MSG_TYPE_LOGOUT => {
                     if rest.len() < 12 + 4 {
                         continue;
@@ -2807,15 +2265,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let _ = send_system_message(&tx, "[Система] Неверный пароль").await;
                             continue;
                         }
-                        let db = state.db.clone();
-                        let uid = my_user_id.clone();
-                        let pwd = password.to_string();
-                        let pwd_check = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            AppState::verify_password_for_user(&mut st.conn, &uid, &pwd)
-                        })
-                        .await
-                        .unwrap();
+
+                        let pwd_check = state.verify_password_for_user(&my_user_id, password).await;
 
                         match pwd_check {
                             Ok(true) => {}
@@ -2831,14 +2282,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             }
                         }
 
-                        let db = state.db.clone();
-                        let uid = my_user_id.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            AppState::soft_delete_account(&mut st, &uid)
-                        })
-                        .await
-                        .unwrap();
+                        let result = state.soft_delete_account(&my_user_id).await;
 
                         let tokens_to_kill = match result {
                             Ok(v) => v,
@@ -2887,14 +2331,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     // Обычный logout (exit)
                     info!("Logout: EXIT, token={}", token);
-                    let db = state.db.clone();
-                    let tok = token.to_string();
-                    let result = tokio::task::spawn_blocking(move || {
-                        let mut st = db.lock().unwrap();
-                        AppState::delete_session(&mut st.conn, &tok)
-                    })
-                    .await
-                    .unwrap();
+                    let result = state.delete_session(token).await;
 
                     match result {
                         Ok(_) => {
@@ -2925,6 +2362,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     }
                 }
 
+                // ==========================================
+                // 0x03: COMMAND
+                // ==========================================
                 MSG_TYPE_COMMAND => {
                     if rest.len() < 4 {
                         continue;
@@ -2984,8 +2424,11 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         let _ = send_system_message(&tx, &response).await;
                     }
                 }
+                // ==========================================
+                // 0x09: TYPING (Печатает...)
+                // ==========================================
                 MSG_TYPE_TYPING => {
-                    debug!("Получен пакет TYPING от {}", my_username); // <--- ДОБАВИТЬ
+                    debug!("Получен пакет TYPING от {}", my_username);
                     // [0x09][kind u8][sender_len u32][sender][recipient_len u32][recipient]
                     if rest.len() < 1 + 4 + 4 {
                         continue;
@@ -3025,33 +2468,23 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let target_session = state.sessions.get(&tok).map(|r| r.clone());
                             if let Some(ts) = target_session {
                                 debug!("Пересылаю TYPING от {} к {}", my_username, recipient_name);
-                                let _ = ts.tx.send(Message::Binary(data.clone().into())); // Пересылаем как есть
+                                let _ = ts.tx.send(Message::Binary(data.clone().into()));
                             }
                         }
                     } else if kind == MSG_KIND_GROUP {
                         let group_name = recipient_name.trim_start_matches('#').to_string();
-                        let db = state.db.clone();
-                        let gname = group_name.clone();
-                        let members = tokio::task::spawn_blocking(move || {
-                            let mut st = db.lock().unwrap();
-                            AppState::get_group_members(&mut st.conn, &gname)
-                        })
-                        .await
-                        .unwrap()
-                        .unwrap_or_default();
+
+                        let members = state
+                            .get_group_members(&group_name)
+                            .await
+                            .unwrap_or_default();
 
                         for member_id in members {
                             if member_id == my_user_id {
                                 continue;
                             }
-                            let db = state.db.clone();
-                            let mid = member_id.clone();
-                            let member_name = tokio::task::spawn_blocking(move || {
-                                let mut st = db.lock().unwrap();
-                                st.resolve_username(&mid)
-                            })
-                            .await
-                            .unwrap();
+
+                            let member_name = state.resolve_username(&member_id).await;
 
                             let tokens = state
                                 .online_users
@@ -3069,6 +2502,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     // В каналах не пересылаем
                 }
 
+                // Неизвестный тип пакета
                 _ => {
                     warn!("Неизвестный тип сообщения: {}", msg_type);
                 }
@@ -3082,7 +2516,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             warn!("Получено небинарное сообщение, игнорируем");
         }
     }
-
     // ---- Закрытие сессии ----
     {
         let username = session.username.get().cloned().unwrap_or_default();
@@ -3108,14 +2541,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         let msg = format!("[Система] Пользователь {} отключился", username);
 
         if !my_user_id.is_empty() {
-            let db_ls = state.db.clone();
-            let uid_ls = my_user_id.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut st = db_ls.lock().unwrap();
-                let _ = AppState::update_last_seen(&mut st.conn, &uid_ls);
-            })
-            .await
-            .unwrap();
+            // Асинхронно обновляем last_seen
+            let _ = state.update_last_seen(&my_user_id).await;
         }
 
         broadcast_system_message(&state, &msg, Some(&username)).await;

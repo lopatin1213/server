@@ -2,22 +2,20 @@ mod app_state;
 mod client;
 mod constants;
 mod fcm;
-mod handshake; // ← новое
-mod senders; // ← новое
+mod handshake;
+mod senders;
 
-use rusqlite::Connection;
-use std::collections::HashMap;
+use deadpool_postgres::{Config, Runtime};
 use std::env;
 use std::sync::Arc;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio_postgres::NoTls;
 
-use app_state::{AppState, DbState};
+use app_state::AppState;
 
-// Замени функцию run_server:
 async fn run_server(
     listener: TcpListener,
-    state: Arc<AppState>, // <-- Убрали Mutex
+    state: Arc<AppState>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         let (stream, _) = listener.accept().await?;
@@ -27,8 +25,6 @@ async fn run_server(
         });
     }
 }
-
-// В функции main, в блоке воркера очистки, замени:
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,37 +40,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr).await?;
     log::info!("WebSocket сервер запущен на {}", addr);
 
-    let db_path = "data.db";
-    let mut conn = Connection::open(db_path)?;
-    conn.execute("PRAGMA foreign_keys = ON", [])?;
+    // Инициализация Postgres (через отдельные переменные, чтобы кириллица в пароле не ломала URL)
+    let mut cfg = Config::new();
+    cfg.host = Some(env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string()));
+    cfg.port = Some(
+        env::var("DB_PORT")
+            .unwrap_or_else(|_| "5432".to_string())
+            .parse()
+            .unwrap_or(5432),
+    );
+    cfg.user = Some(env::var("DB_USER").unwrap_or_else(|_| "vartchat_user".to_string()));
+    cfg.password = Some(env::var("DB_PASSWORD").unwrap_or_else(|_| "МфкеСрфе!2026".to_string()));
+    cfg.dbname = Some(env::var("DB_NAME").unwrap_or_else(|_| "vartchat".to_string()));
 
-    let fk_enabled: i32 = conn.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
-    if fk_enabled != 1 {
-        eprintln!("ВНИМАНИЕ: foreign_keys не включены!");
-    }
+    let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 
-    AppState::init_db(&mut conn)?;
+    // Инициализация таблиц при старте (вызов из migrate.rs, который мы перепишем)
+    AppState::init_db(&pool).await?;
 
-    let mut username_to_id = HashMap::new();
-    let mut id_to_username = HashMap::new();
+    let state = Arc::new(AppState::new(pool));
+
+    // Прогрев кэшей (username <-> id) для быстрой работы resolve_username
     {
-        let mut stmt = conn.prepare("SELECT id, username FROM users")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            let username: String = row.get(1)?;
-            username_to_id.insert(username.clone(), id.clone());
-            id_to_username.insert(id, username);
+        let client = state.db.get().await?;
+        let rows = client.query("SELECT id, username FROM users", &[]).await?;
+        for row in rows {
+            let id: String = row.get(0);
+            let username: String = row.get(1);
+            state.username_to_id.insert(username.clone(), id.clone());
+            state.id_to_username.insert(id, username);
         }
+        log::info!(
+            "Кэш username↔id: {} пользователей",
+            state.username_to_id.len()
+        );
     }
-    log::info!("Кэш username↔id: {} пользователей", username_to_id.len());
-
-    let db_state = DbState {
-        conn,
-        username_to_id,
-        id_to_username,
-    };
-    let state = Arc::new(AppState::new(db_state));
 
     let ctrl_c = tokio::signal::ctrl_c();
     let terminate = async {
@@ -88,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(unix))]
         std::future::pending::<()>().await;
     };
+
     // Воркер чистки просроченных сообщений (delete_at).
     {
         let state_cleanup = state.clone();
@@ -97,12 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ));
             loop {
                 interval.tick().await;
-                let db = state_cleanup.db.clone(); // <-- Убрали .lock().await
-                let _ = tokio::task::spawn_blocking(move || {
-                    let mut st = db.lock().unwrap();
-                    AppState::purge_expired(&mut st.conn)
-                })
-                .await;
+                let _ = AppState::purge_expired(&state_cleanup.db).await;
             }
         });
     }

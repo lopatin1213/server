@@ -1,10 +1,9 @@
 use log::{error, warn};
 use pyo3::prelude::*;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::Arc;
 
 use crate::app_state::AppState;
-use crate::app_state::DbState;
 
 #[derive(Debug)]
 pub enum FcmError {
@@ -94,7 +93,7 @@ pub async fn send_fcm_push(
 }
 
 pub async fn send_fcm_push_and_cleanup(
-    db: Arc<StdMutex<DbState>>,
+    state: Arc<AppState>,
     fcm_token: &str,
     title: &str,
     body: &str,
@@ -104,12 +103,7 @@ pub async fn send_fcm_push_and_cleanup(
         Ok(()) => {}
         Err(FcmError::SendFailed(e)) => {
             warn!("Удаляю недействительный FCM-токен {}: {}", fcm_token, e);
-            let tok = fcm_token.to_string();
-            let _ = tokio::task::spawn_blocking(move || {
-                let mut st = db.lock().unwrap();
-                AppState::delete_fcm_token(&mut st.conn, &tok)
-            })
-            .await;
+            let _ = state.delete_fcm_token(fcm_token).await;
         }
         Err(FcmError::Connection(e)) => {
             error!("FCM недоступен, токен {} сохранён: {}", fcm_token, e);
