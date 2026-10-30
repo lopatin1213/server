@@ -122,7 +122,7 @@ pub async fn process_command(
                     "SELECT g.name, g.creator_id, \
                             (SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = $1) AS is_member \
                      FROM groups g ORDER BY g.name",
-                    &[&uid],
+                    &[&uid]
                 ).await.map_err(|e| e.to_string())?;
 
                 let mut groups = Vec::new();
@@ -250,7 +250,7 @@ pub async fn process_command(
                 let client = state.db.get().await.map_err(|e| e.to_string())?;
                 let rows = client.query(
                     "SELECT phone, username, display_name, last_seen FROM users ORDER BY username",
-                    &[],
+                    &[]
                 ).await.map_err(|e| e.to_string())?;
 
                 let mut users = Vec::new();
@@ -423,37 +423,49 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         Some(Ok(Message::Binary(data))) => data,
         Some(Ok(_)) => {
             error!("Ожидался бинарный пакет аутентификации");
-            let _ = send_task.await;
+            ping_task.abort();
+            send_task.abort();
+            state.sessions.remove(&temp_id);
             return;
         }
         Some(Err(e)) => {
             error!("Ошибка чтения аутентификации: {}", e);
-            let _ = send_task.await;
+            ping_task.abort();
+            send_task.abort();
+            state.sessions.remove(&temp_id);
             return;
         }
         None => {
             error!("Соединение закрыто до аутентификации");
-            let _ = send_task.await;
+            ping_task.abort();
+            send_task.abort();
+            state.sessions.remove(&temp_id);
             return;
         }
     };
 
     if auth_data.is_empty() || auth_data[0] != MSG_TYPE_AUTH {
         error!("Ожидался MSG_TYPE_AUTH, получено {:?}", auth_data.first());
-        let _ = send_task.await;
+        ping_task.abort();
+        send_task.abort();
+        state.sessions.remove(&temp_id);
         return;
     }
 
     if auth_data.len() < 1 + 12 + 4 {
         error!("AUTH: пакет слишком короткий для v3");
-        let _ = send_task.await;
+        ping_task.abort();
+        send_task.abort();
+        state.sessions.remove(&temp_id);
         return;
     }
     let nonce = &auth_data[1..13];
     let enc_len = u32::from_be_bytes(auth_data[13..17].try_into().unwrap()) as usize;
     if auth_data.len() < 17 + enc_len {
         error!("AUTH: не хватает данных enc");
-        let _ = send_task.await;
+        ping_task.abort();
+        send_task.abort();
+        state.sessions.remove(&temp_id);
         return;
     }
     let encrypted = &auth_data[17..17 + enc_len];
@@ -464,20 +476,49 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         Ok(p) => String::from_utf8_lossy(&p).to_string(),
         Err(e) => {
             error!("AUTH: ошибка расшифровки: {}", e);
-            let _ = send_task.await;
+            ping_task.abort();
+            send_task.abort();
+            state.sessions.remove(&temp_id);
             return;
         }
     };
 
-    info!("Auth string: {}", auth_str);
     let parts: Vec<&str> = auth_str.split('|').collect();
     if parts.is_empty() {
         error!("Неверный формат аутентификации");
-        let _ = send_task.await;
+        ping_task.abort();
+        send_task.abort();
+        state.sessions.remove(&temp_id);
         return;
     }
 
     let command = parts[0];
+
+    // БЕЗОПАСНОЕ ЛОГИРОВАНИЕ
+    let safe_log = match command {
+        "login" => {
+            let phone = parts.get(1).unwrap_or(&"");
+            let device = parts.get(3).unwrap_or(&"");
+            format!("login|{}|***|{}|***", phone, device)
+        }
+        "register" => {
+            let phone = parts.get(1).unwrap_or(&"");
+            let fname = parts.get(3).unwrap_or(&"");
+            let lname = parts.get(4).unwrap_or(&"");
+            let uname = parts.get(5).unwrap_or(&"");
+            let device = parts.get(6).unwrap_or(&"");
+            format!(
+                "register|{}|***|{}|{}|{}|{}|***",
+                phone, fname, lname, uname, device
+            )
+        }
+        "token" => {
+            let device = parts.get(2).unwrap_or(&"");
+            format!("token|***|{}|***", device)
+        }
+        _ => "unknown".to_string(),
+    };
+    info!("Получен пакет AUTH: {}", safe_log);
 
     let auth_result = match command {
         "token" => {
@@ -541,7 +582,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match result {
                 Ok(user_id) => {
-                    // Получаем username (в оригинале был кастомный запрос, сделаем через get_profile)
                     let username = match state.get_profile(&user_id).await {
                         Ok((uname, _, _, _, _)) => uname,
                         Err(_) => phone.to_string(),
@@ -680,10 +720,48 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
     let (my_user_id, my_username) = match auth_result {
         Ok((uid, uname)) => (uid, uname),
         Err(_) => {
-            let _ = send_task.await;
+            ping_task.abort();
+            send_task.abort();
+            state.sessions.remove(&temp_id);
             return;
         }
     };
+
+    // --- ПРОВЕРКА НА БАН ---
+    match state.is_user_banned(&my_user_id).await {
+        Ok(Some(reason)) => {
+            warn!(
+                "Пользователь {} заблокирован. Причина: {}",
+                my_username, reason
+            );
+            let _ = send_system_message(
+                &tx,
+                &format!(
+                    "[Система] Вы заблокированы модератором. Причина: {}",
+                    reason
+                ),
+            )
+            .await;
+            ping_task.abort();
+            send_task.abort();
+
+            // Очищаем сессию по токену
+            if let Some(tok) = session.token.get() {
+                state.sessions.remove(tok);
+                if let Some(mut tokens) = state.online_users.get_mut(&my_username) {
+                    tokens.retain(|t| t != tok);
+                    if tokens.is_empty() {
+                        state.online_users.remove(&my_username);
+                    }
+                }
+            }
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            error!("Ошибка проверки на бан: {}", e);
+        }
+    }
 
     // ---- Загрузка истории при логине ----
     if !my_user_id.is_empty() {
@@ -812,6 +890,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             );
         }
     }
+
     // ---- Основной цикл ----
     info!("Начало основного цикла для {}", my_username);
     loop {
@@ -852,7 +931,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match msg_type {
                 MSG_TYPE_USER => {
-                    debug!("Получен MSG_TYPE_USER");
                     if rest.len() < 4 + 4 + 12 + 4 + 24 {
                         warn!("0x01: мало данных");
                         continue;
@@ -993,10 +1071,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
                         };
-                        debug!(
-                            "Сохраняю сообщение от {} client_msg_id: {}",
-                            my_user_id, client_msg_id
-                        );
 
                         let stored_id = match state
                             .store_message(
@@ -1008,16 +1082,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             )
                             .await
                         {
-                            Ok(id) => {
-                                info!("Сообщение успешно сохранено в БД, ID: {}", id);
-                                id
-                            }
+                            Ok(id) => id,
                             Err(e) => {
                                 error!("ОШИБКА сохранения сообщения в БД: {}", e);
-                                continue; // Пропускаем отправку, если база не сохранила
+                                continue;
                             }
                         };
-                        debug!("Пересылаю сообщение");
+
                         send_to_all_my_sessions(
                             &state,
                             &my_username,
@@ -1101,13 +1172,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     if recipient_name.starts_with('#') {
                         let group_name = recipient_name.trim_start_matches('#').to_string();
 
-                        // Проверка на членство в группе через асинхронный запрос
                         let is_member = {
                             match state.db.get().await {
                                 Ok(client) => {
                                     client.query_opt(
                                         "SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id WHERE g.name = $1 AND gm.user_id = $2",
-                                        &[&group_name, &my_user_id],
+                                        &[&group_name, &my_user_id]
                                     ).await.map(|opt| opt.is_some()).unwrap_or(false)
                                 }
                                 Err(_) => false,
@@ -1121,7 +1191,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             continue;
                         }
 
-                        let stored_id = state
+                        let stored_id = match state
                             .store_group_message(
                                 &group_name,
                                 &my_user_id,
@@ -1130,7 +1200,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 reply_opt,
                             )
                             .await
-                            .unwrap_or(0);
+                        {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error!("ОШИБКА сохранения группового сообщения в БД: {}", e);
+                                continue;
+                            }
+                        };
 
                         let members = state
                             .get_group_members(&group_name)
@@ -1243,7 +1319,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 Ok(client) => {
                                     client.query_opt(
                                         "SELECT 1 FROM channels WHERE name = $1 AND creator_id = $2",
-                                        &[&channel_name, &my_user_id],
+                                        &[&channel_name, &my_user_id]
                                     ).await.map(|opt| opt.is_some()).unwrap_or(false)
                                 }
                                 Err(_) => false,
@@ -1259,7 +1335,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             continue;
                         }
 
-                        let stored_id = state
+                        let stored_id = match state
                             .store_channel_message(
                                 &channel_name,
                                 &my_user_id,
@@ -1268,7 +1344,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 reply_opt,
                             )
                             .await
-                            .unwrap_or(0);
+                        {
+                            Ok(id) => id,
+                            Err(e) => {
+                                error!("ОШИБКА сохранения сообщения канала в БД: {}", e);
+                                continue;
+                            }
+                        };
 
                         let subscribers = state
                             .get_channel_subscribers(&channel_name)
@@ -1369,6 +1451,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         continue;
                     }
                 }
+
                 MSG_TYPE_EDIT => {
                     if rest.len() < 8 + 1 + 12 + 4 {
                         warn!("0x08: мало данных");
@@ -1403,7 +1486,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     match kind {
                         MSG_KIND_PERSONAL => {
-                            // 1. СНАЧАЛА ПРОВЕРКА ПРАВ
                             let lookup = state.lookup_personal_message(msg_id).await;
                             let (sender_id, recipient_id) = match lookup {
                                 Ok(Some(v)) => v,
@@ -1429,13 +1511,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
 
-                            // 2. Получаем доп. данные для рассылки (время, reply, прочитано)
                             let (ts, reply_opt, read_flag) = {
                                 match state.db.get().await {
                                     Ok(client) => {
                                         match client.query_opt(
                                             "SELECT (EXTRACT(EPOCH FROM sent_at) * 1000)::bigint, reply_to_id, read_at FROM messages WHERE id = $1",
-                                            &[&msg_id],
+                                            &[&msg_id]
                                         ).await {
                                             Ok(Some(row)) => {
                                                 let ts: i64 = row.get(0);
@@ -1450,7 +1531,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 }
                             };
 
-                            // 3. ОБНОВЛЯЕМ В БД
                             let _ = state
                                 .update_personal_message_content(msg_id, &new_text)
                                 .await;
@@ -1484,7 +1564,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     match state.db.get().await {
                                         Ok(client) => client.query_opt(
                                             "SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 1 AND msg_id = $2",
-                                            &[&recipient_id, &msg_id],
+                                            &[&recipient_id, &msg_id]
                                         ).await.map(|opt| opt.is_some()).unwrap_or(false),
                                         Err(_) => false,
                                     }
@@ -1525,7 +1605,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             }
                         }
                         MSG_KIND_GROUP => {
-                            // 1. ПОЛУЧАЕМ ИНФУ И ПРОВЕРЯЕМ ПРАВА
                             let mut sender_id_opt = None;
                             let mut ts = 0;
                             let mut reply_id = 0;
@@ -1536,7 +1615,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 if let Ok(Some(row)) = client.query_opt(
                                     "SELECT gm.sender_id, (EXTRACT(EPOCH FROM gm.sent_at) * 1000)::bigint, gm.reply_to_id, gm.first_read_at, g.name \
                                      FROM group_messages gm JOIN groups g ON gm.group_id = g.id WHERE gm.id = $1",
-                                    &[&msg_id],
+                                    &[&msg_id]
                                 ).await {
                                     sender_id_opt = Some(row.get::<_, String>(0));
                                     ts = row.get(1);
@@ -1565,7 +1644,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
 
-                            // 2. ОБНОВЛЯЕМ В БД
                             let _ = state.update_group_message_content(msg_id, &new_text).await;
 
                             let recip_with_hash = format!("#{}", gname);
@@ -1599,7 +1677,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     match state.db.get().await {
                                         Ok(client) => client.query_opt(
                                             "SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 2 AND msg_id = $2",
-                                            &[&member_id, &msg_id],
+                                            &[&member_id, &msg_id]
                                         ).await.map(|opt| opt.is_some()).unwrap_or(false),
                                         Err(_) => false,
                                     }
@@ -1647,7 +1725,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             info!("Групповое сообщение id={} отредактировано", msg_id);
                         }
                         MSG_KIND_CHANNEL => {
-                            // 1. ПРОВЕРКА ПРАВ
                             let lookup = state.lookup_channel_message(msg_id).await;
                             let (cname, creator_id, _sender_id) = match lookup {
                                 Ok(Some(v)) => v,
@@ -1669,7 +1746,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
 
-                            // 2. ПОЛУЧАЕМ ДОП. ДАННЫЕ
                             let (ts, reply_id, views_u) = {
                                 match state.db.get().await {
                                     Ok(client) => {
@@ -1677,7 +1753,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                             "SELECT (EXTRACT(EPOCH FROM sent_at) * 1000)::bigint, reply_to_id, \
                                                     (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id) \
                                              FROM channel_messages cm WHERE cm.id = $1",
-                                            &[&msg_id],
+                                            &[&msg_id]
                                         ).await {
                                             Ok(Some(row)) => {
                                                 let t: i64 = row.get(0);
@@ -1692,7 +1768,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 }
                             };
 
-                            // 3. ОБНОВЛЯЕМ В БД
                             let _ = state
                                 .update_channel_message_content(msg_id, &new_text)
                                 .await;
@@ -1731,7 +1806,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     match state.db.get().await {
                                         Ok(client) => client.query_opt(
                                             "SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 3 AND msg_id = $2",
-                                            &[&sub_id, &msg_id],
+                                            &[&sub_id, &msg_id]
                                         ).await.map(|opt| opt.is_some()).unwrap_or(false),
                                         Err(_) => false,
                                     }
@@ -1783,6 +1858,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                     }
                 }
+
                 MSG_TYPE_READ => {
                     if rest.len() < 2 {
                         continue;
@@ -1814,13 +1890,11 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         channel_ids.len()
                     );
 
-                    // --- Личные ---
                     if !personal_ids.is_empty() {
                         if let Ok(client) = state.db.get().await {
-                            // 1. Получаем авторов для всех запрошенных ID
                             let rows = client.query(
                                 "SELECT id, sender_id FROM messages WHERE id = ANY($1) AND recipient_id = $2",
-                                &[&personal_ids, &my_user_id],
+                                &[&personal_ids, &my_user_id]
                             ).await.unwrap_or_default();
 
                             let mut by_author: std::collections::HashMap<String, Vec<i64>> =
@@ -1831,13 +1905,11 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 by_author.entry(sender_id).or_default().push(id);
                             }
 
-                            // 2. Массово обновляем read_at
                             let _ = client.execute(
                                 "UPDATE messages SET read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND read_at IS NULL",
-                                &[&personal_ids],
+                                &[&personal_ids]
                             ).await;
 
-                            // 3. Рассылаем пакеты
                             for (author_id, ids) in by_author {
                                 if author_id == my_user_id {
                                     continue;
@@ -1864,10 +1936,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                     }
 
-                    // --- Группы ---
                     if !group_ids.is_empty() {
                         if let Ok(client) = state.db.get().await {
-                            // 1. Получаем group_id для всех запрошенных сообщений
                             let rows = client
                                 .query(
                                     "SELECT id, group_id FROM group_messages WHERE id = ANY($1)",
@@ -1884,15 +1954,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 by_group.entry(group_id).or_default().push(id);
                             }
 
-                            // 2. Массово обновляем first_read_at
                             let _ = client.execute(
                                 "UPDATE group_messages SET first_read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND first_read_at IS NULL",
-                                &[&group_ids],
+                                &[&group_ids]
                             ).await;
 
-                            // 3. Рассылаем пакеты участникам
                             for (group_id, ids) in by_group {
-                                // Получаем участников группы по её ID
                                 let members = match client
                                     .query(
                                         "SELECT user_id FROM group_members WHERE group_id = $1",
@@ -1934,17 +2001,16 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                     }
 
-                    // --- Каналы ---
                     if !channel_ids.is_empty() {
                         if let Ok(client) = state.db.get().await {
-                            // В Postgres мы можем вставить массив значений одной командой
                             let _ = client.execute(
                                 "INSERT INTO channel_message_views (channel_msg_id, user_id) SELECT unnest($1::bigint[]), $2 ON CONFLICT DO NOTHING",
-                                &[&channel_ids, &my_user_id],
+                                &[&channel_ids, &my_user_id]
                             ).await;
                         }
                     }
                 }
+
                 MSG_TYPE_DELETE => {
                     if rest.len() < 9 {
                         warn!("0x05: мало данных");
@@ -1953,7 +2019,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     let msg_id = i64::from_be_bytes(rest[0..8].try_into().unwrap());
                     let kind = rest[8];
 
-                    // ---- УДАЛЕНИЕ ЦЕЛОГО ЧАТА (msg_id == 0) ----
                     if msg_id == 0 {
                         if rest.len() < 9 + 1 + 4 {
                             warn!("0x05 (чат): мало данных");
@@ -1995,7 +2060,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 if dtype == MSG_DELETE_FOR_ME {
                                     let _ = state.leave_group(&name, &my_user_id).await;
                                 } else {
-                                    // СНАЧАЛА ПОЛУЧАЕМ УЧАСТНИКОВ (пока группа не удалена каскадом)
                                     let members =
                                         state.get_group_members(&name).await.unwrap_or_default();
 
@@ -2031,7 +2095,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 if dtype == MSG_DELETE_FOR_ME {
                                     let _ = state.unsubscribe_channel(&name, &my_user_id).await;
                                 } else {
-                                    // СНАЧАЛА ПОЛУЧАЕМ ПОДПИСЧИКОВ
                                     let subs = state
                                         .get_channel_subscribers(&name)
                                         .await
@@ -2070,7 +2133,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         continue;
                     }
 
-                    // ---- УДАЛЕНИЕ ОДНОГО СООБЩЕНИЯ ----
                     let dtype = if rest.len() >= 10 { rest[9] } else { 0 };
                     if dtype == MSG_DELETE_FOR_ME {
                         let result = state.hide_message(&my_user_id, kind, msg_id).await;
@@ -2117,9 +2179,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     let _ = tx.send(Message::Binary(pkt.clone().into()));
 
                                     if recipient_id != my_user_id {
-                                        //let rec_name_opt = state.resolve_id(&recipient_id).await;
-                                        // Было resolve_username, но тут нужен username для поиска сессии.
-                                        // Используем resolve_username, чтобы получить имя для DashMap.
                                         let rec_name = state.resolve_username(&recipient_id).await;
 
                                         if rec_name != DELETED_LABEL {
@@ -2219,9 +2278,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                     }
                 }
-                // ==========================================
-                // 0x06: LOGOUT / DELETE ACCOUNT
-                // ==========================================
+
                 MSG_TYPE_LOGOUT => {
                     if rest.len() < 12 + 4 {
                         continue;
@@ -2260,7 +2317,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     if ltype == LOGOUT_TYPE_DELETE_ACCOUNT {
                         info!("Logout: DELETE_ACCOUNT от user_id={}", my_user_id);
 
-                        // --- Проверка пароля ---
                         if password.is_empty() {
                             let _ = send_system_message(&tx, "[Система] Неверный пароль").await;
                             continue;
@@ -2329,7 +2385,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         continue;
                     }
 
-                    // Обычный logout (exit)
                     info!("Logout: EXIT, token={}", token);
                     let result = state.delete_session(token).await;
 
@@ -2362,9 +2417,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     }
                 }
 
-                // ==========================================
-                // 0x03: COMMAND
-                // ==========================================
                 MSG_TYPE_COMMAND => {
                     if rest.len() < 4 {
                         continue;
@@ -2424,12 +2476,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         let _ = send_system_message(&tx, &response).await;
                     }
                 }
-                // ==========================================
-                // 0x09: TYPING (Печатает...)
-                // ==========================================
+
                 MSG_TYPE_TYPING => {
                     debug!("Получен пакет TYPING от {}", my_username);
-                    // [0x09][kind u8][sender_len u32][sender][recipient_len u32][recipient]
                     if rest.len() < 1 + 4 + 4 {
                         continue;
                     }
@@ -2455,7 +2504,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     let recipient_name =
                         String::from_utf8_lossy(&rest[offset..offset + recipient_len]).to_string();
 
-                    // Рассылаем дальше
                     if kind == MSG_KIND_PERSONAL {
                         let target_tokens = {
                             state
@@ -2499,10 +2547,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             }
                         }
                     }
-                    // В каналах не пересылаем
                 }
 
-                // Неизвестный тип пакета
                 _ => {
                     warn!("Неизвестный тип сообщения: {}", msg_type);
                 }
@@ -2516,6 +2562,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             warn!("Получено небинарное сообщение, игнорируем");
         }
     }
+
     // ---- Закрытие сессии ----
     {
         let username = session.username.get().cloned().unwrap_or_default();
@@ -2541,7 +2588,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         let msg = format!("[Система] Пользователь {} отключился", username);
 
         if !my_user_id.is_empty() {
-            // Асинхронно обновляем last_seen
             let _ = state.update_last_seen(&my_user_id).await;
         }
 
@@ -2554,5 +2600,5 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         start_time.elapsed()
     );
     ping_task.abort();
-    let _ = send_task.await;
+    send_task.abort();
 }

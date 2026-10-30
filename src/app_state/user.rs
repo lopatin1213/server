@@ -1,6 +1,5 @@
 use bcrypt::{DEFAULT_COST, hash, verify};
 use chrono::TimeZone;
-// <--- ДОБАВЛЕН ИМПОРТ
 use deadpool_postgres::Pool;
 use log::info;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -10,6 +9,29 @@ use super::core::AppState;
 use crate::constants::*;
 
 impl AppState {
+    // ---- Проверка на бан ----
+    pub async fn is_user_banned(&self, user_id: &str) -> Result<Option<String>, String> {
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let row_opt = client.query_opt(
+            "SELECT reason, expires_at FROM bans WHERE user_id = $1 ORDER BY created_at DESC LIMIT 1",
+            &[&user_id],
+        ).await.map_err(|e| e.to_string())?;
+
+        if let Some(row) = row_opt {
+            let reason: String = row.get(0);
+            let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.get(1);
+
+            if let Some(exp) = expires_at {
+                if exp > chrono::Utc::now() {
+                    return Ok(Some(reason)); // Бан еще активен
+                }
+            } else {
+                return Ok(Some(reason)); // Бессрочный бан
+            }
+        }
+        Ok(None) // Бана нет или он истек
+    }
+
     // ---- Регистрация / логин ----
     pub async fn register_user(
         &self,
@@ -80,7 +102,7 @@ impl AppState {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
         let row_opt = client.query_opt(
             "SELECT user_id, username FROM sessions JOIN users ON sessions.user_id = users.id WHERE sessions.token = $1",
-            &[&token],
+            &[&token]
         ).await.map_err(|e| format!("Ошибка выполнения: {}", e))?;
 
         if let Some(row) = row_opt {
@@ -324,7 +346,6 @@ impl AppState {
         reply_to_id: Option<i64>,
     ) -> Result<i64, String> {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-        // Преобразуем i64 в DateTime<Utc>, который tokio-postgres понимает идеально
         let dt = chrono::Utc.timestamp_millis_opt(timestamp).unwrap();
 
         let row = client
