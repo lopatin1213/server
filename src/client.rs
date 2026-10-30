@@ -19,7 +19,8 @@ use crate::fcm::send_fcm_push_and_cleanup;
 use crate::handshake::ws_handshake;
 use crate::senders::{
     broadcast_system_message, build_delete_chat_packet, send_chat_history, send_encrypted_message,
-    send_messages_by_ids, send_system_message, send_to_all_my_sessions, send_to_user_sessions,
+    send_messages_by_ids, send_system_message, send_system_notification, send_to_all_my_sessions,
+    send_to_user_sessions,
 };
 
 pub async fn resolve_display_name(state: &Arc<AppState>, user_id: &str, fallback: &str) -> String {
@@ -355,6 +356,37 @@ pub async fn process_command(
                 }
             }
         }
+        "/report" => {
+            if args.len() < 3 {
+                "[Система] Использование: /report <kind> <msg_id> <причина>".to_string()
+            } else {
+                let kind: u8 = args[0].parse().unwrap_or(1);
+                let msg_id: i64 = args[1].parse().unwrap_or(0);
+                let reason = args[2..].join(" ");
+
+                let target_type = match kind {
+                    MSG_KIND_PERSONAL => "message",
+                    MSG_KIND_GROUP => "message",
+                    MSG_KIND_CHANNEL => "message",
+                    _ => "message",
+                };
+
+                let client = state.db.get().await;
+                match client {
+                    Ok(c) => {
+                        let res = c.execute(
+                            "INSERT INTO reports (reporter_id, target_id, target_type, reason) VALUES ($1, $2, $3, $4)",
+                            &[&my_user_id, &msg_id.to_string(), &target_type, &reason],
+                        ).await;
+                        match res {
+                            Ok(_) => "[Система] Жалоба отправлена модераторам.".to_string(),
+                            Err(e) => format!("[Система] Ошибка: {}", e),
+                        }
+                    }
+                    Err(e) => format!("[Система] Ошибка БД: {}", e),
+                }
+            }
+        }
         _ => format!("[Система] Неизвестная команда: {}", cmd),
     }
 }
@@ -412,7 +444,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         interval.tick().await;
         loop {
             interval.tick().await;
-            if tx_ping.send(Message::Ping(Vec::new().into())).is_err() {
+            if tx_ping.send(Message::Ping(Vec::new())).is_err() {
                 break;
             }
         }
@@ -535,6 +567,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             match result {
                 Ok((user_id, username)) => {
                     // --- ПРОВЕРКА НА БАН ДО УСПЕХА ---
+
                     debug!("Проверяю, что человек не заблокирован");
                     if let Ok(Some(reason)) = state.is_user_banned(&user_id).await {
                         debug!("Он заблокирован!");
@@ -546,11 +579,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             ),
                         )
                         .await;
+
+                        // Шлем фрейм закрытия и ждем, чтобы send_task успел всё отправить
+                        let _ = tx.send(Message::Close(None));
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
                         ping_task.abort();
                         send_task.abort();
                         state.sessions.remove(&temp_id);
                         return;
                     }
+
                     // ---------------------------------
 
                     let msg = format!("Успех|{}|{}|{}", user_id, token, username);
@@ -571,7 +610,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     state
                         .online_users
                         .entry(username.clone())
-                        .or_insert_with(Vec::new)
+                        .or_default()
                         .push(token.to_string());
 
                     let _ = state.update_last_seen(&user_id).await;
@@ -653,13 +692,19 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             state
                                 .online_users
                                 .entry(username.clone())
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push(token.clone());
 
                             let _ = state.update_last_seen(&user_id).await;
 
                             let msg = format!("[Система] Пользователь {} подключился", username);
                             broadcast_system_message(&state, &msg, Some(&username)).await;
+                            let sys_msg = format!(
+                                "Вход в аккаунт с нового устройства: {}\n\n[Отключить это устройство](killsession:{})",
+                                device_name, token
+                            );
+                            send_system_notification(&state, &user_id, &sys_msg).await;
+
                             Ok((user_id, username))
                         }
                         Err(e) => {
@@ -723,13 +768,18 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             state
                                 .online_users
                                 .entry(username.clone())
-                                .or_insert_with(Vec::new)
+                                .or_default()
                                 .push(token.clone());
 
                             let _ = state.update_last_seen(&user_id).await;
 
                             let msg = format!("[Система] Пользователь {} подключился", username);
                             broadcast_system_message(&state, &msg, Some(&username)).await;
+                            let sys_msg = "Добро пожаловать в **VartChat**! 👋\n\n\
+     Сюда вам будут приходить системные уведомления от самого мессенджера.\n\n\
+     ⚠️ **Важно:** Пожалуйста, сохраните свой пароль в надежном месте. На данный момент функция восстановления пароля пока недоступна.".to_string();
+                            send_system_notification(&state, &user_id, &sys_msg).await;
+
                             Ok((user_id, username))
                         }
                         Err(e) => {
@@ -1161,7 +1211,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 resolve_display_name(&state, &my_user_id, &my_username).await;
 
                             for fcm_tok in fcm_tokens {
-                                let title = format!("{}", sender_display_name);
+                                let title = sender_display_name.to_string();
                                 let body = content.chars().take(100).collect::<String>();
                                 let data_payload =
                                     json!({ "sender": sender_display_name, "type": "private" });
@@ -1624,8 +1674,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let mut flag_any = false;
                             let mut gname = String::new();
 
-                            if let Ok(client) = state.db.get().await {
-                                if let Ok(Some(row)) = client.query_opt(
+                            if let Ok(client) = state.db.get().await
+                                && let Ok(Some(row)) = client.query_opt(
                                     "SELECT gm.sender_id, (EXTRACT(EPOCH FROM gm.sent_at) * 1000)::bigint, gm.reply_to_id, gm.first_read_at, g.name \
                                      FROM group_messages gm JOIN groups g ON gm.group_id = g.id WHERE gm.id = $1",
                                     &[&msg_id]
@@ -1636,7 +1686,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     flag_any = row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(3).is_some();
                                     gname = row.get(4);
                                 }
-                            }
 
                             let sender_id = match sender_id_opt {
                                 Some(v) => v,
@@ -1903,124 +1952,124 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         channel_ids.len()
                     );
 
-                    if !personal_ids.is_empty() {
-                        if let Ok(client) = state.db.get().await {
-                            let rows = client.query(
+                    if !personal_ids.is_empty()
+                        && let Ok(client) = state.db.get().await
+                    {
+                        let rows = client.query(
                                 "SELECT id, sender_id FROM messages WHERE id = ANY($1) AND recipient_id = $2",
                                 &[&personal_ids, &my_user_id]
                             ).await.unwrap_or_default();
 
-                            let mut by_author: std::collections::HashMap<String, Vec<i64>> =
-                                std::collections::HashMap::new();
-                            for row in rows {
-                                let id: i64 = row.get(0);
-                                let sender_id: String = row.get(1);
-                                by_author.entry(sender_id).or_default().push(id);
-                            }
+                        let mut by_author: std::collections::HashMap<String, Vec<i64>> =
+                            std::collections::HashMap::new();
+                        for row in rows {
+                            let id: i64 = row.get(0);
+                            let sender_id: String = row.get(1);
+                            by_author.entry(sender_id).or_default().push(id);
+                        }
 
-                            let _ = client.execute(
+                        let _ = client.execute(
                                 "UPDATE messages SET read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND read_at IS NULL",
                                 &[&personal_ids]
                             ).await;
 
-                            for (author_id, ids) in by_author {
-                                if author_id == my_user_id {
-                                    continue;
-                                }
-                                let author_name = state.resolve_username(&author_id).await;
-                                let tokens = {
-                                    state
-                                        .online_users
-                                        .get(&author_name)
-                                        .map(|r| r.clone())
-                                        .unwrap_or_default()
-                                };
-                                let items: Vec<(u8, i64)> =
-                                    ids.iter().map(|id| (MSG_KIND_PERSONAL, *id)).collect();
-                                let pkt = crate::senders::build_read_packet(&items);
+                        for (author_id, ids) in by_author {
+                            if author_id == my_user_id {
+                                continue;
+                            }
+                            let author_name = state.resolve_username(&author_id).await;
+                            let tokens = {
+                                state
+                                    .online_users
+                                    .get(&author_name)
+                                    .map(|r| r.clone())
+                                    .unwrap_or_default()
+                            };
+                            let items: Vec<(u8, i64)> =
+                                ids.iter().map(|id| (MSG_KIND_PERSONAL, *id)).collect();
+                            let pkt = crate::senders::build_read_packet(&items);
 
-                                for tok in tokens {
-                                    let sess = state.sessions.get(&tok).map(|r| r.clone());
-                                    if let Some(s) = sess {
-                                        let _ = s.tx.send(Message::Binary(pkt.clone().into()));
-                                    }
+                            for tok in tokens {
+                                let sess = state.sessions.get(&tok).map(|r| r.clone());
+                                if let Some(s) = sess {
+                                    let _ = s.tx.send(Message::Binary(pkt.clone()));
                                 }
                             }
                         }
                     }
 
-                    if !group_ids.is_empty() {
-                        if let Ok(client) = state.db.get().await {
-                            let rows = client
-                                .query(
-                                    "SELECT id, group_id FROM group_messages WHERE id = ANY($1)",
-                                    &[&group_ids],
-                                )
-                                .await
-                                .unwrap_or_default();
+                    if !group_ids.is_empty()
+                        && let Ok(client) = state.db.get().await
+                    {
+                        let rows = client
+                            .query(
+                                "SELECT id, group_id FROM group_messages WHERE id = ANY($1)",
+                                &[&group_ids],
+                            )
+                            .await
+                            .unwrap_or_default();
 
-                            let mut by_group: std::collections::HashMap<String, Vec<i64>> =
-                                std::collections::HashMap::new();
-                            for row in rows {
-                                let id: i64 = row.get(0);
-                                let group_id: String = row.get(1);
-                                by_group.entry(group_id).or_default().push(id);
-                            }
+                        let mut by_group: std::collections::HashMap<String, Vec<i64>> =
+                            std::collections::HashMap::new();
+                        for row in rows {
+                            let id: i64 = row.get(0);
+                            let group_id: String = row.get(1);
+                            by_group.entry(group_id).or_default().push(id);
+                        }
 
-                            let _ = client.execute(
+                        let _ = client.execute(
                                 "UPDATE group_messages SET first_read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND first_read_at IS NULL",
                                 &[&group_ids]
                             ).await;
 
-                            for (group_id, ids) in by_group {
-                                let members = match client
-                                    .query(
-                                        "SELECT user_id FROM group_members WHERE group_id = $1",
-                                        &[&group_id],
-                                    )
-                                    .await
-                                {
-                                    Ok(rows) => rows
-                                        .into_iter()
-                                        .map(|r| r.get::<_, String>(0))
-                                        .collect::<Vec<String>>(),
-                                    Err(_) => Vec::new(),
+                        for (group_id, ids) in by_group {
+                            let members = match client
+                                .query(
+                                    "SELECT user_id FROM group_members WHERE group_id = $1",
+                                    &[&group_id],
+                                )
+                                .await
+                            {
+                                Ok(rows) => rows
+                                    .into_iter()
+                                    .map(|r| r.get::<_, String>(0))
+                                    .collect::<Vec<String>>(),
+                                Err(_) => Vec::new(),
+                            };
+
+                            let items: Vec<(u8, i64)> =
+                                ids.iter().map(|id| (MSG_KIND_GROUP, *id)).collect();
+                            let pkt = crate::senders::build_read_packet(&items);
+
+                            for mid in members {
+                                if mid == my_user_id {
+                                    continue;
+                                }
+                                let name = state.resolve_username(&mid).await;
+                                let tokens = {
+                                    state
+                                        .online_users
+                                        .get(&name)
+                                        .map(|r| r.clone())
+                                        .unwrap_or_default()
                                 };
-
-                                let items: Vec<(u8, i64)> =
-                                    ids.iter().map(|id| (MSG_KIND_GROUP, *id)).collect();
-                                let pkt = crate::senders::build_read_packet(&items);
-
-                                for mid in members {
-                                    if mid == my_user_id {
-                                        continue;
-                                    }
-                                    let name = state.resolve_username(&mid).await;
-                                    let tokens = {
-                                        state
-                                            .online_users
-                                            .get(&name)
-                                            .map(|r| r.clone())
-                                            .unwrap_or_default()
-                                    };
-                                    for tok in tokens {
-                                        let sess = state.sessions.get(&tok).map(|r| r.clone());
-                                        if let Some(s) = sess {
-                                            let _ = s.tx.send(Message::Binary(pkt.clone().into()));
-                                        }
+                                for tok in tokens {
+                                    let sess = state.sessions.get(&tok).map(|r| r.clone());
+                                    if let Some(s) = sess {
+                                        let _ = s.tx.send(Message::Binary(pkt.clone()));
                                     }
                                 }
                             }
                         }
                     }
 
-                    if !channel_ids.is_empty() {
-                        if let Ok(client) = state.db.get().await {
-                            let _ = client.execute(
+                    if !channel_ids.is_empty()
+                        && let Ok(client) = state.db.get().await
+                    {
+                        let _ = client.execute(
                                 "INSERT INTO channel_message_views (channel_msg_id, user_id) SELECT unnest($1::bigint[]), $2 ON CONFLICT DO NOTHING",
                                 &[&channel_ids, &my_user_id]
                             ).await;
-                        }
                     }
                 }
 
@@ -2189,7 +2238,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         kind,
                                         MSG_DELETE_FOR_ALL,
                                     );
-                                    let _ = tx.send(Message::Binary(pkt.clone().into()));
+                                    let _ = tx.send(Message::Binary(pkt.clone()));
 
                                     if recipient_id != my_user_id {
                                         let rec_name = state.resolve_username(&recipient_id).await;
@@ -2206,9 +2255,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                                 let target =
                                                     state.sessions.get(&tok).map(|r| r.clone());
                                                 if let Some(ts) = target {
-                                                    let _ = ts
-                                                        .tx
-                                                        .send(Message::Binary(pkt.clone().into()));
+                                                    let _ =
+                                                        ts.tx.send(Message::Binary(pkt.clone()));
                                                 }
                                             }
                                         }
@@ -2266,11 +2314,10 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     let sessions: Vec<Arc<Session>> =
                                         state.sessions.iter().map(|r| r.value().clone()).collect();
                                     for s in sessions {
-                                        if let Some(uid) = s.user_id.get() {
-                                            if subs_ids.contains(uid) {
-                                                let _ =
-                                                    s.tx.send(Message::Binary(pkt.clone().into()));
-                                            }
+                                        if let Some(uid) = s.user_id.get()
+                                            && subs_ids.contains(uid)
+                                        {
+                                            let _ = s.tx.send(Message::Binary(pkt.clone()));
                                         }
                                     }
                                 }
@@ -2382,7 +2429,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         for tok in &tokens_to_kill {
                             let sess = state.sessions.get(tok).map(|r| r.clone());
                             if let Some(s) = sess {
-                                let _ = s.tx.send(Message::Binary(pkt.clone().into()));
+                                let _ = s.tx.send(Message::Binary(pkt.clone()));
                             }
                         }
 
@@ -2399,34 +2446,69 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     }
 
                     info!("Logout: EXIT, token={}", token);
-                    let result = state.delete_session(token).await;
 
-                    match result {
-                        Ok(_) => {
-                            state.sessions.remove(token);
+                    let current_token = session.token.get().map(|s| s.as_str()).unwrap_or("");
 
-                            let mut should_remove = false;
-                            if let Some(mut tokens) = state.online_users.get_mut(&my_username) {
-                                tokens.retain(|t| t != token);
-                                if tokens.is_empty() {
-                                    should_remove = true;
+                    if token == current_token {
+                        // Обычный выход текущей сессии
+                        let result = state.delete_session(token).await;
+                        match result {
+                            Ok(_) => {
+                                state.sessions.remove(token);
+
+                                let mut should_remove = false;
+                                if let Some(mut tokens) = state.online_users.get_mut(&my_username) {
+                                    tokens.retain(|t| t != token);
+                                    if tokens.is_empty() {
+                                        should_remove = true;
+                                    }
                                 }
-                            }
-                            if should_remove {
-                                state.online_users.remove(&my_username);
-                            }
+                                if should_remove {
+                                    state.online_users.remove(&my_username);
+                                }
 
-                            session.connected.store(false, Ordering::Relaxed);
-                            let _ = send_system_message(&tx, "[Система] Вы вышли из системы").await;
-                            info!("Сессия {} завершена по logout", token);
+                                session.connected.store(false, Ordering::Relaxed);
+                                let _ =
+                                    send_system_message(&tx, "[Система] Вы вышли из системы").await;
+                                info!("Сессия {} завершена по logout", token);
+                            }
+                            Err(e) => {
+                                let _ = send_system_message(
+                                    &tx,
+                                    &format!("[Система] Ошибка logout: {}", e),
+                                )
+                                .await;
+                            }
                         }
-                        Err(e) => {
+                    } else {
+                        // Убиваем другую сессию (только если она наша)
+                        let is_owner = state
+                            .verify_session_ownership(token, &my_user_id)
+                            .await
+                            .unwrap_or(false);
+                        if !is_owner {
                             let _ = send_system_message(
                                 &tx,
-                                &format!("[Система] Ошибка logout: {}", e),
+                                "[Система] Вы не можете отключить чужую сессию",
                             )
                             .await;
+                            continue;
                         }
+
+                        let _ = state.delete_session(token).await;
+
+                        // Разрываем сокет жертвы, если она онлайн
+                        if let Some((_, sess)) = state.sessions.remove(token) {
+                            let _ = sess.tx.send(Message::Close(None));
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        }
+
+                        let _ = send_system_message(&tx, "[Система] Устройство успешно отключено")
+                            .await;
+                        info!(
+                            "Сессия {} принудительно завершена пользователем {}",
+                            token, my_username
+                        );
                     }
                 }
 
@@ -2529,7 +2611,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let target_session = state.sessions.get(&tok).map(|r| r.clone());
                             if let Some(ts) = target_session {
                                 debug!("Пересылаю TYPING от {} к {}", my_username, recipient_name);
-                                let _ = ts.tx.send(Message::Binary(data.clone().into()));
+                                let _ = ts.tx.send(Message::Binary(data.clone()));
                             }
                         }
                     } else if kind == MSG_KIND_GROUP {
@@ -2555,7 +2637,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             for tok in tokens {
                                 let target_session = state.sessions.get(&tok).map(|r| r.clone());
                                 if let Some(ts) = target_session {
-                                    let _ = ts.tx.send(Message::Binary(data.clone().into()));
+                                    let _ = ts.tx.send(Message::Binary(data.clone()));
                                 }
                             }
                         }

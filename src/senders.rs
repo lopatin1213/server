@@ -19,7 +19,7 @@ pub async fn send_system_message(
     data.push(MSG_TYPE_SYSTEM);
     data.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     data.extend_from_slice(bytes);
-    tx.send(Message::Binary(data.into()))
+    tx.send(Message::Binary(data))
         .map_err(|e| format!("send error: {}", e))
 }
 
@@ -109,7 +109,7 @@ pub async fn send_encrypted_message(
 
     data.extend_from_slice(&client_msg_id.unwrap_or(0).to_be_bytes());
 
-    tx.send(Message::Binary(data.into()))
+    tx.send(Message::Binary(data))
         .map_err(|e| format!("send error: {}", e))
 }
 
@@ -156,7 +156,7 @@ pub async fn send_to_user_sessions(state: &Arc<AppState>, username: &str, packet
     for tok in tokens {
         let sess = state.sessions.get(&tok).map(|r| r.clone());
         if let Some(s) = sess {
-            let _ = s.tx.send(Message::Binary(packet.clone().into()));
+            let _ = s.tx.send(Message::Binary(packet.clone()));
         }
     }
 }
@@ -170,10 +170,10 @@ pub async fn broadcast_system_message(
         let session = entry.value();
         let connected = session.connected.load(std::sync::atomic::Ordering::Relaxed);
         if connected {
-            if let Some(uname) = session.username.get() {
-                if Some(uname.as_str()) == exclude_username {
-                    continue;
-                }
+            if let Some(uname) = session.username.get()
+                && Some(uname.as_str()) == exclude_username
+            {
+                continue;
             }
             let _ = send_system_message(&session.tx, message).await;
         }
@@ -439,5 +439,93 @@ pub async fn send_messages_by_ids(
             None,
         )
         .await;
+    }
+}
+use serde_json::json;
+
+pub async fn send_system_notification(state: &Arc<AppState>, target_user_id: &str, text: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    // 1. Сохраняем в БД
+    let msg_id = match state
+        .store_message("system", target_user_id, text, now, None)
+        .await
+    {
+        Ok(id) => id,
+        Err(e) => {
+            log::error!("Ошибка сохранения системного уведомления: {}", e);
+            return;
+        }
+    };
+
+    // 2. Находим имя получателя
+    let target_name = state.resolve_username(target_user_id).await;
+    if target_name == DELETED_LABEL {
+        return;
+    }
+
+    // 3. Отправляем в WebSocket, если онлайн
+    let tokens = state
+        .online_users
+        .get(&target_name)
+        .map(|r| r.clone())
+        .unwrap_or_default();
+    let is_online = !tokens.is_empty();
+
+    if is_online {
+        for tok in tokens {
+            let sess = state.sessions.get(&tok).map(|r| r.clone());
+            if let Some(s) = sess {
+                let _ = send_encrypted_message(
+                    &s.tx,
+                    &s.keys,
+                    "system",
+                    &target_name,
+                    text.as_bytes(),
+                    MsgFields {
+                        timestamp: now,
+                        msg_id,
+                        reply_to_id: 0,
+                        flag_me: false,
+                        flag_any: false,
+                        views: None,
+                        edited: false,
+                    },
+                    None,
+                )
+                .await;
+            }
+        }
+    }
+
+    // 4. Отправляем FCM, если офлайн (или всегда, на ваше усмотрение, но обычно если офлайн)
+    if !is_online {
+        let fcm_tokens = state
+            .get_fcm_tokens_for_user(target_user_id)
+            .await
+            .unwrap_or_default();
+        for fcm_tok in fcm_tokens {
+            let title = "VartChat System".to_string();
+            let body = text.chars().take(150).collect::<String>();
+            let data_payload = json!({
+                "chatKey": "system",
+                "kind": "system",
+                "sender": "VartChat System"
+            });
+            let state_fcm = state.clone();
+            tokio::spawn(async move {
+                crate::fcm::send_fcm_push_and_cleanup(
+                    state_fcm,
+                    &fcm_tok,
+                    &title,
+                    &body,
+                    Some(data_payload),
+                )
+                .await;
+            });
+        }
     }
 }

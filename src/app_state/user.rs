@@ -733,4 +733,19 @@ impl AppState {
         }
         Ok(total as usize)
     }
+    pub async fn verify_session_ownership(
+        &self,
+        token: &str,
+        user_id: &str,
+    ) -> Result<bool, String> {
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let row_opt = client
+            .query_opt(
+                "SELECT 1 FROM sessions WHERE token = $1 AND user_id = $2",
+                &[&token, &user_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(row_opt.is_some())
+    }
 }

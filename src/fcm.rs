@@ -54,13 +54,12 @@ pub async fn send_fcm_push(
             let path = sys
                 .getattr("path")
                 .map_err(|e| format!("sys.path: {}", e))?;
-            if let Ok(exe_path) = std::env::current_exe() {
-                if let Some(dir) = exe_path.parent() {
-                    if let Some(dir_str) = dir.to_str() {
-                        path.call_method1("insert", (0, dir_str))
-                            .map_err(|e| format!("sys.path.insert: {}", e))?;
-                    }
-                }
+            if let Ok(exe_path) = std::env::current_exe()
+                && let Some(dir) = exe_path.parent()
+                && let Some(dir_str) = dir.to_str()
+            {
+                path.call_method1("insert", (0, dir_str))
+                    .map_err(|e| format!("sys.path.insert: {}", e))?;
             }
             let helper = py
                 .import("fcm_helper")

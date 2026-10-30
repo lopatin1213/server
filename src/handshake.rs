@@ -49,7 +49,7 @@ pub async fn ws_handshake(
         return Err(reason);
     };
 
-    if client_version < MIN_PROTO_VERSION || client_version > CURRENT_PROTO_VERSION {
+    if !(MIN_PROTO_VERSION..=CURRENT_PROTO_VERSION).contains(&client_version) {
         let reason = format!(
             "Несовместимая версия протокола: клиент {}, сервер поддерживает {}..={}",
             client_version, MIN_PROTO_VERSION, CURRENT_PROTO_VERSION
@@ -75,7 +75,7 @@ pub async fn ws_handshake(
     resp.extend_from_slice(&agreed.to_be_bytes());
     resp.extend_from_slice(&server_pub);
     stream
-        .send(Message::Binary(resp.into()))
+        .send(Message::Binary(resp))
         .await
         .map_err(|e| format!("Failed to send handshake response: {}", e))?;
     info!("Handshake: отправлен OK v{} + публичный ключ", agreed);
@@ -102,6 +102,6 @@ async fn reject(stream: &mut tokio_tungstenite::WebSocketStream<TcpStream>, reas
     resp.push(HANDSHAKE_REJECT);
     resp.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     resp.extend_from_slice(bytes);
-    let _ = stream.send(Message::Binary(resp.into())).await;
+    let _ = stream.send(Message::Binary(resp)).await;
     warn!("Handshake: отказ — {}", reason);
 }

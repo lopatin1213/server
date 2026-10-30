@@ -130,6 +130,15 @@ impl AppState {
             .batch_execute(sql)
             .await
             .map_err(|e| format!("Ошибка создания таблиц PG: {}", e))?;
+        // Создаем системного пользователя, если его нет
+        let _ = client
+            .execute(
+                "INSERT INTO users (id, username, phone, password_hash, display_name) \
+             VALUES ('system', 'system', '0000000000', '*', 'VartChat System') \
+             ON CONFLICT (id) DO NOTHING",
+                &[],
+            )
+            .await;
         info!("База данных PostgreSQL успешно инициализирована.");
 
         Ok(())
