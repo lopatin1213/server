@@ -534,6 +534,25 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match result {
                 Ok((user_id, username)) => {
+                    // --- ПРОВЕРКА НА БАН ДО УСПЕХА ---
+                    debug!("Проверяю, что человек не заблокирован");
+                    if let Ok(Some(reason)) = state.is_user_banned(&user_id).await {
+                        debug!("Он заблокирован!");
+                        let _ = send_system_message(
+                            &tx,
+                            &format!(
+                                "[Система] Вы заблокированы модератором. Причина: {}",
+                                reason
+                            ),
+                        )
+                        .await;
+                        ping_task.abort();
+                        send_task.abort();
+                        state.sessions.remove(&temp_id);
+                        return;
+                    }
+                    // ---------------------------------
+
                     let msg = format!("Успех|{}|{}|{}", user_id, token, username);
                     let _ = send_system_message(&tx, &msg).await;
 
@@ -582,6 +601,31 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match result {
                 Ok(user_id) => {
+                    debug!("Проверяю, что человек не заблокирован");
+                    // --- ПРОВЕРКА НА БАН ДО УСПЕХА ---
+                    if let Ok(Some(reason)) = state.is_user_banned(&user_id).await {
+                        debug!("Он заблокирован! Отправляю отказ");
+                        let _ = send_system_message(
+                            &tx,
+                            &format!(
+                                "[Система] Вы заблокированы модератором. Причина: {}",
+                                reason
+                            ),
+                        )
+                        .await;
+
+                        // Шлем фрейм закрытия и ждем, чтобы send_task успел всё отправить
+                        let _ = tx.send(Message::Close(None));
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                        ping_task.abort();
+                        send_task.abort();
+                        state.sessions.remove(&temp_id);
+                        return;
+                    }
+                    // ---------------------------------
+                    // ---------------------------------
+
                     let username = match state.get_profile(&user_id).await {
                         Ok((uname, _, _, _, _)) => uname,
                         Err(_) => phone.to_string(),
@@ -720,6 +764,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
     let (my_user_id, my_username) = match auth_result {
         Ok((uid, uname)) => (uid, uname),
         Err(_) => {
+            // Даем задаче отправки время, чтобы сообщение об ошибке улетело клиенту
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
             ping_task.abort();
             send_task.abort();
             state.sessions.remove(&temp_id);
@@ -728,40 +775,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
     };
 
     // --- ПРОВЕРКА НА БАН ---
-    match state.is_user_banned(&my_user_id).await {
-        Ok(Some(reason)) => {
-            warn!(
-                "Пользователь {} заблокирован. Причина: {}",
-                my_username, reason
-            );
-            let _ = send_system_message(
-                &tx,
-                &format!(
-                    "[Система] Вы заблокированы модератором. Причина: {}",
-                    reason
-                ),
-            )
-            .await;
-            ping_task.abort();
-            send_task.abort();
-
-            // Очищаем сессию по токену
-            if let Some(tok) = session.token.get() {
-                state.sessions.remove(tok);
-                if let Some(mut tokens) = state.online_users.get_mut(&my_username) {
-                    tokens.retain(|t| t != tok);
-                    if tokens.is_empty() {
-                        state.online_users.remove(&my_username);
-                    }
-                }
-            }
-            return;
-        }
-        Ok(None) => {}
-        Err(e) => {
-            error!("Ошибка проверки на бан: {}", e);
-        }
-    }
 
     // ---- Загрузка истории при логине ----
     if !my_user_id.is_empty() {
