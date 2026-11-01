@@ -832,7 +832,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
     };
 
     // ---- Загрузка истории при логине ----
-    if !my_user_id.is_empty() {
+    if !my_user_id.is_empty() && !is_background {
         let tx_h = tx.clone();
         let keys_h = keys.clone();
         let uid_h = my_user_id.clone();
