@@ -1,7 +1,7 @@
 import firebase_admin
-from firebase_admin import credentials, messaging
-import os
 import logging
+import os
+from firebase_admin import credentials, messaging
 from typing import Optional, Tuple
 
 logging.basicConfig(level=logging.INFO)
@@ -33,30 +33,35 @@ def send_fcm_push(
         logger.error("FCM: пустой или нестроковый токен -> удаляем")
         return (False, False)
 
-    if data_payload is not None:
-        data_payload = {k: (v if isinstance(v, str) else str(v)) for k, v in data_payload.items()}
+    # Формируем data-payload
+    final_data = data_payload.copy() if data_payload else {}
+    final_data["title"] = title
+    final_data["body"] = body
+
+    # Убеждаемся, что все значения строковые (требование FCM)
+    final_data = {k: (v if isinstance(v, str) else str(v)) for k, v in final_data.items()}
 
     try:
         message = messaging.Message(
-            notification=messaging.Notification(title=title, body=body),
-            data=data_payload,
+            data=final_data,
             token=device_token,
+            android=messaging.AndroidConfig(
+                priority='high',  # Важно для data-only!
+            ),
         )
         response = messaging.send(message)
-        logger.info(f"FCM отправлено успешно, ID: {response}")
+        logger.info(f"FCM (data-only) отправлено успешно, ID: {response}")
         return (True, False)
 
     except (
             messaging.UnregisteredError,
             messaging.SenderIdMismatchError,
-            ValueError,  # "Message.token must be a non-empty string"
+            ValueError,
     ) as e:
         logger.error(f"FCM отклонил токен ({type(e).__name__}): {e}")
         return (False, False)
 
     except Exception as e:
-        # Всё остальное: сеть, квоты, конфиг — считаем проблемой подключения.
-        # НО если в тексте явно видно notregistered/invalid — это точно отказ по токену.
         low = str(e).lower()
         if "notregistered" in low or "not registered" in low or "unregistered" in low \
                 or "invalidregistration" in low or "invalid token" in low \

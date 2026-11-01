@@ -24,10 +24,7 @@ use crate::senders::{
 };
 
 pub async fn resolve_display_name(state: &Arc<AppState>, user_id: &str, fallback: &str) -> String {
-    let raw = match state.get_display_name(user_id).await {
-        Ok(name) => name,
-        _ => String::new(),
-    };
+    let raw = state.get_display_name(user_id).await.unwrap_or_default();
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         fallback.to_string()
@@ -502,6 +499,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
     }
     let encrypted = &auth_data[17..17 + enc_len];
 
+    // Читаем флаг is_background (если он есть)
+    let is_background = if auth_data.len() > 17 + enc_len {
+        auth_data[17 + enc_len] == 1
+    } else {
+        false // Старый клиент
+    };
+
     let cipher = aes_gcm::Aes256Gcm::new(Key::<aes_gcm::Aes256Gcm>::from_slice(&keys.key));
     let nonce_ref = aes_gcm::Nonce::from_slice(nonce);
     let auth_str = match cipher.decrypt(nonce_ref, encrypted) {
@@ -531,7 +535,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         "login" => {
             let phone = parts.get(1).unwrap_or(&"");
             let device = parts.get(3).unwrap_or(&"");
-            format!("login|{}|***|{}|***", phone, device)
+            format!("login|{}|***|{}|*** (BG: {})", phone, device, is_background)
         }
         "register" => {
             let phone = parts.get(1).unwrap_or(&"");
@@ -540,13 +544,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             let uname = parts.get(5).unwrap_or(&"");
             let device = parts.get(6).unwrap_or(&"");
             format!(
-                "register|{}|***|{}|{}|{}|{}|***",
-                phone, fname, lname, uname, device
+                "register|{}|***|{}|{}|{}|{}|*** (BG: {})",
+                phone, fname, lname, uname, device, is_background
             )
         }
         "token" => {
             let device = parts.get(2).unwrap_or(&"");
-            format!("token|***|{}|***", device)
+            format!("token|***|{}|*** (BG: {})", device, is_background)
         }
         _ => "unknown".to_string(),
     };
@@ -566,8 +570,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match result {
                 Ok((user_id, username)) => {
-                    // --- ПРОВЕРКА НА БАН ДО УСПЕХА ---
-
                     debug!("Проверяю, что человек не заблокирован");
                     if let Ok(Some(reason)) = state.is_user_banned(&user_id).await {
                         debug!("Он заблокирован!");
@@ -580,7 +582,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         )
                         .await;
 
-                        // Шлем фрейм закрытия и ждем, чтобы send_task успел всё отправить
                         let _ = tx.send(Message::Close(None));
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -589,8 +590,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         state.sessions.remove(&temp_id);
                         return;
                     }
-
-                    // ---------------------------------
 
                     let msg = format!("Успех|{}|{}|{}", user_id, token, username);
                     let _ = send_system_message(&tx, &msg).await;
@@ -607,16 +606,21 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     state.sessions.remove(&temp_id);
                     state.sessions.insert(token.to_string(), session.clone());
-                    state
-                        .online_users
-                        .entry(username.clone())
-                        .or_default()
-                        .push(token.to_string());
 
-                    let _ = state.update_last_seen(&user_id).await;
+                    // ВАЖНО: Обновляем онлайн-статус только если это НЕ фон
+                    if !is_background {
+                        state
+                            .online_users
+                            .entry(username.clone())
+                            .or_default()
+                            .push(token.to_string());
 
-                    let msg = format!("[Система] Пользователь {} подключился", username);
-                    broadcast_system_message(&state, &msg, Some(&username)).await;
+                        let _ = state.update_last_seen(&user_id).await;
+
+                        let msg = format!("[Система] Пользователь {} подключился", username);
+                        broadcast_system_message(&state, &msg, Some(&username)).await;
+                    }
+
                     Ok((user_id, username))
                 }
                 Err(e) => {
@@ -641,7 +645,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             match result {
                 Ok(user_id) => {
                     debug!("Проверяю, что человек не заблокирован");
-                    // --- ПРОВЕРКА НА БАН ДО УСПЕХА ---
                     if let Ok(Some(reason)) = state.is_user_banned(&user_id).await {
                         debug!("Он заблокирован! Отправляю отказ");
                         let _ = send_system_message(
@@ -653,7 +656,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         )
                         .await;
 
-                        // Шлем фрейм закрытия и ждем, чтобы send_task успел всё отправить
                         let _ = tx.send(Message::Close(None));
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -662,8 +664,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         state.sessions.remove(&temp_id);
                         return;
                     }
-                    // ---------------------------------
-                    // ---------------------------------
 
                     let username = match state.get_profile(&user_id).await {
                         Ok((uname, _, _, _, _)) => uname,
@@ -689,21 +689,24 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                             state.sessions.remove(&temp_id);
                             state.sessions.insert(token.clone(), session.clone());
-                            state
-                                .online_users
-                                .entry(username.clone())
-                                .or_default()
-                                .push(token.clone());
 
-                            let _ = state.update_last_seen(&user_id).await;
+                            // ВАЖНО: Обновляем онлайн-статус только если это НЕ фон
+                            if !is_background {
+                                state
+                                    .online_users
+                                    .entry(username.clone())
+                                    .or_default()
+                                    .push(token.clone());
 
-                            let msg = format!("[Система] Пользователь {} подключился", username);
-                            broadcast_system_message(&state, &msg, Some(&username)).await;
-                            let sys_msg = format!(
-                                "Вход в аккаунт с нового устройства: {}\n\n[Отключить это устройство](killsession:{})",
-                                device_name, token
-                            );
-                            send_system_notification(&state, &user_id, &sys_msg).await;
+                                let _ = state.update_last_seen(&user_id).await;
+
+                                let msg =
+                                    format!("[Система] Пользователь {} подключился", username);
+                                broadcast_system_message(&state, &msg, Some(&username)).await;
+                                let sys_msg =
+                                    format!("Вход в аккаунт с нового устройства: {}", device_name);
+                                send_system_notification(&state, &user_id, &sys_msg).await;
+                            }
 
                             Ok((user_id, username))
                         }
@@ -765,20 +768,25 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                             state.sessions.remove(&temp_id);
                             state.sessions.insert(token.clone(), session.clone());
-                            state
-                                .online_users
-                                .entry(username.clone())
-                                .or_default()
-                                .push(token.clone());
 
-                            let _ = state.update_last_seen(&user_id).await;
+                            // ВАЖНО: Обновляем онлайн-статус только если это НЕ фон
+                            if !is_background {
+                                state
+                                    .online_users
+                                    .entry(username.clone())
+                                    .or_default()
+                                    .push(token.clone());
 
-                            let msg = format!("[Система] Пользователь {} подключился", username);
-                            broadcast_system_message(&state, &msg, Some(&username)).await;
-                            let sys_msg = "Добро пожаловать в **VartChat**! 👋\n\n\
+                                let _ = state.update_last_seen(&user_id).await;
+
+                                let msg =
+                                    format!("[Система] Пользователь {} подключился", username);
+                                broadcast_system_message(&state, &msg, Some(&username)).await;
+                                let sys_msg = "Добро пожаловать в **VartChat**! 👋\n\n\
      Сюда вам будут приходить системные уведомления от самого мессенджера.\n\n\
      ⚠️ **Важно:** Пожалуйста, сохраните свой пароль в надежном месте. На данный момент функция восстановления пароля пока недоступна.".to_string();
-                            send_system_notification(&state, &user_id, &sys_msg).await;
+                                send_system_notification(&state, &user_id, &sys_msg).await;
+                            }
 
                             Ok((user_id, username))
                         }
@@ -814,7 +822,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
     let (my_user_id, my_username) = match auth_result {
         Ok((uid, uname)) => (uid, uname),
         Err(_) => {
-            // Даем задаче отправки время, чтобы сообщение об ошибке улетело клиенту
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
             ping_task.abort();
@@ -824,10 +831,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         }
     };
 
-    // --- ПРОВЕРКА НА БАН ---
-
     // ---- Загрузка истории при логине ----
-    if !my_user_id.is_empty() {
+    if !my_user_id.is_empty() && !is_background {
         let tx_h = tx.clone();
         let keys_h = keys.clone();
         let uid_h = my_user_id.clone();
@@ -1046,11 +1051,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         (now, 0, 0)
                     };
 
-                    let reply_opt: Option<i64> = if reply_to_id == 0 {
-                        None
-                    } else {
-                        Some(reply_to_id)
-                    };
+                    let reply_opt = (reply_to_id != 0).then_some(reply_to_id);
 
                     let cipher =
                         aes_gcm::Aes256Gcm::new(Key::<aes_gcm::Aes256Gcm>::from_slice(&keys.key));
@@ -1120,7 +1121,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     }
 
                     // ---- Личное ----
-                    if !recipient_name.starts_with('#') && !recipient_name.starts_with('&') {
+                    if !recipient_name.starts_with(['#', '&']) {
                         let recipient_id_opt = state.resolve_id(&recipient_name).await;
 
                         let recipient_id = match recipient_id_opt {
@@ -1213,8 +1214,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             for fcm_tok in fcm_tokens {
                                 let title = sender_display_name.to_string();
                                 let body = content.chars().take(100).collect::<String>();
-                                let data_payload =
-                                    json!({ "sender": sender_display_name, "type": "private" });
+                                let data_payload = json!({
+                                    "sender": sender_display_name,
+                                    "type": "private",
+                                    "kind": "personal",
+                                    "msg_id": stored_id.to_string()
+                                });
                                 let state_fcm = state.clone();
                                 tokio::spawn(async move {
                                     send_fcm_push_and_cleanup(
@@ -1355,7 +1360,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         sender_display_name,
                                         content.chars().take(100).collect::<String>()
                                     );
-                                    let data_payload = json!({ "sender": sender_display_name, "group": group_name, "type": "group" });
+                                    let data_payload = json!({
+                                        "sender": sender_display_name,
+                                        "group": group_name,
+                                        "type": "group",
+                                        "kind": "group",
+                                        "msg_id": stored_id.to_string()
+                                    });
                                     let state_fcm = state.clone();
                                     tokio::spawn(async move {
                                         send_fcm_push_and_cleanup(
@@ -1496,7 +1507,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     let title =
                                         format!("Новое сообщение в канале {}", channel_name);
                                     let body = content.chars().take(100).collect::<String>();
-                                    let data_payload = json!({ "sender": sender_display_name, "channel": channel_name, "type": "channel" });
+                                    let data_payload = json!({
+                                        "sender": sender_display_name,
+                                        "channel": channel_name,
+                                        "type": "channel",
+                                        "kind": "channel",
+                                        "msg_id": stored_id.to_string()
+                                    });
                                     let state_fcm = state.clone();
                                     tokio::spawn(async move {
                                         send_fcm_push_and_cleanup(
@@ -1676,16 +1693,16 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                             if let Ok(client) = state.db.get().await
                                 && let Ok(Some(row)) = client.query_opt(
-                                    "SELECT gm.sender_id, (EXTRACT(EPOCH FROM gm.sent_at) * 1000)::bigint, gm.reply_to_id, gm.first_read_at, g.name \
+                                "SELECT gm.sender_id, (EXTRACT(EPOCH FROM gm.sent_at) * 1000)::bigint, gm.reply_to_id, gm.first_read_at, g.name \
                                      FROM group_messages gm JOIN groups g ON gm.group_id = g.id WHERE gm.id = $1",
-                                    &[&msg_id]
-                                ).await {
-                                    sender_id_opt = Some(row.get::<_, String>(0));
-                                    ts = row.get(1);
-                                    reply_id = row.get::<_, Option<i64>>(2).unwrap_or(0);
-                                    flag_any = row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(3).is_some();
-                                    gname = row.get(4);
-                                }
+                                &[&msg_id]
+                            ).await {
+                                sender_id_opt = Some(row.get::<_, String>(0));
+                                ts = row.get(1);
+                                reply_id = row.get::<_, Option<i64>>(2).unwrap_or(0);
+                                flag_any = row.get::<_, Option<chrono::DateTime<chrono::Utc>>>(3).is_some();
+                                gname = row.get(4);
+                            }
 
                             let sender_id = match sender_id_opt {
                                 Some(v) => v,
@@ -1956,9 +1973,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         && let Ok(client) = state.db.get().await
                     {
                         let rows = client.query(
-                                "SELECT id, sender_id FROM messages WHERE id = ANY($1) AND recipient_id = $2",
-                                &[&personal_ids, &my_user_id]
-                            ).await.unwrap_or_default();
+                            "SELECT id, sender_id FROM messages WHERE id = ANY($1) AND recipient_id = $2",
+                            &[&personal_ids, &my_user_id]
+                        ).await.unwrap_or_default();
 
                         let mut by_author: std::collections::HashMap<String, Vec<i64>> =
                             std::collections::HashMap::new();
@@ -1969,9 +1986,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
 
                         let _ = client.execute(
-                                "UPDATE messages SET read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND read_at IS NULL",
-                                &[&personal_ids]
-                            ).await;
+                            "UPDATE messages SET read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND read_at IS NULL",
+                            &[&personal_ids]
+                        ).await;
 
                         for (author_id, ids) in by_author {
                             if author_id == my_user_id {
@@ -2018,9 +2035,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
 
                         let _ = client.execute(
-                                "UPDATE group_messages SET first_read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND first_read_at IS NULL",
-                                &[&group_ids]
-                            ).await;
+                            "UPDATE group_messages SET first_read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND first_read_at IS NULL",
+                            &[&group_ids]
+                        ).await;
 
                         for (group_id, ids) in by_group {
                             let members = match client
@@ -2067,9 +2084,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         && let Ok(client) = state.db.get().await
                     {
                         let _ = client.execute(
-                                "INSERT INTO channel_message_views (channel_msg_id, user_id) SELECT unnest($1::bigint[]), $2 ON CONFLICT DO NOTHING",
-                                &[&channel_ids, &my_user_id]
-                            ).await;
+                            "INSERT INTO channel_message_views (channel_msg_id, user_id) SELECT unnest($1::bigint[]), $2 ON CONFLICT DO NOTHING",
+                            &[&channel_ids, &my_user_id]
+                        ).await;
                     }
                 }
 
@@ -2112,9 +2129,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                             state.delete_personal_chat(&my_user_id, &peer_id).await;
 
                                         let pkt = build_delete_chat_packet(kind, &name, 0);
-                                        send_to_user_sessions(&state, &my_username, pkt.clone())
-                                            .await;
-                                        send_to_user_sessions(&state, &name, pkt).await;
+                                        send_to_user_sessions(&state, &my_username, pkt.clone());
+                                        send_to_user_sessions(&state, &name, pkt);
                                     }
                                 }
                             }
@@ -2132,8 +2148,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                             let pkt = build_delete_chat_packet(kind, &name, 0);
                                             for m_id in members {
                                                 let m_name = state.resolve_username(&m_id).await;
-                                                send_to_user_sessions(&state, &m_name, pkt.clone())
-                                                    .await;
+                                                send_to_user_sessions(&state, &m_name, pkt.clone());
                                             }
                                         }
                                         Ok(false) => {
@@ -2169,8 +2184,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                             let pkt = build_delete_chat_packet(kind, &name, 0);
                                             for sub_id in subs {
                                                 let s_name = state.resolve_username(&sub_id).await;
-                                                send_to_user_sessions(&state, &s_name, pkt.clone())
-                                                    .await;
+                                                send_to_user_sessions(&state, &s_name, pkt.clone());
                                             }
                                         }
                                         Ok(false) => {
@@ -2221,6 +2235,39 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         )
                                         .await;
                                         continue;
+                                    }
+
+                                    // Отправляем FCM на удаление получателю
+                                    if recipient_id != my_user_id {
+                                        let rec_name = state.resolve_username(&recipient_id).await;
+                                        if rec_name != DELETED_LABEL {
+                                            let is_online =
+                                                state.online_users.contains_key(&rec_name);
+                                            if !is_online {
+                                                let fcm_tokens = state
+                                                    .get_fcm_tokens_for_user(&recipient_id)
+                                                    .await
+                                                    .unwrap_or_default();
+                                                let data_payload = json!({
+                                                    "kind": "delete",
+                                                    "msg_id": msg_id.to_string()
+                                                });
+                                                for fcm_tok in fcm_tokens {
+                                                    let state_fcm = state.clone();
+                                                    let payload = data_payload.clone();
+                                                    tokio::spawn(async move {
+                                                        send_fcm_push_and_cleanup(
+                                                            state_fcm,
+                                                            &fcm_tok,
+                                                            "",
+                                                            "",
+                                                            Some(payload),
+                                                        )
+                                                        .await;
+                                                    });
+                                                }
+                                            }
+                                        }
                                     }
 
                                     let del = state.delete_message(msg_id).await;
@@ -2447,15 +2494,24 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     info!("Logout: EXIT, token={}", token);
 
-                    let current_token = session.token.get().map(|s| s.as_str()).unwrap_or("");
+                    let is_owner = state
+                        .verify_session_ownership(token, &my_user_id)
+                        .await
+                        .unwrap_or(false);
+                    if !is_owner {
+                        let _ = send_system_message(&tx, "[Система] Сессия не найдена").await;
+                        continue;
+                    }
 
-                    if token == current_token {
-                        // Обычный выход текущей сессии
-                        let result = state.delete_session(token).await;
-                        match result {
-                            Ok(_) => {
-                                state.sessions.remove(token);
+                    let is_current = token == session.token.get().map(|s| s.as_str()).unwrap_or("");
 
+                    let result = state.delete_session(token).await;
+
+                    match result {
+                        Ok(_) => {
+                            state.sessions.remove(token);
+
+                            if !is_background {
                                 let mut should_remove = false;
                                 if let Some(mut tokens) = state.online_users.get_mut(&my_username) {
                                     tokens.retain(|t| t != token);
@@ -2467,48 +2523,41 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     state.online_users.remove(&my_username);
                                 }
 
+                                if is_current {
+                                    let _ = state.update_last_seen(&my_user_id).await;
+                                    let msg = format!(
+                                        "[Система] Пользователь {} отключился",
+                                        my_username
+                                    );
+                                    broadcast_system_message(&state, &msg, Some(&my_username))
+                                        .await;
+                                }
+                            }
+
+                            if is_current {
                                 session.connected.store(false, Ordering::Relaxed);
                                 let _ =
                                     send_system_message(&tx, "[Система] Вы вышли из системы").await;
                                 info!("Сессия {} завершена по logout", token);
-                            }
-                            Err(e) => {
+                            } else {
                                 let _ = send_system_message(
                                     &tx,
-                                    &format!("[Система] Ошибка logout: {}", e),
+                                    "[Система] Устройство успешно отключено",
                                 )
                                 .await;
+                                info!(
+                                    "Сессия {} принудительно завершена пользователем {}",
+                                    token, my_username
+                                );
                             }
                         }
-                    } else {
-                        // Убиваем другую сессию (только если она наша)
-                        let is_owner = state
-                            .verify_session_ownership(token, &my_user_id)
-                            .await
-                            .unwrap_or(false);
-                        if !is_owner {
+                        Err(e) => {
                             let _ = send_system_message(
                                 &tx,
-                                "[Система] Вы не можете отключить чужую сессию",
+                                &format!("[Система] Ошибка logout: {}", e),
                             )
                             .await;
-                            continue;
                         }
-
-                        let _ = state.delete_session(token).await;
-
-                        // Разрываем сокет жертвы, если она онлайн
-                        if let Some((_, sess)) = state.sessions.remove(token) {
-                            let _ = sess.tx.send(Message::Close(None));
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        }
-
-                        let _ = send_system_message(&tx, "[Система] Устройство успешно отключено")
-                            .await;
-                        info!(
-                            "Сессия {} принудительно завершена пользователем {}",
-                            token, my_username
-                        );
                     }
                 }
 
@@ -2663,30 +2712,32 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         let username = session.username.get().cloned().unwrap_or_default();
         let token = session.token.get().cloned().unwrap_or_default();
 
-        if !username.is_empty() {
-            let mut should_remove = false;
-            if let Some(mut tokens) = state.online_users.get_mut(&username) {
-                tokens.retain(|t| t != &token);
-                if tokens.is_empty() {
-                    should_remove = true;
+        if !is_background {
+            if !username.is_empty() {
+                let mut should_remove = false;
+                if let Some(mut tokens) = state.online_users.get_mut(&username) {
+                    tokens.retain(|t| t != &token);
+                    if tokens.is_empty() {
+                        should_remove = true;
+                    }
+                }
+                if should_remove {
+                    state.online_users.remove(&username);
                 }
             }
-            if should_remove {
-                state.online_users.remove(&username);
+
+            let msg = format!("[Система] Пользователь {} отключился", username);
+
+            if !my_user_id.is_empty() {
+                let _ = state.update_last_seen(&my_user_id).await;
             }
+
+            broadcast_system_message(&state, &msg, Some(&username)).await;
         }
 
         if !token.is_empty() {
             state.sessions.remove(&token);
         }
-
-        let msg = format!("[Система] Пользователь {} отключился", username);
-
-        if !my_user_id.is_empty() {
-            let _ = state.update_last_seen(&my_user_id).await;
-        }
-
-        broadcast_system_message(&state, &msg, Some(&username)).await;
     }
 
     info!(
