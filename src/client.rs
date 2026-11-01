@@ -703,8 +703,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 let msg =
                                     format!("[Система] Пользователь {} подключился", username);
                                 broadcast_system_message(&state, &msg, Some(&username)).await;
-                                let sys_msg =
-                                    format!("Вход в аккаунт с нового устройства: {}", device_name);
+
+                                // ВОТ ТУТ НУЖНО ВЕРНУТЬ ССЫЛКУ
+                                let sys_msg = format!(
+                                    "Вход в аккаунт с нового устройства: {}\n\n[Отключить это устройство](killsession:{})",
+                                    device_name, token
+                                );
                                 send_system_notification(&state, &user_id, &sys_msg).await;
                             }
 
@@ -999,6 +1003,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match msg_type {
                 MSG_TYPE_USER => {
+                    info!("Получен 0x01");
                     if rest.len() < 4 + 4 + 12 + 4 + 24 {
                         warn!("0x01: мало данных");
                         continue;
@@ -1064,7 +1069,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                     };
                     let content = String::from_utf8_lossy(&plaintext).to_string();
-
+                    debug!("Успешно расшифровано");
                     if content.starts_with('/') {
                         if content.starts_with("/history") {
                             let parts: Vec<&str> = content.split_whitespace().collect();
@@ -1135,6 +1140,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
                         };
+                        debug!("Отправитель найден");
 
                         let stored_id = match state
                             .store_message(
@@ -1152,7 +1158,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
                         };
-
+                        debug!("Успешно сохранено");
                         send_to_all_my_sessions(
                             &state,
                             &my_username,
@@ -1171,6 +1177,29 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         )
                         .await;
 
+                        // --- ДОБАВИТЬ ЭТО ДЛЯ ACK В ФОНЕ ---
+                        if is_background {
+                            let _ = send_encrypted_message(
+                                &tx, // Отправляем напрямую в текущую сессию
+                                &keys,
+                                &my_username,
+                                &recipient_name,
+                                &plaintext,
+                                MsgFields {
+                                    timestamp,
+                                    msg_id: stored_id,
+                                    reply_to_id,
+                                    flag_me: true,
+                                    flag_any: false,
+                                    views: None,
+                                    edited: false,
+                                },
+                                Some(client_msg_id),
+                            )
+                            .await;
+                        }
+                        // ------------------------------------
+                        debug!("Отпрвлено на свои сессии");
                         if recipient_id != my_user_id {
                             let target_tokens = {
                                 state
@@ -1201,6 +1230,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     )
                                     .await;
                                 }
+                                debug!("Отправлено");
                             }
 
                             let fcm_tokens = state
@@ -1216,6 +1246,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 let body = content.chars().take(100).collect::<String>();
                                 let data_payload = json!({
                                     "sender": sender_display_name,
+                                    "sender_username": my_username, // Добавили
+                                    "chatKey": my_username,         // Добавили
                                     "type": "private",
                                     "kind": "personal",
                                     "msg_id": stored_id.to_string()
@@ -1299,6 +1331,26 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             Some(client_msg_id),
                         )
                         .await;
+                        if is_background {
+                            let _ = send_encrypted_message(
+                                &tx,
+                                &keys,
+                                &my_username,
+                                &recip_with_hash, // <--- правильная переменная
+                                &plaintext,
+                                MsgFields {
+                                    timestamp,
+                                    msg_id: stored_id,
+                                    reply_to_id,
+                                    flag_me: true,
+                                    flag_any: false,
+                                    views: None,
+                                    edited: false,
+                                },
+                                Some(client_msg_id),
+                            )
+                            .await;
+                        }
 
                         for member_id in members {
                             if member_id == my_user_id {
@@ -1362,9 +1414,10 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     );
                                     let data_payload = json!({
                                         "sender": sender_display_name,
-                                        "group": group_name,
-                                        "type": "group",
-                                        "kind": "group",
+                                        "sender_username": my_username, // Добавили
+                                        "chatKey": my_username,         // Добавили
+                                        "type": "private",
+                                        "kind": "personal",
                                         "msg_id": stored_id.to_string()
                                     });
                                     let state_fcm = state.clone();
@@ -1510,6 +1563,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     let data_payload = json!({
                                         "sender": sender_display_name,
                                         "channel": channel_name,
+                                        "chatKey": format!("&{}", channel_name), // Добавили
                                         "type": "channel",
                                         "kind": "channel",
                                         "msg_id": stored_id.to_string()
