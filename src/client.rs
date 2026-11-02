@@ -39,7 +39,7 @@ pub async fn process_command(
     my_user_id: &str,
     _my_username: &str,
     state: &Arc<AppState>,
-    _session: &Arc<Session>,
+    session: &Arc<Session>,
 ) -> String {
     let cmd_parts: Vec<&str> = cmd.split_whitespace().collect();
     if cmd_parts.is_empty() {
@@ -55,8 +55,7 @@ pub async fn process_command(
                 "[Система] Использование: /creategroup <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let result = state.create_group(&group_name, my_user_id).await;
-                match result {
+                match state.create_group(&group_name, my_user_id).await {
                     Ok(_) => format!("[Система] Группа {} создана", group_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
                 }
@@ -67,8 +66,7 @@ pub async fn process_command(
                 "[Система] Использование: /joingroup <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let result = state.join_group(&group_name, my_user_id).await;
-                match result {
+                match state.join_group(&group_name, my_user_id).await {
                     Ok(_) => format!("[Система] Вы присоединились к группе {}", group_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
                 }
@@ -79,8 +77,7 @@ pub async fn process_command(
                 "[Система] Использование: /leavegroup <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let result = state.leave_group(&group_name, my_user_id).await;
-                match result {
+                match state.leave_group(&group_name, my_user_id).await {
                     Ok(_) => format!("[Система] Вы покинули группу {}", group_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
                 }
@@ -91,8 +88,7 @@ pub async fn process_command(
                 "[Система] Использование: /groupmembers <название>".to_string()
             } else {
                 let group_name = args.join(" ");
-                let result = state.get_group_members(&group_name).await;
-                match result {
+                match state.get_group_members(&group_name).await {
                     Ok(ids) => {
                         let mut names = Vec::new();
                         for id in ids {
@@ -117,9 +113,7 @@ pub async fn process_command(
             let result: Result<Vec<String>, String> = async {
                 let client = state.db.get().await.map_err(|e| e.to_string())?;
                 let rows = client.query(
-                    "SELECT g.name, g.creator_id, \
-                            (SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = $1) AS is_member \
-                     FROM groups g ORDER BY g.name",
+                    "SELECT g.name, g.creator_id, (SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = $1) AS is_member FROM groups g ORDER BY g.name",
                     &[&uid]
                 ).await.map_err(|e| e.to_string())?;
 
@@ -130,7 +124,6 @@ pub async fn process_command(
                     let is_member: Option<i32> = row.get(2);
                     groups.push((name, creator_id, is_member.is_some()));
                 }
-
                 let mut out = Vec::new();
                 for (name, cid, is_member) in groups {
                     let creator_name = state.resolve_username(&cid).await;
@@ -159,8 +152,7 @@ pub async fn process_command(
                 "[Система] Использование: /createchannel <название>".to_string()
             } else {
                 let channel_name = args.join(" ");
-                let result = state.create_channel(&channel_name, my_user_id).await;
-                match result {
+                match state.create_channel(&channel_name, my_user_id).await {
                     Ok(_) => format!("[Система] Канал {} создан", channel_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
                 }
@@ -171,8 +163,7 @@ pub async fn process_command(
                 "[Система] Использование: /subscribe <название>".to_string()
             } else {
                 let channel_name = args.join(" ");
-                let result = state.subscribe_channel(&channel_name, my_user_id).await;
-                match result {
+                match state.subscribe_channel(&channel_name, my_user_id).await {
                     Ok(_) => format!("[Система] Вы подписались на канал {}", channel_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
                 }
@@ -183,8 +174,7 @@ pub async fn process_command(
                 "[Система] Использование: /unsubscribe <название>".to_string()
             } else {
                 let channel_name = args.join(" ");
-                let result = state.unsubscribe_channel(&channel_name, my_user_id).await;
-                match result {
+                match state.unsubscribe_channel(&channel_name, my_user_id).await {
                     Ok(_) => format!("[Система] Вы отписались от канала {}", channel_name),
                     Err(e) => format!("[Система] Ошибка: {}", e),
                 }
@@ -194,17 +184,10 @@ pub async fn process_command(
             let uid = my_user_id.to_string();
             let result: Result<Vec<String>, String> = async {
                 let client = state.db.get().await.map_err(|e| e.to_string())?;
-                let rows = client
-                    .query(
-                        "SELECT c.name, c.creator_id,
-                            (SELECT 1 FROM channel_subscribers cs
-                             WHERE cs.channel_id = c.id AND cs.user_id = $1) AS subscribed
-                     FROM channels c
-                     ORDER BY c.name",
-                        &[&uid],
-                    )
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let rows = client.query(
+                    "SELECT c.name, c.creator_id, (SELECT 1 FROM channel_subscribers cs WHERE cs.channel_id = c.id AND cs.user_id = $1) AS subscribed FROM channels c ORDER BY c.name",
+                    &[&uid],
+                ).await.map_err(|e| e.to_string())?;
 
                 let mut raw = Vec::new();
                 for row in rows {
@@ -213,20 +196,13 @@ pub async fn process_command(
                     let subscribed: Option<i32> = row.get(2);
                     raw.push((name, creator_id, subscribed.is_some()));
                 }
-
                 let mut out = Vec::new();
                 for (name, cid, sub) in raw {
                     let creator_name = state.resolve_username(&cid).await;
-                    out.push(format!(
-                        "{}|{}|{}",
-                        name,
-                        creator_name,
-                        if sub { "1" } else { "0" }
-                    ));
+                    out.push(format!("{}|{}|{}", name, creator_name, if sub { "1" } else { "0" }));
                 }
                 Ok(out)
-            }
-            .await;
+            }.await;
 
             match result {
                 Ok(channels) => {
@@ -244,31 +220,66 @@ pub async fn process_command(
             }
         }
         "/listusers" => {
+            let uid = my_user_id.to_string();
+            let is_phones = args.len() >= 2 && args[0] == "phones";
+            let is_history = args.len() >= 1 && args[0] == "history";
+
             let result: Result<Vec<String>, String> = async {
                 let client = state.db.get().await.map_err(|e| e.to_string())?;
-                let rows = client.query(
-                    "SELECT phone, username, display_name, last_seen FROM users ORDER BY username",
-                    &[]
-                ).await.map_err(|e| e.to_string())?;
+
+                let query_str = if is_phones {
+                    "SELECT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)
+                     FROM users u LEFT JOIN user_settings s ON u.id = s.user_id
+                     WHERE u.phone = ANY($1)"
+                } else if is_history {
+                    "SELECT DISTINCT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)
+                     FROM users u
+                     LEFT JOIN user_settings s ON u.id = s.user_id
+                     JOIN messages m ON (m.sender_id = u.id AND m.recipient_id = $1) OR (m.recipient_id = u.id AND m.sender_id = $1)
+                     WHERE u.id != $1"
+                } else {
+                    "SELECT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)
+                     FROM users u LEFT JOIN user_settings s ON u.id = s.user_id"
+                };
+
+                let rows = if is_phones {
+                    let phones = args[1..].join(" ");
+                    let phone_list: Vec<&str> = phones.split(',').collect();
+                    client.query(query_str, &[&phone_list]).await
+                } else if is_history {
+                    client.query(query_str, &[&uid]).await
+                } else {
+                    client.query(query_str, &[]).await
+                }.map_err(|e| e.to_string())?;
 
                 let mut users = Vec::new();
                 for row in rows {
-                    let phone: String = row.get(0);
-                    let username: String = row.get(1);
-                    let display_name: Option<String> = row.get(2);
-                    let last_seen: Option<i64> = row.get(3);
+                    let target_id: String = row.get(0);
+                    let mut phone: String = row.get(1);
+                    let username: String = row.get(2);
+                    let display_name: String = row.get(3);
+                    let mut last_seen: i64 = row.get(4);
+                    let hide_phone: bool = row.get(5);
+                    let privacy: i16 = row.get(6);
 
-                    users.push(format!(
-                        "{}|{}|{}|{}",
-                        phone,
-                        username,
-                        display_name.unwrap_or_default(),
-                        last_seen.unwrap_or(0)
-                    ));
+                    if hide_phone && target_id != uid {
+                        phone = "".to_string();
+                    }
+
+                    let is_online = state.online_users.contains_key(&username);
+                    if privacy == 2 && target_id != uid {
+                        last_seen = 0;
+                    } else if privacy == 1 && target_id != uid && !is_history {
+                        last_seen = 0;
+                    }
+                    if is_online {
+                        last_seen = 0;
+                    }
+
+                    users.push(format!("{}|{}|{}|{}", phone, username, display_name, last_seen));
                 }
                 Ok(users)
-            }
-            .await;
+            }.await;
 
             match result {
                 Ok(users) => {
@@ -296,63 +307,127 @@ pub async fn process_command(
             }
         }
         "/profile" => {
-            let result = state.get_profile(my_user_id).await;
-            match result {
-                Ok((username, phone, first_name, last_name, display_name)) => {
-                    format!(
-                        "[Система] Профиль: username={}, phone={}, name={} {}, display_name={}",
-                        username, phone, first_name, last_name, display_name
-                    )
-                }
-                Err(e) => format!("[Система] Ошибка: {}", e),
-            }
-        }
-        "/setname" => {
-            if args.is_empty() {
-                "[Система] Использование: /setname <имя> [фамилия]".to_string()
+            let target_username = if args.is_empty() {
+                _my_username
             } else {
-                let first_name = args[0];
-                let last_name = if args.len() > 1 {
-                    args[1..].join(" ")
-                } else {
-                    "".to_string()
-                };
-                let result = state.set_name(my_user_id, first_name, &last_name).await;
-                match result {
-                    Ok(_) => format!("[Система] Имя обновлено: {} {}", first_name, last_name),
-                    Err(e) => format!("[Система] Ошибка: {}", e),
-                }
-            }
-        }
-        "/setdisplayname" => {
-            if args.is_empty() {
-                "[Система] Использование: /setdisplayname <отображаемое имя>".to_string()
-            } else {
-                let display_name = args.join(" ");
-                let result = state.set_display_name(my_user_id, &display_name).await;
-                match result {
-                    Ok(_) => format!("[Система] Отображаемое имя обновлено: {}", display_name),
-                    Err(e) => format!("[Система] Ошибка: {}", e),
-                }
-            }
-        }
-        "/setusername" => {
-            if args.is_empty() {
-                "[Система] Использование: /setusername <новый_username>".to_string()
-            } else {
-                let new_username = args[0];
-                let result = state.set_username(my_user_id, new_username).await;
-                match result {
-                    Ok(_old) => {
+                args[0]
+            };
+            let target_id_opt = state.resolve_id(target_username).await;
+
+            if let Some(target_id) = target_id_opt {
+                match state.get_profile(&target_id).await {
+                    Ok((uname, phone, fname, lname, dname, bio)) => {
+                        let (hide_phone, privacy) = state
+                            .get_user_settings(&target_id)
+                            .await
+                            .unwrap_or((false, 0));
+                        let is_me = target_id == my_user_id;
+
+                        // ИСПРАВЛЕНИЕ ТИПОВ: приводим к String
+                        let show_phone = if hide_phone && !is_me {
+                            "скрыт".to_string()
+                        } else {
+                            phone.clone()
+                        };
+
+                        let mut status = "скрыт".to_string();
+                        if is_me || privacy == 0 {
+                            let is_online = state.online_users.contains_key(&uname);
+                            if is_online {
+                                status = "онлайн".to_string();
+                            }
+                        }
+
                         format!(
-                            "[Система] Username изменён на {}. Переподключитесь для применения.",
-                            new_username
+                            "[Система] Профиль|{}|{}|{}|{}|{}|{}|{}",
+                            uname, show_phone, fname, lname, dname, bio, status
                         )
                     }
                     Err(e) => format!("[Система] Ошибка: {}", e),
                 }
+            } else {
+                format!("[Система] Пользователь {} не найден", target_username)
             }
         }
+        "/update_profile" => {
+            if args.is_empty() {
+                "[Система] Использование: /update_profile <имя>|<фамилия>|<display_name>|<username>|<bio>".to_string()
+            } else {
+                let joined = args.join(" ");
+                let parts: Vec<&str> = joined.split('|').collect();
+                if parts.len() != 5 {
+                    "[Система] Ошибка: передайте 5 параметров через |".to_string()
+                } else {
+                    let fname = parts[0];
+                    let lname = parts[1];
+                    let dname = parts[2];
+                    let uname = parts[3];
+                    let bio = parts[4];
+
+                    match state
+                        .update_profile(my_user_id, fname, lname, dname, uname, bio)
+                        .await
+                    {
+                        Ok(_) => "[Система] Профиль успешно обновлен".to_string(),
+                        Err(e) => format!("[Система] Ошибка: {}", e),
+                    }
+                }
+            }
+        }
+        "/update_settings" => {
+            if args.is_empty() {
+                "[Система] Использование: /update_settings <hide_phone 0/1>|<last_seen_privacy 0/1/2>".to_string()
+            } else {
+                let parts: Vec<&str> = args[0].split('|').collect();
+                if parts.len() != 2 {
+                    "[Система] Ошибка: передайте два параметра через |".to_string()
+                } else {
+                    let hide_phone = parts[0] == "1";
+                    let privacy = parts[1].parse::<i16>().unwrap_or(0);
+
+                    match state
+                        .update_user_settings(my_user_id, hide_phone, privacy)
+                        .await
+                    {
+                        Ok(_) => "[Система] Настройки приватности обновлены".to_string(),
+                        Err(e) => format!("[Система] Ошибка: {}", e),
+                    }
+                }
+            }
+        }
+        "/change_password" => {
+            if args.is_empty() {
+                "[Система] Использование: /change_password <старый>|<новый>".to_string()
+            } else {
+                let parts: Vec<&str> = args[0].split('|').collect();
+                if parts.len() != 2 {
+                    "[Система] Ошибка: передайте старый и новый пароль через |".to_string()
+                } else {
+                    let old_pwd = parts[0];
+                    let new_pwd = parts[1];
+
+                    match state.verify_password_for_user(my_user_id, old_pwd).await {
+                        Ok(true) => match state.update_password(my_user_id, new_pwd).await {
+                            Ok(_) => "[Система] Пароль успешно изменен".to_string(),
+                            Err(e) => format!("[Система] Ошибка: {}", e),
+                        },
+                        _ => "[Система] Неверный старый пароль".to_string(),
+                    }
+                }
+            }
+        }
+        "/sessions" => match state.get_user_sessions(my_user_id).await {
+            Ok(sessions) => {
+                let current_token = session.token.get().map(|s| s.as_str()).unwrap_or("");
+                let mut out = Vec::new();
+                for (tok, dev, last_seen) in sessions {
+                    let is_current = if tok == current_token { "1" } else { "0" };
+                    out.push(format!("{}|{}|{}|{}", tok, dev, last_seen, is_current));
+                }
+                format!("[Система] Сессии: {}", out.join(", "))
+            }
+            Err(e) => format!("[Система] Ошибка: {}", e),
+        },
         "/report" => {
             if args.len() < 3 {
                 "[Система] Использование: /report <kind> <msg_id> <причина>".to_string()
@@ -360,14 +435,12 @@ pub async fn process_command(
                 let kind: u8 = args[0].parse().unwrap_or(1);
                 let msg_id: i64 = args[1].parse().unwrap_or(0);
                 let reason = args[2..].join(" ");
-
                 let target_type = match kind {
                     MSG_KIND_PERSONAL => "message",
                     MSG_KIND_GROUP => "message",
                     MSG_KIND_CHANNEL => "message",
                     _ => "message",
                 };
-
                 let client = state.db.get().await;
                 match client {
                     Ok(c) => {
@@ -665,8 +738,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         return;
                     }
 
+                    // ИСПРАВЛЕНИЕ: get_profile теперь возвращает 6 элементов (добавили bio)
                     let username = match state.get_profile(&user_id).await {
-                        Ok((uname, _, _, _, _)) => uname,
+                        Ok((uname, _, _, _, _, _)) => uname,
                         Err(_) => phone.to_string(),
                     };
 
@@ -1003,7 +1077,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match msg_type {
                 MSG_TYPE_USER => {
-                    info!("Получен 0x01");
                     if rest.len() < 4 + 4 + 12 + 4 + 24 {
                         warn!("0x01: мало данных");
                         continue;
@@ -1069,7 +1142,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                     };
                     let content = String::from_utf8_lossy(&plaintext).to_string();
-                    debug!("Успешно расшифровано");
+
                     if content.starts_with('/') {
                         if content.starts_with("/history") {
                             let parts: Vec<&str> = content.split_whitespace().collect();
@@ -1140,7 +1213,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
                         };
-                        debug!("Отправитель найден");
 
                         let stored_id = match state
                             .store_message(
@@ -1158,7 +1230,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 continue;
                             }
                         };
-                        debug!("Успешно сохранено");
+
                         send_to_all_my_sessions(
                             &state,
                             &my_username,
@@ -1177,10 +1249,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         )
                         .await;
 
-                        // --- ДОБАВИТЬ ЭТО ДЛЯ ACK В ФОНЕ ---
                         if is_background {
                             let _ = send_encrypted_message(
-                                &tx, // Отправляем напрямую в текущую сессию
+                                &tx,
                                 &keys,
                                 &my_username,
                                 &recipient_name,
@@ -1198,8 +1269,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             )
                             .await;
                         }
-                        // ------------------------------------
-                        debug!("Отпрвлено на свои сессии");
+
                         if recipient_id != my_user_id {
                             let target_tokens = {
                                 state
@@ -1230,7 +1300,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     )
                                     .await;
                                 }
-                                debug!("Отправлено");
                             }
 
                             let fcm_tokens = state
@@ -1246,8 +1315,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 let body = content.chars().take(100).collect::<String>();
                                 let data_payload = json!({
                                     "sender": sender_display_name,
-                                    "sender_username": my_username, // Добавили
-                                    "chatKey": my_username,         // Добавили
+                                    "sender_username": my_username,
+                                    "chatKey": my_username,
                                     "type": "private",
                                     "kind": "personal",
                                     "msg_id": stored_id.to_string()
@@ -1331,12 +1400,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             Some(client_msg_id),
                         )
                         .await;
+
                         if is_background {
                             let _ = send_encrypted_message(
                                 &tx,
                                 &keys,
                                 &my_username,
-                                &recip_with_hash, // <--- правильная переменная
+                                &recip_with_hash,
                                 &plaintext,
                                 MsgFields {
                                     timestamp,
@@ -1414,10 +1484,10 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     );
                                     let data_payload = json!({
                                         "sender": sender_display_name,
-                                        "sender_username": my_username, // Добавили
-                                        "chatKey": my_username,         // Добавили
-                                        "type": "private",
-                                        "kind": "personal",
+                                        "group": group_name,
+                                        "chatKey": format!("#{}", group_name),
+                                        "type": "group",
+                                        "kind": "group",
                                         "msg_id": stored_id.to_string()
                                     });
                                     let state_fcm = state.clone();
@@ -1563,7 +1633,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     let data_payload = json!({
                                         "sender": sender_display_name,
                                         "channel": channel_name,
-                                        "chatKey": format!("&{}", channel_name), // Добавили
+                                        "chatKey": format!("&{}", channel_name),
                                         "type": "channel",
                                         "kind": "channel",
                                         "msg_id": stored_id.to_string()
