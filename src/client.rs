@@ -228,17 +228,17 @@ pub async fn process_command(
                 let client = state.db.get().await.map_err(|e| e.to_string())?;
 
                 let query_str = if is_phones {
-                    "SELECT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)
+                    "SELECT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)::smallint
                      FROM users u LEFT JOIN user_settings s ON u.id = s.user_id
                      WHERE u.phone = ANY($1)"
                 } else if is_history {
-                    "SELECT DISTINCT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)
+                    "SELECT DISTINCT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)::smallint
                      FROM users u
                      LEFT JOIN user_settings s ON u.id = s.user_id
                      JOIN messages m ON (m.sender_id = u.id AND m.recipient_id = $1) OR (m.recipient_id = u.id AND m.sender_id = $1)
                      WHERE u.id != $1"
                 } else {
-                    "SELECT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)
+                    "SELECT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)::smallint
                      FROM users u LEFT JOIN user_settings s ON u.id = s.user_id"
                 };
 
@@ -260,7 +260,7 @@ pub async fn process_command(
                     let display_name: String = row.get(3);
                     let mut last_seen: i64 = row.get(4);
                     let hide_phone: bool = row.get(5);
-                    let privacy: i16 = row.get(6);
+                    let privacy: i16 = row.get(6); // Теперь тут точно i16 (SMALLINT)!
 
                     if hide_phone && target_id != uid {
                         phone = "".to_string();
@@ -315,6 +315,19 @@ pub async fn process_command(
             let target_id_opt = state.resolve_id(target_username).await;
 
             if let Some(target_id) = target_id_opt {
+                let last_seen: i64 = {
+                    match state.db.get().await {
+                        Ok(client) => match client
+                            .query_opt("SELECT last_seen FROM users WHERE id = $1", &[&target_id])
+                            .await
+                        {
+                            Ok(Some(row)) => row.get(0),
+                            _ => 0,
+                        },
+                        Err(_) => 0,
+                    }
+                };
+
                 match state.get_profile(&target_id).await {
                     Ok((uname, phone, fname, lname, dname, bio)) => {
                         let (hide_phone, privacy) = state
@@ -323,7 +336,6 @@ pub async fn process_command(
                             .unwrap_or((false, 0));
                         let is_me = target_id == my_user_id;
 
-                        // ИСПРАВЛЕНИЕ ТИПОВ: приводим к String
                         let show_phone = if hide_phone && !is_me {
                             "скрыт".to_string()
                         } else {
@@ -335,12 +347,25 @@ pub async fn process_command(
                             let is_online = state.online_users.contains_key(&uname);
                             if is_online {
                                 status = "онлайн".to_string();
+                            } else {
+                                status = "офлайн".to_string();
                             }
+                        } else if privacy == 1 {
+                            status = "офлайн".to_string();
                         }
 
                         format!(
-                            "[Система] Профиль|{}|{}|{}|{}|{}|{}|{}",
-                            uname, show_phone, fname, lname, dname, bio, status
+                            "[Система] Профиль|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+                            uname,
+                            show_phone,
+                            fname,
+                            lname,
+                            dname,
+                            bio,
+                            status,
+                            last_seen,
+                            hide_phone,
+                            privacy
                         )
                     }
                     Err(e) => format!("[Система] Ошибка: {}", e),
