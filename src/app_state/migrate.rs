@@ -11,10 +11,6 @@ impl AppState {
             .await
             .map_err(|e| format!("Ошибка получения клиента из пула: {}", e))?;
 
-        // Весь SQL переписан под Postgres:
-        // SERIAL / BIGSERIAL для автоинкремента
-        // TIMESTAMPTZ для времени
-        // BOOLEAN для флагов
         let sql = r#"
             CREATE TABLE IF NOT EXISTS users (
                 id TEXT PRIMARY KEY,
@@ -24,9 +20,21 @@ impl AppState {
                 first_name TEXT,
                 last_name TEXT,
                 display_name TEXT,
+                bio TEXT,
                 created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 last_seen BIGINT DEFAULT 0
             );
+            -- Добавляем bio, если таблица уже существует (для старых баз)
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
+
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                hide_phone BOOLEAN DEFAULT false,
+                last_seen_privacy SMALLINT DEFAULT 0
+            );
+            -- Переносим существующих пользователей в user_settings
+            INSERT INTO user_settings (user_id) SELECT id FROM users ON CONFLICT DO NOTHING;
+
             CREATE TABLE IF NOT EXISTS sessions (
                 token TEXT PRIMARY KEY,
                 user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -113,6 +121,13 @@ impl AppState {
                 created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (user_id, kind, msg_id)
             );
+            CREATE TABLE IF NOT EXISTS bans (
+                id BIGSERIAL PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                reason TEXT NOT NULL,
+                expires_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
 
             -- Индексы для быстрой работы
             CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
@@ -125,11 +140,11 @@ impl AppState {
             CREATE INDEX IF NOT EXISTS idx_hidden_user ON hidden_messages(user_id);
         "#;
 
-        // batch_execute выполняет несколько запросов разом
         client
             .batch_execute(sql)
             .await
             .map_err(|e| format!("Ошибка создания таблиц PG: {}", e))?;
+
         // Создаем системного пользователя, если его нет
         let _ = client
             .execute(
@@ -139,6 +154,15 @@ impl AppState {
                 &[],
             )
             .await;
+
+        // Убеждаемся, что у системного пользователя есть настройки
+        let _ = client
+            .execute(
+                "INSERT INTO user_settings (user_id) VALUES ('system') ON CONFLICT DO NOTHING",
+                &[],
+            )
+            .await;
+
         info!("База данных PostgreSQL успешно инициализирована.");
 
         Ok(())
