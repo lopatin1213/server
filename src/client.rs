@@ -2278,8 +2278,9 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                             state.delete_personal_chat(&my_user_id, &peer_id).await;
 
                                         let pkt = build_delete_chat_packet(kind, &name, 0);
-                                        send_to_user_sessions(&state, &my_username, pkt.clone());
-                                        send_to_user_sessions(&state, &name, pkt);
+                                        send_to_user_sessions(&state, &my_username, pkt.clone())
+                                            .await;
+                                        send_to_user_sessions(&state, &name, pkt).await;
                                     }
                                 }
                             }
@@ -2297,7 +2298,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                             let pkt = build_delete_chat_packet(kind, &name, 0);
                                             for m_id in members {
                                                 let m_name = state.resolve_username(&m_id).await;
-                                                send_to_user_sessions(&state, &m_name, pkt.clone());
+                                                send_to_user_sessions(&state, &m_name, pkt.clone())
+                                                    .await;
                                             }
                                         }
                                         Ok(false) => {
@@ -2333,7 +2335,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                             let pkt = build_delete_chat_packet(kind, &name, 0);
                                             for sub_id in subs {
                                                 let s_name = state.resolve_username(&sub_id).await;
-                                                send_to_user_sessions(&state, &s_name, pkt.clone());
+                                                send_to_user_sessions(&state, &s_name, pkt.clone())
+                                                    .await;
                                             }
                                         }
                                         Ok(false) => {
