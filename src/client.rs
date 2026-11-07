@@ -3,7 +3,7 @@ use aes_gcm::{
     aead::{Aead, KeyInit},
 };
 use futures_util::{SinkExt, StreamExt};
-use log::{debug, error, info, warn};
+use log::{error, info, warn};
 use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -18,9 +18,8 @@ use crate::constants::*;
 use crate::fcm::send_fcm_push_and_cleanup;
 use crate::handshake::ws_handshake;
 use crate::senders::{
-    broadcast_system_message, build_delete_chat_packet, send_chat_history, send_encrypted_message,
-    send_messages_by_ids, send_system_message, send_system_notification, send_to_all_my_sessions,
-    send_to_user_sessions,
+    broadcast_system_message, send_chat_history, send_encrypted_message, send_messages_by_ids,
+    send_system_message, send_system_notification, send_to_all_my_sessions,
 };
 
 pub async fn resolve_display_name(state: &Arc<AppState>, user_id: &str, fallback: &str) -> String {
@@ -112,11 +111,7 @@ pub async fn process_command(
             let uid = my_user_id.to_string();
             let result: Result<Vec<String>, String> = async {
                 let client = state.db.get().await.map_err(|e| e.to_string())?;
-                let rows = client.query(
-                    "SELECT g.name, g.creator_id, (SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = $1) AS is_member FROM groups g ORDER BY g.name",
-                    &[&uid]
-                ).await.map_err(|e| e.to_string())?;
-
+                let rows = client.query("SELECT g.name, g.creator_id, (SELECT 1 FROM group_members gm WHERE gm.group_id = g.id AND gm.user_id = $1) AS is_member FROM groups g ORDER BY g.name", &[&uid]).await.map_err(|e| e.to_string())?;
                 let mut groups = Vec::new();
                 for row in rows {
                     let name: String = row.get(0);
@@ -131,7 +126,6 @@ pub async fn process_command(
                 }
                 Ok(out)
             }.await;
-
             match result {
                 Ok(groups) => {
                     if groups.is_empty() {
@@ -184,11 +178,7 @@ pub async fn process_command(
             let uid = my_user_id.to_string();
             let result: Result<Vec<String>, String> = async {
                 let client = state.db.get().await.map_err(|e| e.to_string())?;
-                let rows = client.query(
-                    "SELECT c.name, c.creator_id, (SELECT 1 FROM channel_subscribers cs WHERE cs.channel_id = c.id AND cs.user_id = $1) AS subscribed FROM channels c ORDER BY c.name",
-                    &[&uid],
-                ).await.map_err(|e| e.to_string())?;
-
+                let rows = client.query("SELECT c.name, c.creator_id, (SELECT 1 FROM channel_subscribers cs WHERE cs.channel_id = c.id AND cs.user_id = $1) AS subscribed FROM channels c ORDER BY c.name", &[&uid]).await.map_err(|e| e.to_string())?;
                 let mut raw = Vec::new();
                 for row in rows {
                     let name: String = row.get(0);
@@ -203,7 +193,6 @@ pub async fn process_command(
                 }
                 Ok(out)
             }.await;
-
             match result {
                 Ok(channels) => {
                     if channels.is_empty() {
@@ -221,64 +210,32 @@ pub async fn process_command(
         }
         "/listusers" => {
             let uid = my_user_id.to_string();
-            let is_phones = args.len() >= 2 && args[0] == "phones";
-            let is_history = args.len() >= 1 && args[0] == "history";
-
             let result: Result<Vec<String>, String> = async {
                 let client = state.db.get().await.map_err(|e| e.to_string())?;
 
-                let query_str = if is_phones {
-                    "SELECT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)::smallint
-                     FROM users u LEFT JOIN user_settings s ON u.id = s.user_id
-                     WHERE u.phone = ANY($1)"
-                } else if is_history {
-                    "SELECT DISTINCT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)::smallint
-                     FROM users u
-                     LEFT JOIN user_settings s ON u.id = s.user_id
-                     JOIN messages m ON (m.sender_id = u.id AND m.recipient_id = $1) OR (m.recipient_id = u.id AND m.sender_id = $1)
-                     WHERE u.id != $1"
+                if args.is_empty() {
+                    let rows = client.query("SELECT phone, username, COALESCE(display_name, ''), COALESCE(last_seen, 0) FROM users ORDER BY username", &[]).await.map_err(|e| e.to_string())?;
+                    let mut users = Vec::new();
+                    for row in rows { users.push(format!("{}|{}|{}|{}", row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, i64>(3))); }
+                    Ok(users)
+                } else if args[0] == "history" {
+                    info!("Вызван с history");
+                    let rows = client.query("SELECT DISTINCT u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0) FROM users u JOIN messages m ON (m.sender_id = u.id AND m.recipient_id = $1) OR (m.recipient_id = u.id AND m.sender_id = $1) WHERE u.id != $1", &[&uid]).await.map_err(|e| e.to_string())?;
+                    let mut users = Vec::new();
+                    for row in rows { users.push(format!("{}|{}|{}|{}", row.get::<_, String>(0), row.get::<_, String>(1), row.get::<_, String>(2), row.get::<_, i64>(3))); }
+                    Ok(users)
+                } else if args[0] == "contacts" {
+                    state.get_contacts(&uid).await
                 } else {
-                    "SELECT u.id, u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0), COALESCE(s.hide_phone, false), COALESCE(s.last_seen_privacy, 0)::smallint
-                     FROM users u LEFT JOIN user_settings s ON u.id = s.user_id"
-                };
-
-                let rows = if is_phones {
-                    let phones = args[1..].join(" ");
-                    let phone_list: Vec<&str> = phones.split(',').collect();
-                    client.query(query_str, &[&phone_list]).await
-                } else if is_history {
-                    client.query(query_str, &[&uid]).await
-                } else {
-                    client.query(query_str, &[]).await
-                }.map_err(|e| e.to_string())?;
-
-                let mut users = Vec::new();
-                for row in rows {
-                    let target_id: String = row.get(0);
-                    let mut phone: String = row.get(1);
-                    let username: String = row.get(2);
-                    let display_name: String = row.get(3);
-                    let mut last_seen: i64 = row.get(4);
-                    let hide_phone: bool = row.get(5);
-                    let privacy: i16 = row.get(6); // Теперь тут точно i16 (SMALLINT)!
-
-                    if hide_phone && target_id != uid {
-                        phone = "".to_string();
+                    let mut hashes = Vec::new();
+                    for arg in args {
+                        for part in arg.split(',') {
+                            if !part.trim().is_empty() { hashes.push(part.trim().to_string()); }
+                        }
                     }
-
-                    let is_online = state.online_users.contains_key(&username);
-                    if privacy == 2 && target_id != uid {
-                        last_seen = 0;
-                    } else if privacy == 1 && target_id != uid && !is_history {
-                        last_seen = 0;
-                    }
-                    if is_online {
-                        last_seen = 0;
-                    }
-
-                    users.push(format!("{}|{}|{}|{}", phone, username, display_name, last_seen));
+                    let _ = state.sync_contacts(&uid, &hashes).await;
+                    state.get_contacts(&uid).await
                 }
-                Ok(users)
             }.await;
 
             match result {
@@ -290,6 +247,16 @@ pub async fn process_command(
                     }
                 }
                 Err(e) => format!("[Система] Ошибка: {}", e),
+            }
+        }
+        "/add_contact" => {
+            if args.is_empty() {
+                "[Система] Использование: /add_contact <username>".to_string()
+            } else {
+                match state.add_contact(my_user_id, args[0]).await {
+                    Ok(_) => format!("[Система] Пользователь {} добавлен в контакты", args[0]),
+                    Err(e) => format!("[Система] Ошибка: {}", e),
+                }
             }
         }
         "/onlineusers" => {
@@ -315,21 +282,19 @@ pub async fn process_command(
             let target_id_opt = state.resolve_id(target_username).await;
 
             if let Some(target_id) = target_id_opt {
-                let last_seen: i64 = {
-                    match state.db.get().await {
-                        Ok(client) => match client
-                            .query_opt("SELECT last_seen FROM users WHERE id = $1", &[&target_id])
-                            .await
-                        {
-                            Ok(Some(row)) => row.get(0),
-                            _ => 0,
-                        },
-                        Err(_) => 0,
-                    }
+                let last_seen: i64 = match state.db.get().await {
+                    Ok(client) => match client
+                        .query_opt("SELECT last_seen FROM users WHERE id = $1", &[&target_id])
+                        .await
+                    {
+                        Ok(Some(row)) => row.get(0),
+                        _ => 0,
+                    },
+                    Err(_) => 0,
                 };
 
                 match state.get_profile(&target_id).await {
-                    Ok((uname, phone, fname, lname, dname, bio)) => {
+                    Ok((uname, phone, first_name, last_name, display_name, bio)) => {
                         let (hide_phone, privacy) = state
                             .get_user_settings(&target_id)
                             .await
@@ -342,25 +307,35 @@ pub async fn process_command(
                             phone.clone()
                         };
 
-                        let mut status = "скрыт".to_string();
-                        if is_me || privacy == 0 {
+                        let mut can_see_last_seen = is_me || privacy == 0;
+                        if !can_see_last_seen && privacy == 1 {
+                            let is_contact = match state.db.get().await {
+                                Ok(client) => client.query_opt("SELECT 1 FROM user_contacts WHERE owner_id = $1 AND contact_id = $2", &[&my_user_id, &target_id]).await.map(|opt| opt.is_some()).unwrap_or(false),
+                                Err(_) => false,
+                            };
+                            if is_contact {
+                                can_see_last_seen = true;
+                            }
+                        }
+
+                        let status = if can_see_last_seen {
                             let is_online = state.online_users.contains_key(&uname);
                             if is_online {
-                                status = "онлайн".to_string();
+                                "онлайн".to_string()
                             } else {
-                                status = "офлайн".to_string();
+                                "офлайн".to_string()
                             }
-                        } else if privacy == 1 {
-                            status = "офлайн".to_string();
-                        }
+                        } else {
+                            "скрыт".to_string()
+                        };
 
                         format!(
                             "[Система] Профиль|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
                             uname,
                             show_phone,
-                            fname,
-                            lname,
-                            dname,
+                            first_name,
+                            last_name,
+                            display_name,
                             bio,
                             status,
                             last_seen,
@@ -383,14 +358,10 @@ pub async fn process_command(
                 if parts.len() != 5 {
                     "[Система] Ошибка: передайте 5 параметров через |".to_string()
                 } else {
-                    let fname = parts[0];
-                    let lname = parts[1];
-                    let dname = parts[2];
-                    let uname = parts[3];
-                    let bio = parts[4];
-
                     match state
-                        .update_profile(my_user_id, fname, lname, dname, uname, bio)
+                        .update_profile(
+                            my_user_id, parts[0], parts[1], parts[2], parts[3], parts[4],
+                        )
                         .await
                     {
                         Ok(_) => "[Система] Профиль успешно обновлен".to_string(),
@@ -409,7 +380,6 @@ pub async fn process_command(
                 } else {
                     let hide_phone = parts[0] == "1";
                     let privacy = parts[1].parse::<i16>().unwrap_or(0);
-
                     match state
                         .update_user_settings(my_user_id, hide_phone, privacy)
                         .await
@@ -428,11 +398,8 @@ pub async fn process_command(
                 if parts.len() != 2 {
                     "[Система] Ошибка: передайте старый и новый пароль через |".to_string()
                 } else {
-                    let old_pwd = parts[0];
-                    let new_pwd = parts[1];
-
-                    match state.verify_password_for_user(my_user_id, old_pwd).await {
-                        Ok(true) => match state.update_password(my_user_id, new_pwd).await {
+                    match state.verify_password_for_user(my_user_id, parts[0]).await {
+                        Ok(true) => match state.update_password(my_user_id, parts[1]).await {
                             Ok(_) => "[Система] Пароль успешно изменен".to_string(),
                             Err(e) => format!("[Система] Ошибка: {}", e),
                         },
@@ -469,10 +436,7 @@ pub async fn process_command(
                 let client = state.db.get().await;
                 match client {
                     Ok(c) => {
-                        let res = c.execute(
-                            "INSERT INTO reports (reporter_id, target_id, target_type, reason) VALUES ($1, $2, $3, $4)",
-                            &[&my_user_id, &msg_id.to_string(), &target_type, &reason],
-                        ).await;
+                        let res = c.execute("INSERT INTO reports (reporter_id, target_id, target_type, reason) VALUES ($1, $2, $3, $4)", &[&my_user_id, &msg_id.to_string(), &target_type, &reason]).await;
                         match res {
                             Ok(_) => "[Система] Жалоба отправлена модераторам.".to_string(),
                             Err(e) => format!("[Система] Ошибка: {}", e),
@@ -597,11 +561,10 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
     }
     let encrypted = &auth_data[17..17 + enc_len];
 
-    // Читаем флаг is_background (если он есть)
     let is_background = if auth_data.len() > 17 + enc_len {
         auth_data[17 + enc_len] == 1
     } else {
-        false // Старый клиент
+        false
     };
 
     let cipher = aes_gcm::Aes256Gcm::new(Key::<aes_gcm::Aes256Gcm>::from_slice(&keys.key));
@@ -625,31 +588,29 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         state.sessions.remove(&temp_id);
         return;
     }
-
     let command = parts[0];
 
-    // БЕЗОПАСНОЕ ЛОГИРОВАНИЕ
     let safe_log = match command {
-        "login" => {
-            let phone = parts.get(1).unwrap_or(&"");
-            let device = parts.get(3).unwrap_or(&"");
-            format!("login|{}|***|{}|*** (BG: {})", phone, device, is_background)
-        }
-        "register" => {
-            let phone = parts.get(1).unwrap_or(&"");
-            let fname = parts.get(3).unwrap_or(&"");
-            let lname = parts.get(4).unwrap_or(&"");
-            let uname = parts.get(5).unwrap_or(&"");
-            let device = parts.get(6).unwrap_or(&"");
-            format!(
-                "register|{}|***|{}|{}|{}|{}|*** (BG: {})",
-                phone, fname, lname, uname, device, is_background
-            )
-        }
-        "token" => {
-            let device = parts.get(2).unwrap_or(&"");
-            format!("token|***|{}|*** (BG: {})", device, is_background)
-        }
+        "login" => format!(
+            "login|{}|***|{}|*** (BG: {})",
+            parts.get(1).unwrap_or(&""),
+            parts.get(3).unwrap_or(&""),
+            is_background
+        ),
+        "register" => format!(
+            "register|{}|***|{}|{}|{}|{}|*** (BG: {})",
+            parts.get(1).unwrap_or(&""),
+            parts.get(3).unwrap_or(&""),
+            parts.get(4).unwrap_or(&""),
+            parts.get(5).unwrap_or(&""),
+            parts.get(6).unwrap_or(&""),
+            is_background
+        ),
+        "token" => format!(
+            "token|***|{}|*** (BG: {})",
+            parts.get(2).unwrap_or(&""),
+            is_background
+        ),
         _ => "unknown".to_string(),
     };
     info!("Получен пакет AUTH: {}", safe_log);
@@ -668,9 +629,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match result {
                 Ok((user_id, username)) => {
-                    debug!("Проверяю, что человек не заблокирован");
                     if let Ok(Some(reason)) = state.is_user_banned(&user_id).await {
-                        debug!("Он заблокирован!");
                         let _ = send_system_message(
                             &tx,
                             &format!(
@@ -679,10 +638,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             ),
                         )
                         .await;
-
                         let _ = tx.send(Message::Close(None));
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
                         ping_task.abort();
                         send_task.abort();
                         state.sessions.remove(&temp_id);
@@ -705,20 +662,16 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     state.sessions.remove(&temp_id);
                     state.sessions.insert(token.to_string(), session.clone());
 
-                    // ВАЖНО: Обновляем онлайн-статус только если это НЕ фон
                     if !is_background {
                         state
                             .online_users
                             .entry(username.clone())
                             .or_default()
                             .push(token.to_string());
-
                         let _ = state.update_last_seen(&user_id).await;
-
                         let msg = format!("[Система] Пользователь {} подключился", username);
                         broadcast_system_message(&state, &msg, Some(&username)).await;
                     }
-
                     Ok((user_id, username))
                 }
                 Err(e) => {
@@ -742,9 +695,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
             match result {
                 Ok(user_id) => {
-                    debug!("Проверяю, что человек не заблокирован");
                     if let Ok(Some(reason)) = state.is_user_banned(&user_id).await {
-                        debug!("Он заблокирован! Отправляю отказ");
                         let _ = send_system_message(
                             &tx,
                             &format!(
@@ -753,17 +704,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             ),
                         )
                         .await;
-
                         let _ = tx.send(Message::Close(None));
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
                         ping_task.abort();
                         send_task.abort();
                         state.sessions.remove(&temp_id);
                         return;
                     }
 
-                    // ИСПРАВЛЕНИЕ: get_profile теперь возвращает 6 элементов (добавили bio)
                     let username = match state.get_profile(&user_id).await {
                         Ok((uname, _, _, _, _, _)) => uname,
                         Err(_) => phone.to_string(),
@@ -789,28 +737,22 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             state.sessions.remove(&temp_id);
                             state.sessions.insert(token.clone(), session.clone());
 
-                            // ВАЖНО: Обновляем онлайн-статус только если это НЕ фон
                             if !is_background {
                                 state
                                     .online_users
                                     .entry(username.clone())
                                     .or_default()
                                     .push(token.clone());
-
                                 let _ = state.update_last_seen(&user_id).await;
-
                                 let msg =
                                     format!("[Система] Пользователь {} подключился", username);
                                 broadcast_system_message(&state, &msg, Some(&username)).await;
-
-                                // ВОТ ТУТ НУЖНО ВЕРНУТЬ ССЫЛКУ
                                 let sys_msg = format!(
                                     "Вход в аккаунт с нового устройства: {}\n\n[Отключить это устройство](killsession:{})",
                                     device_name, token
                                 );
                                 send_system_notification(&state, &user_id, &sys_msg).await;
                             }
-
                             Ok((user_id, username))
                         }
                         Err(e) => {
@@ -843,11 +785,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
                 .map(|s| s.to_string());
+            let phone_hash = parts.get(8).map(|s| s.trim()).filter(|s| !s.is_empty());
 
             let username = username_opt.unwrap_or(phone).to_string();
 
             let result = state
-                .register_user(&username, phone, password, first_name, last_name)
+                .register_user(
+                    &username, phone, password, first_name, last_name, phone_hash,
+                )
                 .await;
 
             match result {
@@ -872,25 +817,19 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             state.sessions.remove(&temp_id);
                             state.sessions.insert(token.clone(), session.clone());
 
-                            // ВАЖНО: Обновляем онлайн-статус только если это НЕ фон
                             if !is_background {
                                 state
                                     .online_users
                                     .entry(username.clone())
                                     .or_default()
                                     .push(token.clone());
-
                                 let _ = state.update_last_seen(&user_id).await;
-
                                 let msg =
                                     format!("[Система] Пользователь {} подключился", username);
                                 broadcast_system_message(&state, &msg, Some(&username)).await;
-                                let sys_msg = "Добро пожаловать в **VartChat**! 👋\n\n\
-     Сюда вам будут приходить системные уведомления от самого мессенджера.\n\n\
-     ⚠️ **Важно:** Пожалуйста, сохраните свой пароль в надежном месте. На данный момент функция восстановления пароля пока недоступна.".to_string();
+                                let sys_msg = "Добро пожаловать в **VartChat**! 👋\n\nСюда вам будут приходить системные уведомления от самого мессенджера.\n\n⚠️ **Важно:** Пожалуйста, сохраните свой пароль в надежном месте. На данный момент функция восстановления пароля пока недоступна.".to_string();
                                 send_system_notification(&state, &user_id, &sys_msg).await;
                             }
-
                             Ok((user_id, username))
                         }
                         Err(e) => {
@@ -926,7 +865,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         Ok((uid, uname)) => (uid, uname),
         Err(_) => {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
             ping_task.abort();
             send_task.abort();
             state.sessions.remove(&temp_id);
@@ -941,10 +879,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
         let uid_h = my_user_id.clone();
         let state_h = state.clone();
 
-        // Личные
         let personal = state_h.get_recent_personal(&uid_h, LOGIN_PER_CHAT).await;
         if let Ok(msgs) = personal {
-            let count = msgs.len();
             for (
                 msg_id,
                 sender_id,
@@ -959,7 +895,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             {
                 let sender = state_h.resolve_username(&sender_id).await;
                 let recipient = state_h.resolve_username(&recipient_id).await;
-
                 let _ = send_encrypted_message(
                     &tx_h,
                     &keys_h,
@@ -979,18 +914,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 )
                 .await;
             }
-            info!("Логин: {} последних личных ({} шт)", LOGIN_PER_CHAT, count);
         }
 
-        // Группы
         let groups = state_h.get_recent_groups(&uid_h, LOGIN_PER_CHAT).await;
         if let Ok(msgs) = groups {
-            let count = msgs.len();
             for (msg_id, gname, sender_id, content, ts, reply_id, flag_me, flag_any, edited) in msgs
             {
                 let sender = state_h.resolve_username(&sender_id).await;
                 let recipient = format!("#{}", gname);
-
                 let _ = send_encrypted_message(
                     &tx_h,
                     &keys_h,
@@ -1010,16 +941,10 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 )
                 .await;
             }
-            info!(
-                "Логин: {} последних групповых ({} шт)",
-                LOGIN_PER_CHAT, count
-            );
         }
 
-        // Каналы
         let channels = state_h.get_recent_channels(&uid_h, LOGIN_PER_CHAT).await;
         if let Ok(msgs) = channels {
-            let count = msgs.len();
             for (
                 msg_id,
                 cname,
@@ -1035,7 +960,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             {
                 let sender = state_h.resolve_username(&sender_id).await;
                 let recipient = format!("&{}", cname);
-
                 let _ = send_encrypted_message(
                     &tx_h,
                     &keys_h,
@@ -1055,10 +979,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 )
                 .await;
             }
-            info!(
-                "Логин: {} последних канальных ({} шт)",
-                LOGIN_PER_CHAT, count
-            );
         }
     }
 
@@ -1087,7 +1007,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 continue;
             }
 
-            // Rate limit
             if !session.check_rate_limit() {
                 let _ = send_system_message(
                     &session.tx,
@@ -1116,7 +1035,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     let _sender_name =
                         String::from_utf8_lossy(&rest[offset..offset + sender_len]).to_string();
                     offset += sender_len;
-
                     let recipient_len =
                         u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
@@ -1126,10 +1044,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     let recipient_name =
                         String::from_utf8_lossy(&rest[offset..offset + recipient_len]).to_string();
                     offset += recipient_len;
-
                     let nonce = &rest[offset..offset + 12];
                     offset += 12;
-
                     let msg_len =
                         u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
@@ -1153,7 +1069,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             .as_millis() as i64;
                         (now, 0, 0)
                     };
-
                     let reply_opt = (reply_to_id != 0).then_some(reply_to_id);
 
                     let cipher =
@@ -1223,10 +1138,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         continue;
                     }
 
-                    // ---- Личное ----
                     if !recipient_name.starts_with(['#', '&']) {
                         let recipient_id_opt = state.resolve_id(&recipient_name).await;
-
                         let recipient_id = match recipient_id_opt {
                             Some(id) => id,
                             None => {
@@ -1331,21 +1244,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 .get_fcm_tokens_for_user(&recipient_id)
                                 .await
                                 .unwrap_or_default();
-
                             let sender_display_name =
                                 resolve_display_name(&state, &my_user_id, &my_username).await;
 
                             for fcm_tok in fcm_tokens {
                                 let title = sender_display_name.to_string();
                                 let body = content.chars().take(100).collect::<String>();
-                                let data_payload = json!({
-                                    "sender": sender_display_name,
-                                    "sender_username": my_username,
-                                    "chatKey": my_username,
-                                    "type": "private",
-                                    "kind": "personal",
-                                    "msg_id": stored_id.to_string()
-                                });
+                                let data_payload = json!({ "sender": sender_display_name, "sender_username": my_username, "chatKey": my_username, "type": "private", "kind": "personal", "msg_id": stored_id.to_string() });
                                 let state_fcm = state.clone();
                                 tokio::spawn(async move {
                                     send_fcm_push_and_cleanup(
@@ -1362,22 +1267,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         continue;
                     }
 
-                    // ---- Группа ----
                     if recipient_name.starts_with('#') {
                         let group_name = recipient_name.trim_start_matches('#').to_string();
-
                         let is_member = {
                             match state.db.get().await {
-                                Ok(client) => {
-                                    client.query_opt(
-                                        "SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id WHERE g.name = $1 AND gm.user_id = $2",
-                                        &[&group_name, &my_user_id]
-                                    ).await.map(|opt| opt.is_some()).unwrap_or(false)
-                                }
-                                Err(_) => false,
+                                Ok(client) => client.query_opt("SELECT 1 FROM group_members gm JOIN groups g ON gm.group_id = g.id WHERE g.name = $1 AND gm.user_id = $2", &[&group_name, &my_user_id]).await.map(|opt| opt.is_some()).unwrap_or(false),
+                                Err(_) => false
                             }
                         };
-
                         if !is_member {
                             let _ =
                                 send_system_message(&tx, "[Система] Вы не состоите в этой группе")
@@ -1451,14 +1348,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             if member_id == my_user_id {
                                 continue;
                             }
-
                             let member_name = state.resolve_username(&member_id).await;
                             if member_name == DELETED_LABEL {
                                 continue;
                             }
 
                             let target_online = state.online_users.contains_key(&member_name);
-
                             if target_online {
                                 let target_tokens = {
                                     state
@@ -1496,10 +1391,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     .get_fcm_tokens_for_user(&member_id)
                                     .await
                                     .unwrap_or_default();
-
                                 let sender_display_name =
                                     resolve_display_name(&state, &my_user_id, &my_username).await;
-
                                 for fcm_tok in fcm_tokens {
                                     let title = format!("Новое сообщение в группе {}", group_name);
                                     let body = format!(
@@ -1507,14 +1400,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         sender_display_name,
                                         content.chars().take(100).collect::<String>()
                                     );
-                                    let data_payload = json!({
-                                        "sender": sender_display_name,
-                                        "group": group_name,
-                                        "chatKey": format!("#{}", group_name),
-                                        "type": "group",
-                                        "kind": "group",
-                                        "msg_id": stored_id.to_string()
-                                    });
+                                    let data_payload = json!({ "sender": sender_display_name, "group": group_name, "chatKey": format!("#{}", group_name), "type": "group", "kind": "group", "msg_id": stored_id.to_string() });
                                     let state_fcm = state.clone();
                                     tokio::spawn(async move {
                                         send_fcm_push_and_cleanup(
@@ -1532,22 +1418,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         continue;
                     }
 
-                    // ---- Канал ----
                     if recipient_name.starts_with('&') {
                         let channel_name = recipient_name.trim_start_matches('&').to_string();
-
                         let is_owner = {
                             match state.db.get().await {
-                                Ok(client) => {
-                                    client.query_opt(
-                                        "SELECT 1 FROM channels WHERE name = $1 AND creator_id = $2",
-                                        &[&channel_name, &my_user_id]
-                                    ).await.map(|opt| opt.is_some()).unwrap_or(false)
-                                }
-                                Err(_) => false,
+                                Ok(client) => client.query_opt("SELECT 1 FROM channels WHERE name = $1 AND creator_id = $2", &[&channel_name, &my_user_id]).await.map(|opt| opt.is_some()).unwrap_or(false),
+                                Err(_) => false
                             }
                         };
-
                         if !is_owner {
                             let _ = send_system_message(
                                 &tx,
@@ -1602,14 +1480,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             if sub_id == my_user_id {
                                 continue;
                             }
-
                             let sub_name = state.resolve_username(&sub_id).await;
                             if sub_name == DELETED_LABEL {
                                 continue;
                             }
 
                             let target_online = state.online_users.contains_key(&sub_name);
-
                             if target_online {
                                 let target_tokens = {
                                     state
@@ -1647,22 +1523,13 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     .get_fcm_tokens_for_user(&sub_id)
                                     .await
                                     .unwrap_or_default();
-
                                 let sender_display_name =
                                     resolve_display_name(&state, &my_user_id, &my_username).await;
-
                                 for fcm_tok in fcm_tokens {
                                     let title =
                                         format!("Новое сообщение в канале {}", channel_name);
                                     let body = content.chars().take(100).collect::<String>();
-                                    let data_payload = json!({
-                                        "sender": sender_display_name,
-                                        "channel": channel_name,
-                                        "chatKey": format!("&{}", channel_name),
-                                        "type": "channel",
-                                        "kind": "channel",
-                                        "msg_id": stored_id.to_string()
-                                    });
+                                    let data_payload = json!({ "sender": sender_display_name, "channel": channel_name, "chatKey": format!("&{}", channel_name), "type": "channel", "kind": "channel", "msg_id": stored_id.to_string() });
                                     let state_fcm = state.clone();
                                     tokio::spawn(async move {
                                         send_fcm_push_and_cleanup(
@@ -1743,10 +1610,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let (ts, reply_opt, read_flag) = {
                                 match state.db.get().await {
                                     Ok(client) => {
-                                        match client.query_opt(
-                                            "SELECT (EXTRACT(EPOCH FROM sent_at) * 1000)::bigint, reply_to_id, read_at FROM messages WHERE id = $1",
-                                            &[&msg_id]
-                                        ).await {
+                                        match client.query_opt("SELECT (EXTRACT(EPOCH FROM sent_at) * 1000)::bigint, reply_to_id, read_at FROM messages WHERE id = $1", &[&msg_id]).await {
                                             Ok(Some(row)) => {
                                                 let ts: i64 = row.get(0);
                                                 let rt: Option<i64> = row.get(1);
@@ -1791,14 +1655,10 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             if recipient_id != my_user_id {
                                 let hidden = {
                                     match state.db.get().await {
-                                        Ok(client) => client.query_opt(
-                                            "SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 1 AND msg_id = $2",
-                                            &[&recipient_id, &msg_id]
-                                        ).await.map(|opt| opt.is_some()).unwrap_or(false),
-                                        Err(_) => false,
+                                        Ok(client) => client.query_opt("SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 1 AND msg_id = $2", &[&recipient_id, &msg_id]).await.map(|opt| opt.is_some()).unwrap_or(false),
+                                        Err(_) => false
                                     }
                                 };
-
                                 if !hidden {
                                     let tokens = {
                                         state
@@ -1841,11 +1701,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let mut gname = String::new();
 
                             if let Ok(client) = state.db.get().await
-                                && let Ok(Some(row)) = client.query_opt(
-                                "SELECT gm.sender_id, (EXTRACT(EPOCH FROM gm.sent_at) * 1000)::bigint, gm.reply_to_id, gm.first_read_at, g.name \
-                                     FROM group_messages gm JOIN groups g ON gm.group_id = g.id WHERE gm.id = $1",
-                                &[&msg_id]
-                            ).await {
+                                && let Ok(Some(row)) = client.query_opt("SELECT gm.sender_id, (EXTRACT(EPOCH FROM gm.sent_at) * 1000)::bigint, gm.reply_to_id, gm.first_read_at, g.name FROM group_messages gm JOIN groups g ON gm.group_id = g.id WHERE gm.id = $1", &[&msg_id]).await {
                                 sender_id_opt = Some(row.get::<_, String>(0));
                                 ts = row.get(1);
                                 reply_id = row.get::<_, Option<i64>>(2).unwrap_or(0);
@@ -1873,7 +1729,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             }
 
                             let _ = state.update_group_message_content(msg_id, &new_text).await;
-
                             let recip_with_hash = format!("#{}", gname);
 
                             send_to_all_my_sessions(
@@ -1895,19 +1750,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             .await;
 
                             let members = state.get_group_members(&gname).await.unwrap_or_default();
-
                             for member_id in members {
                                 if member_id == my_user_id {
                                     continue;
                                 }
-
                                 let hidden = {
                                     match state.db.get().await {
-                                        Ok(client) => client.query_opt(
-                                            "SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 2 AND msg_id = $2",
-                                            &[&member_id, &msg_id]
-                                        ).await.map(|opt| opt.is_some()).unwrap_or(false),
-                                        Err(_) => false,
+                                        Ok(client) => client.query_opt("SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 2 AND msg_id = $2", &[&member_id, &msg_id]).await.map(|opt| opt.is_some()).unwrap_or(false),
+                                        Err(_) => false
                                     }
                                 };
                                 if hidden {
@@ -1977,12 +1827,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let (ts, reply_id, views_u) = {
                                 match state.db.get().await {
                                     Ok(client) => {
-                                        match client.query_opt(
-                                            "SELECT (EXTRACT(EPOCH FROM sent_at) * 1000)::bigint, reply_to_id, \
-                                                    (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id) \
-                                             FROM channel_messages cm WHERE cm.id = $1",
-                                            &[&msg_id]
-                                        ).await {
+                                        match client.query_opt("SELECT (EXTRACT(EPOCH FROM sent_at) * 1000)::bigint, reply_to_id, (SELECT COUNT(*) FROM channel_message_views v WHERE v.channel_msg_id = cm.id) FROM channel_messages cm WHERE cm.id = $1", &[&msg_id]).await {
                                             Ok(Some(row)) => {
                                                 let t: i64 = row.get(0);
                                                 let r: i64 = row.get::<_, Option<i64>>(1).unwrap_or(0);
@@ -1999,7 +1844,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let _ = state
                                 .update_channel_message_content(msg_id, &new_text)
                                 .await;
-
                             let recip_with_amp = format!("&{}", cname);
 
                             send_to_all_my_sessions(
@@ -2024,19 +1868,14 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 .get_channel_subscribers(&cname)
                                 .await
                                 .unwrap_or_default();
-
                             for sub_id in subscribers {
                                 if sub_id == my_user_id {
                                     continue;
                                 }
-
                                 let hidden = {
                                     match state.db.get().await {
-                                        Ok(client) => client.query_opt(
-                                            "SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 3 AND msg_id = $2",
-                                            &[&sub_id, &msg_id]
-                                        ).await.map(|opt| opt.is_some()).unwrap_or(false),
-                                        Err(_) => false,
+                                        Ok(client) => client.query_opt("SELECT 1 FROM hidden_messages WHERE user_id = $1 AND kind = 3 AND msg_id = $2", &[&sub_id, &msg_id]).await.map(|opt| opt.is_some()).unwrap_or(false),
+                                        Err(_) => false
                                     }
                                 };
                                 if hidden {
@@ -2121,11 +1960,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     if !personal_ids.is_empty()
                         && let Ok(client) = state.db.get().await
                     {
-                        let rows = client.query(
-                            "SELECT id, sender_id FROM messages WHERE id = ANY($1) AND recipient_id = $2",
-                            &[&personal_ids, &my_user_id]
-                        ).await.unwrap_or_default();
-
+                        let rows = client.query("SELECT id, sender_id FROM messages WHERE id = ANY($1) AND recipient_id = $2", &[&personal_ids, &my_user_id]).await.unwrap_or_default();
                         let mut by_author: std::collections::HashMap<String, Vec<i64>> =
                             std::collections::HashMap::new();
                         for row in rows {
@@ -2134,10 +1969,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             by_author.entry(sender_id).or_default().push(id);
                         }
 
-                        let _ = client.execute(
-                            "UPDATE messages SET read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND read_at IS NULL",
-                            &[&personal_ids]
-                        ).await;
+                        let _ = client.execute("UPDATE messages SET read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND read_at IS NULL", &[&personal_ids]).await;
 
                         for (author_id, ids) in by_author {
                             if author_id == my_user_id {
@@ -2174,7 +2006,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             )
                             .await
                             .unwrap_or_default();
-
                         let mut by_group: std::collections::HashMap<String, Vec<i64>> =
                             std::collections::HashMap::new();
                         for row in rows {
@@ -2183,10 +2014,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             by_group.entry(group_id).or_default().push(id);
                         }
 
-                        let _ = client.execute(
-                            "UPDATE group_messages SET first_read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND first_read_at IS NULL",
-                            &[&group_ids]
-                        ).await;
+                        let _ = client.execute("UPDATE group_messages SET first_read_at = CURRENT_TIMESTAMP WHERE id = ANY($1) AND first_read_at IS NULL", &[&group_ids]).await;
 
                         for (group_id, ids) in by_group {
                             let members = match client
@@ -2232,10 +2060,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     if !channel_ids.is_empty()
                         && let Ok(client) = state.db.get().await
                     {
-                        let _ = client.execute(
-                            "INSERT INTO channel_message_views (channel_msg_id, user_id) SELECT unnest($1::bigint[]), $2 ON CONFLICT DO NOTHING",
-                            &[&channel_ids, &my_user_id]
-                        ).await;
+                        let _ = client.execute("INSERT INTO channel_message_views (channel_msg_id, user_id) SELECT unnest($1::bigint[]), $2 ON CONFLICT DO NOTHING", &[&channel_ids, &my_user_id]).await;
                     }
                 }
 
@@ -2268,7 +2093,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         match kind {
                             MSG_KIND_PERSONAL => {
                                 let peer_id_opt = state.resolve_id(&name).await;
-
                                 if let Some(peer_id) = peer_id_opt {
                                     if dtype == MSG_DELETE_FOR_ME {
                                         let _ =
@@ -2276,11 +2100,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     } else {
                                         let _ =
                                             state.delete_personal_chat(&my_user_id, &peer_id).await;
-
-                                        let pkt = build_delete_chat_packet(kind, &name, 0);
-                                        send_to_user_sessions(&state, &my_username, pkt.clone())
+                                        let pkt = crate::senders::build_delete_chat_packet(
+                                            kind, &name, 0,
+                                        );
+                                        crate::senders::send_to_user_sessions(
+                                            &state,
+                                            &my_username,
+                                            pkt.clone(),
+                                        )
+                                        .await;
+                                        crate::senders::send_to_user_sessions(&state, &name, pkt)
                                             .await;
-                                        send_to_user_sessions(&state, &name, pkt).await;
                                     }
                                 }
                             }
@@ -2290,16 +2120,20 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 } else {
                                     let members =
                                         state.get_group_members(&name).await.unwrap_or_default();
-
                                     let del_res = state.delete_group(&name, &my_user_id).await;
-
                                     match del_res {
                                         Ok(true) => {
-                                            let pkt = build_delete_chat_packet(kind, &name, 0);
+                                            let pkt = crate::senders::build_delete_chat_packet(
+                                                kind, &name, 0,
+                                            );
                                             for m_id in members {
                                                 let m_name = state.resolve_username(&m_id).await;
-                                                send_to_user_sessions(&state, &m_name, pkt.clone())
-                                                    .await;
+                                                crate::senders::send_to_user_sessions(
+                                                    &state,
+                                                    &m_name,
+                                                    pkt.clone(),
+                                                )
+                                                .await;
                                             }
                                         }
                                         Ok(false) => {
@@ -2327,16 +2161,20 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         .get_channel_subscribers(&name)
                                         .await
                                         .unwrap_or_default();
-
                                     let del_res = state.delete_channel(&name, &my_user_id).await;
-
                                     match del_res {
                                         Ok(true) => {
-                                            let pkt = build_delete_chat_packet(kind, &name, 0);
+                                            let pkt = crate::senders::build_delete_chat_packet(
+                                                kind, &name, 0,
+                                            );
                                             for sub_id in subs {
                                                 let s_name = state.resolve_username(&sub_id).await;
-                                                send_to_user_sessions(&state, &s_name, pkt.clone())
-                                                    .await;
+                                                crate::senders::send_to_user_sessions(
+                                                    &state,
+                                                    &s_name,
+                                                    pkt.clone(),
+                                                )
+                                                .await;
                                             }
                                         }
                                         Ok(false) => {
@@ -2377,7 +2215,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     match kind {
                         MSG_KIND_PERSONAL => {
                             let lookup = state.lookup_personal_message(msg_id).await;
-
                             match lookup {
                                 Ok(Some((sender_id, recipient_id))) => {
                                     if sender_id != my_user_id {
@@ -2389,7 +2226,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         continue;
                                     }
 
-                                    // Отправляем FCM на удаление получателю
                                     if recipient_id != my_user_id {
                                         let rec_name = state.resolve_username(&recipient_id).await;
                                         if rec_name != DELETED_LABEL {
@@ -2400,10 +2236,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                                     .get_fcm_tokens_for_user(&recipient_id)
                                                     .await
                                                     .unwrap_or_default();
-                                                let data_payload = json!({
-                                                    "kind": "delete",
-                                                    "msg_id": msg_id.to_string()
-                                                });
+                                                let data_payload = json!({ "kind": "delete", "msg_id": msg_id.to_string() });
                                                 for fcm_tok in fcm_tokens {
                                                     let state_fcm = state.clone();
                                                     let payload = data_payload.clone();
@@ -2441,7 +2274,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                                     if recipient_id != my_user_id {
                                         let rec_name = state.resolve_username(&recipient_id).await;
-
                                         if rec_name != DELETED_LABEL {
                                             let tokens = {
                                                 state
@@ -2481,7 +2313,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
                         MSG_KIND_CHANNEL => {
                             let lookup = state.lookup_channel_message(msg_id).await;
-
                             match lookup {
                                 Ok(Some((channel_name, creator_id, _sender_id))) => {
                                     if creator_id != my_user_id {
@@ -2503,7 +2334,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                         .get_channel_subscribers(&channel_name)
                                         .await
                                         .unwrap_or_default();
-
                                     let pkt = crate::senders::build_delete_packet(
                                         msg_id,
                                         kind,
@@ -2582,7 +2412,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
 
                         let pwd_check = state.verify_password_for_user(&my_user_id, password).await;
-
                         match pwd_check {
                             Ok(true) => {}
                             Ok(false) => {
@@ -2598,7 +2427,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         }
 
                         let result = state.soft_delete_account(&my_user_id).await;
-
                         let tokens_to_kill = match result {
                             Ok(v) => v,
                             Err(e) => {
@@ -2656,7 +2484,6 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     }
 
                     let is_current = token == session.token.get().map(|s| s.as_str()).unwrap_or("");
-
                     let result = state.delete_session(token).await;
 
                     match result {
@@ -2774,7 +2601,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                 }
 
                 MSG_TYPE_TYPING => {
-                    debug!("Получен пакет TYPING от {}", my_username);
+                    info!("Получен пакет TYPING от {}", my_username);
                     if rest.len() < 1 + 4 + 4 {
                         continue;
                     }
@@ -2811,25 +2638,20 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         for tok in target_tokens {
                             let target_session = state.sessions.get(&tok).map(|r| r.clone());
                             if let Some(ts) = target_session {
-                                debug!("Пересылаю TYPING от {} к {}", my_username, recipient_name);
                                 let _ = ts.tx.send(Message::Binary(data.clone()));
                             }
                         }
                     } else if kind == MSG_KIND_GROUP {
                         let group_name = recipient_name.trim_start_matches('#').to_string();
-
                         let members = state
                             .get_group_members(&group_name)
                             .await
                             .unwrap_or_default();
-
                         for member_id in members {
                             if member_id == my_user_id {
                                 continue;
                             }
-
                             let member_name = state.resolve_username(&member_id).await;
-
                             let tokens = state
                                 .online_users
                                 .get(&member_name)
@@ -2842,6 +2664,41 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                 }
                             }
                         }
+                    }
+                }
+                MSG_TYPE_SECURE_COMMAND => {
+                    if rest.len() < 12 + 4 {
+                        warn!("0x0A: мало данных");
+                        continue;
+                    }
+                    let nonce = &rest[0..12];
+                    let enc_len = u32::from_be_bytes(rest[12..16].try_into().unwrap()) as usize;
+                    if rest.len() < 16 + enc_len {
+                        continue;
+                    }
+                    let encrypted = &rest[16..16 + enc_len];
+
+                    let cipher =
+                        aes_gcm::Aes256Gcm::new(Key::<aes_gcm::Aes256Gcm>::from_slice(&keys.key));
+                    let nonce_ref = aes_gcm::Nonce::from_slice(nonce);
+                    let plaintext = match cipher.decrypt(nonce_ref, encrypted) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            error!("0x0A: ошибка расшифровки: {}", e);
+                            continue;
+                        }
+                    };
+                    let cmd = String::from_utf8_lossy(&plaintext).to_string();
+
+                    info!(
+                        "Получена SECURE_COMMAND через 0x0A: {}",
+                        cmd.split('|').next().unwrap_or("")
+                    );
+
+                    let response =
+                        process_command(&cmd, &my_user_id, &my_username, &state, &session).await;
+                    if !response.is_empty() {
+                        let _ = send_system_message(&tx, &response).await;
                     }
                 }
 
@@ -2877,16 +2734,12 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     state.online_users.remove(&username);
                 }
             }
-
             let msg = format!("[Система] Пользователь {} отключился", username);
-
             if !my_user_id.is_empty() {
                 let _ = state.update_last_seen(&my_user_id).await;
             }
-
             broadcast_system_message(&state, &msg, Some(&username)).await;
         }
-
         if !token.is_empty() {
             state.sessions.remove(&token);
         }

@@ -27,7 +27,7 @@ pub const MSG_DELETE_FOR_ME: u8 = 1;
 
 pub const LOGOUT_TYPE_EXIT: u8 = 0;
 pub const LOGOUT_TYPE_DELETE_ACCOUNT: u8 = 1;
-
+pub const MSG_TYPE_SECURE_COMMAND: u8 = 0x0A;
 // ==================== Лимиты ====================
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 pub const RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(1);
@@ -43,3 +43,6 @@ pub const DELETED_LABEL: &str = "deleted";
 // ==================== Удаление аккаунта ====================
 pub const DELETE_GRACE_PERIOD_SECS: i64 = 7 * 24 * 60 * 60;
 pub const PURGE_INTERVAL_SECS: u64 = 60 * 60;
+
+// ==================== PEPPER для v5 ====================
+pub const PEPPER: &str = "vartchat-secure--x8wNh3UCuGlOO6Klie79S4MzENCnwarKMQx0m83frGLkIJmcO2DPN1bnCmuGfkAY1bh5206czOfiqhtUPDYbfkiVxLLxznTbFaPY8FCQEIjZbyABWzA2iI9ZOXGmN6RvOO";

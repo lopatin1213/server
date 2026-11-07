@@ -9,7 +9,6 @@ use super::core::AppState;
 use crate::constants::*;
 
 impl AppState {
-    // ---- Проверка на бан ----
     pub async fn is_user_banned(&self, user_id: &str) -> Result<Option<String>, String> {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
         let row_opt = client.query_opt(
@@ -20,7 +19,6 @@ impl AppState {
         if let Some(row) = row_opt {
             let reason: String = row.get(0);
             let expires_at: Option<chrono::DateTime<chrono::Utc>> = row.get(1);
-
             if let Some(exp) = expires_at {
                 if exp > chrono::Utc::now() {
                     return Ok(Some(reason));
@@ -32,7 +30,6 @@ impl AppState {
         Ok(None)
     }
 
-    // ---- Регистрация / логин ----
     pub async fn register_user(
         &self,
         username: &str,
@@ -40,6 +37,7 @@ impl AppState {
         password: &str,
         first_name: Option<&str>,
         last_name: Option<&str>,
+        phone_hash: Option<&str>,
     ) -> Result<String, String> {
         let password_hash =
             hash(password, DEFAULT_COST).map_err(|e| format!("Ошибка хеширования: {}", e))?;
@@ -52,12 +50,17 @@ impl AppState {
         let first_name_str = first_name.unwrap_or("");
         let last_name_str = last_name.unwrap_or("");
 
+        let final_phone_hash = match phone_hash {
+            Some(h) => h.to_string(),
+            None => AppState::compute_phone_hash(phone),
+        };
+
         let mut client = self.db.get().await.map_err(|e| e.to_string())?;
         let tx = client.transaction().await.map_err(|e| e.to_string())?;
 
         tx.execute(
-            "INSERT INTO users (id, username, phone, password_hash, first_name, last_name, display_name) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            &[&user_id, &username, &phone, &password_hash, &first_name_str, &last_name_str, &display_name],
+            "INSERT INTO users (id, username, phone, password_hash, first_name, last_name, display_name, phone_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[&user_id, &username, &phone, &password_hash, &first_name_str, &last_name_str, &display_name, &final_phone_hash],
         ).await.map_err(|e| format!("Ошибка регистрации: {}", e))?;
 
         tx.execute(
@@ -86,7 +89,6 @@ impl AppState {
             )
             .await
             .map_err(|e| format!("Ошибка выполнения: {}", e))?;
-
         if let Some(row) = row_opt {
             let user_id: String = row.get(0);
             let hash: String = row.get(1);
@@ -98,24 +100,92 @@ impl AppState {
         Err("Неверный телефон или пароль".to_string())
     }
 
-    // ---- Сессии ----
+    pub async fn sync_contacts(&self, user_id: &str, hashes: &[String]) -> Result<(), String> {
+        if hashes.is_empty() {
+            return Ok(());
+        }
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+
+        let rows = client
+            .query(
+                "SELECT id FROM users WHERE phone_hash = ANY($1)",
+                &[&hashes],
+            )
+            .await
+            .map_err(|e| format!("Ошибка поиска контактов: {}", e))?;
+
+        let mut client = self.db.get().await.map_err(|e| e.to_string())?;
+        let tx = client.transaction().await.map_err(|e| e.to_string())?;
+
+        for row in rows {
+            let contact_id: String = row.get(0);
+            if contact_id != user_id {
+                let _ = tx.execute(
+                    "INSERT INTO user_contacts (owner_id, contact_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    &[&user_id, &contact_id],
+                ).await;
+            }
+        }
+        tx.commit().await.map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    pub async fn add_contact(&self, user_id: &str, target_username: &str) -> Result<(), String> {
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let target_id: String = client
+            .query_one(
+                "SELECT id FROM users WHERE username = $1",
+                &[&target_username],
+            )
+            .await
+            .map_err(|_| "Пользователь не найден".to_string())?
+            .get(0);
+
+        if user_id == target_id {
+            return Err("Нельзя добавить себя".to_string());
+        }
+
+        client.execute(
+            "INSERT INTO user_contacts (owner_id, contact_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            &[&user_id, &target_id],
+        ).await.map_err(|e| format!("Ошибка добавления контакта: {}", e))?;
+        Ok(())
+    }
+
+    pub async fn get_contacts(&self, user_id: &str) -> Result<Vec<String>, String> {
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let rows = client
+            .query(
+                "SELECT u.phone, u.username, COALESCE(u.display_name, ''), COALESCE(u.last_seen, 0)
+             FROM users u JOIN user_contacts c ON u.id = c.contact_id
+             WHERE c.owner_id = $1 ORDER BY u.username",
+                &[&user_id],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let phone: String = r.get(0);
+                let username: String = r.get(1);
+                let display: String = r.get(2);
+                let last_seen: i64 = r.get(3);
+                format!("{}|{}|{}|{}", phone, username, display, last_seen)
+            })
+            .collect())
+    }
+
     pub async fn create_session(&self, user_id: &str, device_name: &str) -> Result<String, String> {
         let token = Uuid::new_v4().to_string();
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-        client.execute(
-            "INSERT INTO sessions (token, user_id, device_name, last_seen) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)",
-            &[&token, &user_id, &device_name],
-        ).await.map_err(|e| format!("Ошибка создания сессии: {}", e))?;
+        client.execute("INSERT INTO sessions (token, user_id, device_name, last_seen) VALUES ($1, $2, $3, CURRENT_TIMESTAMP)", &[&token, &user_id, &device_name]).await.map_err(|e| format!("Ошибка создания сессии: {}", e))?;
         Ok(token)
     }
 
     pub async fn check_session(&self, token: &str) -> Result<(String, String), String> {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-        let row_opt = client.query_opt(
-            "SELECT user_id, username FROM sessions JOIN users ON sessions.user_id = users.id WHERE sessions.token = $1",
-            &[&token]
-        ).await.map_err(|e| format!("Ошибка выполнения: {}", e))?;
-
+        let row_opt = client.query_opt("SELECT user_id, username FROM sessions JOIN users ON sessions.user_id = users.id WHERE sessions.token = $1", &[&token]).await.map_err(|e| format!("Ошибка выполнения: {}", e))?;
         if let Some(row) = row_opt {
             let user_id: String = row.get(0);
             let username: String = row.get(1);
@@ -146,15 +216,7 @@ impl AppState {
         user_id: &str,
     ) -> Result<Vec<(String, String, i64)>, String> {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-        let rows = client
-            .query(
-                "SELECT token, device_name, (EXTRACT(EPOCH FROM last_seen) * 1000)::bigint
-             FROM sessions WHERE user_id = $1 ORDER BY last_seen DESC",
-                &[&user_id],
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-
+        let rows = client.query("SELECT token, device_name, (EXTRACT(EPOCH FROM last_seen) * 1000)::bigint FROM sessions WHERE user_id = $1 ORDER BY last_seen DESC", &[&user_id]).await.map_err(|e| e.to_string())?;
         Ok(rows
             .into_iter()
             .map(|r| {
@@ -168,7 +230,6 @@ impl AppState {
             .collect())
     }
 
-    // ---- FCM ----
     pub async fn save_fcm_token(
         &self,
         user_id: &str,
@@ -180,16 +241,12 @@ impl AppState {
         if token.is_empty() {
             return Ok(());
         }
-
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-
         let existing_opt = client
             .query_opt("SELECT user_id FROM fcm_tokens WHERE token = $1", &[&token])
             .await
             .map_err(|e| e.to_string())?;
-
         let existing: Option<String> = existing_opt.map(|r| r.get(0));
-
         if existing.as_deref() == Some(user_id) {
             client
                 .execute(
@@ -200,23 +257,16 @@ impl AppState {
                 .map_err(|e| format!("Ошибка обновления FCM-токена: {}", e))?;
             return Ok(());
         }
-
         client
             .execute("DELETE FROM fcm_tokens WHERE token = $1", &[&token])
             .await
             .map_err(|e| format!("Ошибка очистки старого FCM-токена: {}", e))?;
-
         let dev = if device_name.is_empty() {
             "unknown"
         } else {
             device_name
         };
-
-        client.execute(
-            "INSERT INTO fcm_tokens (user_id, session_token, token, device_name) VALUES ($1, $2, $3, $4)",
-            &[&user_id, &session_token, &token, &dev],
-        ).await.map_err(|e| format!("Ошибка сохранения FCM-токена: {}", e))?;
-
+        client.execute("INSERT INTO fcm_tokens (user_id, session_token, token, device_name) VALUES ($1, $2, $3, $4)", &[&user_id, &session_token, &token, &dev]).await.map_err(|e| format!("Ошибка сохранения FCM-токена: {}", e))?;
         Ok(())
     }
 
@@ -229,37 +279,24 @@ impl AppState {
             )
             .await
             .map_err(|e| format!("Ошибка выполнения: {}", e))?;
-
-        let mut tokens = Vec::new();
-        for row in rows {
-            tokens.push(row.get::<_, String>(0));
-        }
-        Ok(tokens)
+        Ok(rows.into_iter().map(|r| r.get(0)).collect())
     }
 
     pub async fn delete_fcm_token(&self, token: &str) -> Result<(), String> {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-        let affected = client
+        client
             .execute("DELETE FROM fcm_tokens WHERE token = $1", &[&token])
             .await
             .map_err(|e| format!("Ошибка удаления FCM-токена: {}", e))?;
-        if affected > 0 {
-            info!("FCM-токен удалён из БД: {}", token);
-        }
         Ok(())
     }
 
-    // ---- Профиль и Настройки ----
     pub async fn get_profile(
         &self,
         user_id: &str,
     ) -> Result<(String, String, String, String, String, String), String> {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-        let row_opt = client.query_opt(
-            "SELECT username, phone, COALESCE(first_name, ''), COALESCE(last_name, ''), COALESCE(display_name, ''), COALESCE(bio, '') FROM users WHERE id = $1",
-            &[&user_id],
-        ).await.map_err(|e| format!("Ошибка выполнения запроса: {}", e))?;
-
+        let row_opt = client.query_opt("SELECT username, phone, COALESCE(first_name, ''), COALESCE(last_name, ''), COALESCE(display_name, ''), COALESCE(bio, '') FROM users WHERE id = $1", &[&user_id]).await.map_err(|e| format!("Ошибка выполнения запроса: {}", e))?;
         if let Some(row) = row_opt {
             Ok((
                 row.get(0),
@@ -284,14 +321,11 @@ impl AppState {
         bio: &str,
     ) -> Result<(), String> {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-
-        // Проверяем занятость username, если он меняется
         let old_username: String = client
             .query_one("SELECT username FROM users WHERE id = $1", &[&user_id])
             .await
             .map_err(|_| "Пользователь не найден".to_string())?
             .get(0);
-
         if old_username != username {
             let exists = client
                 .query_opt("SELECT id FROM users WHERE username = $1", &[&username])
@@ -306,12 +340,12 @@ impl AppState {
             self.id_to_username
                 .insert(user_id.to_string(), username.to_string());
         }
-
-        client.execute(
-            "UPDATE users SET first_name = $1, last_name = $2, display_name = $3, username = $4, bio = $5 WHERE id = $6",
-            &[&first_name, &last_name, &display_name, &username, &bio, &user_id],
-        ).await.map_err(|e| format!("Ошибка обновления профиля: {}", e))?;
-
+        let final_display_name = if display_name.trim().is_empty() {
+            username
+        } else {
+            display_name
+        };
+        client.execute("UPDATE users SET first_name = $1, last_name = $2, display_name = $3, username = $4, bio = $5 WHERE id = $6", &[&first_name, &last_name, &final_display_name, &username, &bio, &user_id]).await.map_err(|e| format!("Ошибка обновления профиля: {}", e))?;
         Ok(())
     }
 
@@ -338,7 +372,6 @@ impl AppState {
             )
             .await
             .map_err(|e| e.to_string())?;
-
         match row {
             Some(r) => Ok((r.get(0), r.get(1))),
             None => Ok((false, 0)),
@@ -352,86 +385,8 @@ impl AppState {
         last_seen_privacy: i16,
     ) -> Result<(), String> {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-        client
-            .execute(
-                "INSERT INTO user_settings (user_id, hide_phone, last_seen_privacy)
-             VALUES ($1, $2, $3)
-             ON CONFLICT (user_id) DO UPDATE
-             SET hide_phone = $2, last_seen_privacy = $3",
-                &[&user_id, &hide_phone, &last_seen_privacy],
-            )
-            .await
-            .map_err(|e| format!("Ошибка обновления настроек: {}", e))?;
+        client.execute("INSERT INTO user_settings (user_id, hide_phone, last_seen_privacy) VALUES ($1, $2, $3) ON CONFLICT (user_id) DO UPDATE SET hide_phone = $2, last_seen_privacy = $3", &[&user_id, &hide_phone, &last_seen_privacy]).await.map_err(|e| format!("Ошибка обновления настроек: {}", e))?;
         Ok(())
-    }
-
-    // ---- Обновление last_seen, проверка пароля и т.д. (старые методы) ----
-    pub async fn set_name(
-        &self,
-        user_id: &str,
-        first_name: &str,
-        last_name: &str,
-    ) -> Result<(), String> {
-        let display_name = if last_name.is_empty() {
-            first_name.to_string()
-        } else {
-            format!("{} {}", first_name, last_name)
-        };
-        let client = self.db.get().await.map_err(|e| e.to_string())?;
-        client
-            .execute(
-                "UPDATE users SET first_name = $1, last_name = $2, display_name = $3 WHERE id = $4",
-                &[&first_name, &last_name, &display_name, &user_id],
-            )
-            .await
-            .map_err(|e| format!("Ошибка обновления имени: {}", e))?;
-        Ok(())
-    }
-
-    pub async fn set_display_name(&self, user_id: &str, display_name: &str) -> Result<(), String> {
-        let client = self.db.get().await.map_err(|e| e.to_string())?;
-        client
-            .execute(
-                "UPDATE users SET display_name = $1 WHERE id = $2",
-                &[&display_name, &user_id],
-            )
-            .await
-            .map_err(|e| format!("Ошибка обновления отображаемого имени: {}", e))?;
-        Ok(())
-    }
-
-    pub async fn set_username(&self, user_id: &str, new_username: &str) -> Result<String, String> {
-        let client = self.db.get().await.map_err(|e| e.to_string())?;
-
-        let exists = client
-            .query_opt("SELECT id FROM users WHERE username = $1", &[&new_username])
-            .await
-            .map_err(|e| e.to_string())?;
-        if exists.is_some() {
-            return Err("Username уже занят".to_string());
-        }
-
-        let old_username: String = client
-            .query_one("SELECT username FROM users WHERE id = $1", &[&user_id])
-            .await
-            .map_err(|_| "Пользователь не найден".to_string())?
-            .get(0);
-
-        client
-            .execute(
-                "UPDATE users SET username = $1 WHERE id = $2",
-                &[&new_username, &user_id],
-            )
-            .await
-            .map_err(|e| format!("Ошибка обновления username: {}", e))?;
-
-        self.username_to_id.remove(&old_username);
-        self.username_to_id
-            .insert(new_username.to_string(), user_id.to_string());
-        self.id_to_username
-            .insert(user_id.to_string(), new_username.to_string());
-
-        Ok(old_username)
     }
 
     pub async fn update_last_seen(&self, user_id: &str) -> Result<(), String> {
@@ -473,7 +428,6 @@ impl AppState {
         verify(password, &hash).map_err(|e| format!("Ошибка проверки пароля: {}", e))
     }
 
-    // ---- Личные сообщения (без изменений) ----
     pub async fn store_message(
         &self,
         sender_id: &str,
@@ -484,10 +438,7 @@ impl AppState {
     ) -> Result<i64, String> {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
         let dt = chrono::Utc.timestamp_millis_opt(timestamp).unwrap();
-        let row = client.query_one(
-            "INSERT INTO messages (sender_id, recipient_id, content, sent_at, reply_to_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-            &[&sender_id, &recipient_id, &content, &dt, &reply_to_id],
-        ).await.map_err(|e| format!("Ошибка сохранения сообщения: {}", e))?;
+        let row = client.query_one("INSERT INTO messages (sender_id, recipient_id, content, sent_at, reply_to_id) VALUES ($1, $2, $3, $4, $5) RETURNING id", &[&sender_id, &recipient_id, &content, &dt, &reply_to_id]).await.map_err(|e| format!("Ошибка сохранения сообщения: {}", e))?;
         Ok(row.get(0))
     }
 
@@ -510,20 +461,7 @@ impl AppState {
         String,
     > {
         let client = self.db.get().await.map_err(|e| e.to_string())?;
-        let stmt = client.prepare_cached(
-            "WITH ranked AS (
-                SELECT m.id, m.sender_id, m.recipient_id, m.content,
-                       (EXTRACT(EPOCH FROM m.sent_at) * 1000)::bigint AS ts,
-                       m.reply_to_id, m.read_at, m.edited,
-                       ROW_NUMBER() OVER (PARTITION BY CASE WHEN m.sender_id = $1 THEN m.recipient_id ELSE m.sender_id END ORDER BY m.id DESC) AS rn
-                FROM messages m
-                LEFT JOIN hidden_messages h ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = $1
-                WHERE (m.sender_id = $1 OR m.recipient_id = $1) AND h.msg_id IS NULL
-            )
-            SELECT id, sender_id, recipient_id, content, ts, reply_to_id, read_at, edited
-            FROM ranked WHERE rn <= $2 ORDER BY id ASC",
-        ).await.map_err(|e| e.to_string())?;
-
+        let stmt = client.prepare_cached("WITH ranked AS (SELECT m.id, m.sender_id, m.recipient_id, m.content, (EXTRACT(EPOCH FROM m.sent_at) * 1000)::bigint AS ts, m.reply_to_id, m.read_at, m.edited, ROW_NUMBER() OVER (PARTITION BY CASE WHEN m.sender_id = $1 THEN m.recipient_id ELSE m.sender_id END ORDER BY m.id DESC) AS rn FROM messages m LEFT JOIN hidden_messages h ON h.kind = 1 AND h.msg_id = m.id AND h.user_id = $1 WHERE (m.sender_id = $1 OR m.recipient_id = $1) AND h.msg_id IS NULL) SELECT id, sender_id, recipient_id, content, ts, reply_to_id, read_at, edited FROM ranked WHERE rn <= $2 ORDER BY id ASC").await.map_err(|e| e.to_string())?;
         let rows = client
             .query(&stmt, &[&user_id, &per_chat])
             .await
@@ -534,8 +472,6 @@ impl AppState {
             let read_at: Option<chrono::DateTime<chrono::Utc>> = row.get(6);
             let is_sender = sender_id == user_id;
             let read_flag = read_at.is_some();
-            let flag_me = if is_sender { true } else { read_flag };
-            let flag_any = if is_sender { read_flag } else { true };
             out.push((
                 row.get(0),
                 sender_id,
@@ -543,8 +479,8 @@ impl AppState {
                 row.get(3),
                 row.get(4),
                 row.get(5),
-                flag_me,
-                flag_any,
+                if is_sender { true } else { read_flag },
+                if is_sender { read_flag } else { true },
                 row.get(7),
             ));
         }
@@ -645,8 +581,6 @@ impl AppState {
                     let read_at: Option<chrono::DateTime<chrono::Utc>> = row.get(6);
                     let is_sender = sender_id == user_id;
                     let read_flag = read_at.is_some();
-                    let flag_me = if is_sender { true } else { read_flag };
-                    let flag_any = if is_sender { read_flag } else { true };
                     out.push((
                         row.get(0),
                         self.resolve_username(&sender_id).await,
@@ -654,8 +588,8 @@ impl AppState {
                         row.get(3),
                         row.get(4),
                         row.get(5),
-                        flag_me,
-                        flag_any,
+                        if is_sender { true } else { read_flag },
+                        if is_sender { read_flag } else { true },
                         None,
                         row.get(7),
                     ));

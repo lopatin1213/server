@@ -28,10 +28,32 @@ async fn run_server(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Принудительно загружаем .env (для DB_PASSWORD и PEPPER)
+    dotenvy::dotenv_override().ok();
+
     env_logger::init();
 
+    // Проверяем наличие секретов перед стартом
+    let db_password =
+        env::var("DB_PASSWORD").expect("КРИТИЧЕСКАЯ ОШИБКА: DB_PASSWORD не задан в .env!");
+    let pepper = env::var("PEPPER").expect("КРИТИЧЕСКАЯ ОШИБКА: PEPPER не задан в .env!");
+
+    // Инициализируем PEPPER для доступа из migrate.rs
+    unsafe {
+        env::set_var("PEPPER", pepper);
+    }
+
+    // Остальные настройки берем из env (если заданы), иначе - дефолты
     let ip = env::var("IP").unwrap_or_else(|_| "0.0.0.0".to_string());
     let port = env::var("PORT").unwrap_or_else(|_| "8100".to_string());
+    let db_host = env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let db_port: u16 = env::var("DB_PORT")
+        .unwrap_or_else(|_| "5432".to_string())
+        .parse()
+        .unwrap_or(5432);
+    let db_user = env::var("DB_USER").unwrap_or_else(|_| "vartchat_user".to_string());
+    let db_name = env::var("DB_NAME").unwrap_or_else(|_| "vartchat".to_string());
+
     let addr = if ip.contains(':') {
         format!("[{}]:{}", ip, port)
     } else {
@@ -40,27 +62,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(&addr).await?;
     log::info!("WebSocket сервер запущен на {}", addr);
 
-    // Инициализация Postgres (через отдельные переменные, чтобы кириллица в пароле не ломала URL)
     let mut cfg = Config::new();
-    cfg.host = Some(env::var("DB_HOST").unwrap_or_else(|_| "localhost".to_string()));
-    cfg.port = Some(
-        env::var("DB_PORT")
-            .unwrap_or_else(|_| "5432".to_string())
-            .parse()
-            .unwrap_or(5432),
-    );
-    cfg.user = Some(env::var("DB_USER").unwrap_or_else(|_| "vartchat_user".to_string()));
-    cfg.password = Some(env::var("DB_PASSWORD").unwrap_or_else(|_| "МфкеСрфе!2026".to_string()));
-    cfg.dbname = Some(env::var("DB_NAME").unwrap_or_else(|_| "vartchat".to_string()));
+    cfg.host = Some(db_host);
+    cfg.port = Some(db_port);
+    cfg.user = Some(db_user);
+    cfg.password = Some(db_password);
+    cfg.dbname = Some(db_name);
 
     let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 
-    // Инициализация таблиц при старте (вызов из migrate.rs, который мы перепишем)
     AppState::init_db(&pool).await?;
 
     let state = Arc::new(AppState::new(pool));
 
-    // Прогрев кэшей (username <-> id) для быстрой работы resolve_username
+    // Прогрев кэшей (username <-> id)
     {
         let client = state.db.get().await?;
         let rows = client.query("SELECT id, username FROM users", &[]).await?;
@@ -89,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::future::pending::<()>().await;
     };
 
-    // Воркер чистки просроченных сообщений (delete_at).
+    // Воркер чистки просроченных сообщений
     {
         let state_cleanup = state.clone();
         tokio::spawn(async move {
@@ -105,12 +120,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tokio::select! {
         _ = run_server(listener, state) => {},
-        _ = ctrl_c => {
-            log::info!("Получен сигнал Ctrl+C, завершаем работу...");
-        },
-        _ = terminate => {
-            log::info!("Получен сигнал завершения, завершаем работу...");
-        },
+        _ = ctrl_c => { log::info!("Получен сигнал Ctrl+C, завершаем работу..."); },
+        _ = terminate => { log::info!("Получен сигнал завершения, завершаем работу..."); },
     }
 
     Ok(())

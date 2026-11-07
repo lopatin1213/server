@@ -1,10 +1,18 @@
 use deadpool_postgres::Pool;
 use log::info;
+use sha2::{Digest, Sha256};
 
 use super::core::AppState;
 
 impl AppState {
-    // ---- init ----
+    // Переносим сюда функцию хэширования, она нужна и тут, и в user.rs
+    pub fn compute_phone_hash(phone: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(phone.as_bytes());
+        hasher.update(crate::constants::PEPPER.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+
     pub async fn init_db(pool: &Pool) -> Result<(), String> {
         let client = pool
             .get()
@@ -21,19 +29,27 @@ impl AppState {
                 last_name TEXT,
                 display_name TEXT,
                 bio TEXT,
+                phone_hash TEXT,
                 created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
                 last_seen BIGINT DEFAULT 0
             );
-            -- Добавляем bio, если таблица уже существует (для старых баз)
+            -- Добавляем bio и phone_hash, если таблица уже существует
             ALTER TABLE users ADD COLUMN IF NOT EXISTS bio TEXT;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS phone_hash TEXT;
+            CREATE INDEX IF NOT EXISTS idx_users_phone_hash ON users(phone_hash);
 
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 hide_phone BOOLEAN DEFAULT false,
                 last_seen_privacy SMALLINT DEFAULT 0
             );
-            -- Переносим существующих пользователей в user_settings
             INSERT INTO user_settings (user_id) SELECT id FROM users ON CONFLICT DO NOTHING;
+
+            CREATE TABLE IF NOT EXISTS user_contacts (
+                owner_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+                contact_id TEXT REFERENCES users(id) ON DELETE CASCADE,
+                PRIMARY KEY (owner_id, contact_id)
+            );
 
             CREATE TABLE IF NOT EXISTS sessions (
                 token TEXT PRIMARY KEY,
@@ -129,7 +145,6 @@ impl AppState {
                 created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
             );
 
-            -- Индексы для быстрой работы
             CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
             CREATE INDEX IF NOT EXISTS idx_messages_recipient ON messages(recipient_id);
             CREATE INDEX IF NOT EXISTS idx_group_messages_group ON group_messages(group_id);
@@ -145,17 +160,7 @@ impl AppState {
             .await
             .map_err(|e| format!("Ошибка создания таблиц PG: {}", e))?;
 
-        // Создаем системного пользователя, если его нет
-        let _ = client
-            .execute(
-                "INSERT INTO users (id, username, phone, password_hash, display_name) \
-             VALUES ('system', 'system', '0000000000', '*', 'VartChat System') \
-             ON CONFLICT (id) DO NOTHING",
-                &[],
-            )
-            .await;
-
-        // Убеждаемся, что у системного пользователя есть настройки
+        let _ = client.execute("INSERT INTO users (id, username, phone, password_hash, display_name) VALUES ('system', 'system', '0000000000', '*', 'VartChat System') ON CONFLICT (id) DO NOTHING", &[]).await;
         let _ = client
             .execute(
                 "INSERT INTO user_settings (user_id) VALUES ('system') ON CONFLICT DO NOTHING",
@@ -163,8 +168,43 @@ impl AppState {
             )
             .await;
 
-        info!("База данных PostgreSQL успешно инициализирована.");
+        // ==================== V5: МИГРАЦИЯ ДАННЫХ ====================
+        info!("Проверяем необходимость миграции phone_hash...");
 
+        let rows = client
+            .query(
+                "SELECT id, phone FROM users WHERE phone_hash IS NULL AND phone != '0000000000'",
+                &[],
+            )
+            .await
+            .map_err(|e| format!("Ошибка выборки для миграции: {}", e))?;
+
+        if !rows.is_empty() {
+            info!(
+                "Миграция: найдено {} пользователей без phone_hash. Заполняем...",
+                rows.len()
+            );
+
+            for row in rows {
+                let user_id: String = row.get(0);
+                let phone: String = row.get(1);
+                let hash = Self::compute_phone_hash(&phone);
+
+                let _ = client
+                    .execute(
+                        "UPDATE users SET phone_hash = $1 WHERE id = $2",
+                        &[&hash, &user_id],
+                    )
+                    .await
+                    .map_err(|e| format!("Ошибка записи phone_hash: {}", e))?;
+            }
+            info!("Миграция: успешно заполнены хэши для всех пользователей.");
+        } else {
+            info!("Миграция: все пользователи уже имеют phone_hash.");
+        }
+        // ==========================================================
+
+        info!("База данных PostgreSQL успешно инициализирована (с поддержкой V5).");
         Ok(())
     }
 }

@@ -22,5 +22,12 @@
       <jdbc-url>jdbc:postgresql://localhost:5432/vartchat</jdbc-url>
       <working-dir>$ProjectFileDir$</working-dir>
     </data-source>
+    <data-source source="LOCAL" name="vartchatprod" uuid="0a1aef36-b711-42a9-ae76-21db9effa03f">
+      <driver-ref>postgresql</driver-ref>
+      <synchronize>true</synchronize>
+      <jdbc-driver>org.postgresql.Driver</jdbc-driver>
+      <jdbc-url>jdbc:postgresql://postgresql-vartchat.alwaysdata.net:5432/postgres</jdbc-url>
+      <working-dir>$ProjectFileDir$</working-dir>
+    </data-source>
   </component>
 </project>
