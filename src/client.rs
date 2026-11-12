@@ -358,13 +358,25 @@ pub async fn process_command(
                 if parts.len() != 5 {
                     "[Система] Ошибка: передайте 5 параметров через |".to_string()
                 } else {
+                    let old_username = _my_username.to_string();
+                    let new_username = parts[3].to_string();
+
                     match state
                         .update_profile(
                             my_user_id, parts[0], parts[1], parts[2], parts[3], parts[4],
                         )
                         .await
                     {
-                        Ok(_) => "[Система] Профиль успешно обновлен".to_string(),
+                        Ok(_) => {
+                            if old_username != new_username {
+                                crate::senders::broadcast_invalidate_cache(
+                                    state,
+                                    Some(&new_username),
+                                )
+                                .await;
+                            }
+                            "[Система] Профиль успешно обновлен".to_string()
+                        }
                         Err(e) => format!("[Система] Ошибка: {}", e),
                     }
                 }
@@ -874,112 +886,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
     // ---- Загрузка истории при логине ----
     if !my_user_id.is_empty() && !is_background {
-        let tx_h = tx.clone();
-        let keys_h = keys.clone();
-        let uid_h = my_user_id.clone();
-        let state_h = state.clone();
-
-        let personal = state_h.get_recent_personal(&uid_h, LOGIN_PER_CHAT).await;
-        if let Ok(msgs) = personal {
-            for (
-                msg_id,
-                sender_id,
-                recipient_id,
-                content,
-                ts,
-                reply_id,
-                flag_me,
-                flag_any,
-                edited,
-            ) in msgs
-            {
-                let sender = state_h.resolve_username(&sender_id).await;
-                let recipient = state_h.resolve_username(&recipient_id).await;
-                let _ = send_encrypted_message(
-                    &tx_h,
-                    &keys_h,
-                    &sender,
-                    &recipient,
-                    content.as_bytes(),
-                    MsgFields {
-                        timestamp: ts,
-                        msg_id,
-                        reply_to_id: reply_id.unwrap_or(0),
-                        flag_me,
-                        flag_any,
-                        views: None,
-                        edited,
-                    },
-                    None,
-                )
-                .await;
-            }
-        }
-
-        let groups = state_h.get_recent_groups(&uid_h, LOGIN_PER_CHAT).await;
-        if let Ok(msgs) = groups {
-            for (msg_id, gname, sender_id, content, ts, reply_id, flag_me, flag_any, edited) in msgs
-            {
-                let sender = state_h.resolve_username(&sender_id).await;
-                let recipient = format!("#{}", gname);
-                let _ = send_encrypted_message(
-                    &tx_h,
-                    &keys_h,
-                    &sender,
-                    &recipient,
-                    content.as_bytes(),
-                    MsgFields {
-                        timestamp: ts,
-                        msg_id,
-                        reply_to_id: reply_id.unwrap_or(0),
-                        flag_me,
-                        flag_any,
-                        views: None,
-                        edited,
-                    },
-                    None,
-                )
-                .await;
-            }
-        }
-
-        let channels = state_h.get_recent_channels(&uid_h, LOGIN_PER_CHAT).await;
-        if let Ok(msgs) = channels {
-            for (
-                msg_id,
-                cname,
-                sender_id,
-                content,
-                ts,
-                reply_id,
-                flag_me,
-                flag_any,
-                views,
-                edited,
-            ) in msgs
-            {
-                let sender = state_h.resolve_username(&sender_id).await;
-                let recipient = format!("&{}", cname);
-                let _ = send_encrypted_message(
-                    &tx_h,
-                    &keys_h,
-                    &sender,
-                    &recipient,
-                    content.as_bytes(),
-                    MsgFields {
-                        timestamp: ts,
-                        msg_id,
-                        reply_to_id: reply_id.unwrap_or(0),
-                        flag_me,
-                        flag_any,
-                        views: Some(views),
-                        edited,
-                    },
-                    None,
-                )
-                .await;
-            }
-        }
+        crate::senders::push_login_history(&tx, &keys, &my_user_id, &state).await;
     }
 
     // ---- Основной цикл ----
@@ -1148,6 +1055,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                                     &format!("[Система] Пользователь {} не найден", recipient_name),
                                 )
                                 .await;
+                                let pkt = crate::senders::build_invalidate_cache_packet();
+                                let _ = tx.send(Message::Binary(pkt));
                                 continue;
                             }
                         };
@@ -2699,6 +2608,101 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         process_command(&cmd, &my_user_id, &my_username, &state, &session).await;
                     if !response.is_empty() {
                         let _ = send_system_message(&tx, &response).await;
+                    }
+                }
+                MSG_TYPE_REACTION => {
+                    if rest.len() < 8 + 1 + 4 {
+                        warn!("0x0B: мало данных");
+                        continue;
+                    }
+                    let mut offset = 0;
+                    let msg_id = i64::from_be_bytes(rest[offset..offset + 8].try_into().unwrap());
+                    offset += 8;
+                    let kind = rest[offset];
+                    offset += 1;
+                    let sym_len =
+                        u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
+                    offset += 4;
+                    if rest.len() < offset + sym_len {
+                        continue;
+                    }
+                    let symbol =
+                        String::from_utf8_lossy(&rest[offset..offset + sym_len]).to_string();
+
+                    // Сохраняем/удаляем реакцию (логика переключения в user.rs)
+                    let _ = state
+                        .save_reaction(kind, msg_id, &my_user_id, &symbol)
+                        .await;
+
+                    // Получаем актуальное состояние реакций для этого сообщения
+                    let reactions = state
+                        .get_reactions_for_messages(kind, &[msg_id])
+                        .await
+                        .unwrap_or_default();
+
+                    let mut target_users = Vec::new();
+                    match kind {
+                        MSG_KIND_PERSONAL => {
+                            if let Ok(Some((sender_id, recipient_id))) =
+                                state.lookup_personal_message(msg_id).await
+                            {
+                                target_users.push(sender_id.clone());
+                                if recipient_id != sender_id {
+                                    target_users.push(recipient_id);
+                                }
+                            }
+                        }
+                        MSG_KIND_GROUP => {
+                            if let Ok(client) = state.db.get().await {
+                                if let Ok(Some(row)) = client.query_opt("SELECT g.name FROM group_messages gm JOIN groups g ON gm.group_id = g.id WHERE gm.id = $1", &[&msg_id]).await {
+                                    let gname: String = row.get(0);
+                                    if let Ok(members) = state.get_group_members(&gname).await {
+                                        target_users.extend(members);
+                                    }
+                                }
+                            }
+                        }
+                        MSG_KIND_CHANNEL => {
+                            if let Ok(client) = state.db.get().await {
+                                if let Ok(Some(row)) = client.query_opt("SELECT c.name FROM channel_messages cm JOIN channels c ON cm.channel_id = c.id WHERE cm.id = $1", &[&msg_id]).await {
+                                    let cname: String = row.get(0);
+                                    if let Ok(subs) = state.get_channel_subscribers(&cname).await {
+                                        target_users.extend(subs);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    let mut updated_symbols = std::collections::HashSet::new();
+
+                    // Рассылаем актуальные реакции
+                    if let Some(msg_reacts) = reactions.get(&msg_id) {
+                        for (emoji, users) in msg_reacts {
+                            updated_symbols.insert(emoji.clone());
+                            let count = users.len() as u32;
+                            let who = users.join(",");
+                            let pkt = crate::senders::build_reaction_packet(
+                                msg_id, kind, emoji, count, &who,
+                            );
+                            for uid in &target_users {
+                                let uname = state.resolve_username(uid).await;
+                                crate::senders::send_to_user_sessions(&state, &uname, pkt.clone())
+                                    .await;
+                            }
+                        }
+                    }
+
+                    // Если эмодзи больше нет в списке, значит он был удален. Явно шлем count=0.
+                    if !updated_symbols.contains(&symbol) {
+                        let pkt =
+                            crate::senders::build_reaction_packet(msg_id, kind, &symbol, 0, "");
+                        for uid in &target_users {
+                            let uname = state.resolve_username(&uid).await;
+                            crate::senders::send_to_user_sessions(&state, &uname, pkt.clone())
+                                .await;
+                        }
                     }
                 }
 

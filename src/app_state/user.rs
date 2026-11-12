@@ -737,4 +737,75 @@ impl AppState {
             .map_err(|e| e.to_string())?;
         Ok(row_opt.is_some())
     }
+
+    pub async fn save_reaction(
+        &self,
+        kind: u8,
+        msg_id: i64,
+        user_id: &str,
+        emoji: &str,
+    ) -> Result<(), String> {
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+
+        // Проверяем, есть ли уже реакция от этого юзера
+        let row = client.query_opt(
+            "SELECT emoji FROM message_reactions WHERE kind = $1 AND msg_id = $2 AND user_id = $3",
+            &[&(kind as i16), &msg_id, &user_id],
+        ).await.map_err(|e| e.to_string())?;
+
+        if let Some(r) = row {
+            let current: String = r.get(0);
+            if current == emoji {
+                // Если клик пришел на тот же эмодзи - удаляем
+                client.execute(
+                    "DELETE FROM message_reactions WHERE kind = $1 AND msg_id = $2 AND user_id = $3",
+                    &[&(kind as i16), &msg_id, &user_id],
+                ).await.map_err(|e| format!("Ошибка удаления реакции: {}", e))?;
+                return Ok(());
+            }
+        }
+
+        // Иначе ставим/обновляем
+        client.execute(
+            "INSERT INTO message_reactions (kind, msg_id, user_id, emoji) VALUES ($1, $2, $3, $4) ON CONFLICT (kind, msg_id, user_id) DO UPDATE SET emoji = $4",
+            &[&(kind as i16), &msg_id, &user_id, &emoji],
+        ).await.map_err(|e| format!("Ошибка сохранения реакции: {}", e))?;
+        Ok(())
+    }
+
+    pub async fn get_reactions_for_messages(
+        &self,
+        kind: u8,
+        msg_ids: &[i64],
+    ) -> Result<
+        std::collections::HashMap<i64, std::collections::HashMap<String, Vec<String>>>,
+        String,
+    > {
+        let mut map: std::collections::HashMap<
+            i64,
+            std::collections::HashMap<String, Vec<String>>,
+        > = std::collections::HashMap::new();
+        if msg_ids.is_empty() {
+            return Ok(map);
+        }
+        let client = self.db.get().await.map_err(|e| e.to_string())?;
+        let rows = client.query(
+            "SELECT msg_id, emoji, user_id FROM message_reactions WHERE kind = $1 AND msg_id = ANY($2)",
+            &[&(kind as i16), &msg_ids],
+        ).await.map_err(|e| format!("Ошибка получения реакций: {}", e))?;
+
+        for row in rows {
+            let msg_id: i64 = row.get(0);
+            let emoji: String = row.get(1);
+            let user_id: String = row.get(2);
+            let uname = self.resolve_username(&user_id).await;
+
+            map.entry(msg_id)
+                .or_default()
+                .entry(emoji)
+                .or_default()
+                .push(uname);
+        }
+        Ok(map)
+    }
 }

@@ -2,7 +2,7 @@ use std::time::Duration as StdDuration;
 
 // ==================== Версия протокола ====================
 pub const MIN_PROTO_VERSION: u16 = 3;
-pub const CURRENT_PROTO_VERSION: u16 = 4;
+pub const CURRENT_PROTO_VERSION: u16 = 5;
 
 pub const HANDSHAKE_OK: u8 = 0x00;
 pub const HANDSHAKE_REJECT: u8 = 0xFF;
@@ -17,6 +17,9 @@ pub const MSG_TYPE_LOGOUT: u8 = 0x06;
 pub const MSG_TYPE_READ: u8 = 0x07;
 pub const MSG_TYPE_EDIT: u8 = 0x08;
 pub const MSG_TYPE_TYPING: u8 = 0x09;
+pub const MSG_TYPE_SECURE_COMMAND: u8 = 0x0A;
+pub const MSG_TYPE_REACTION: u8 = 0x0B;
+pub const MSG_TYPE_INVALIDATE_CACHE: u8 = 0x0C;
 
 pub const MSG_KIND_PERSONAL: u8 = 1;
 pub const MSG_KIND_GROUP: u8 = 2;
@@ -27,7 +30,7 @@ pub const MSG_DELETE_FOR_ME: u8 = 1;
 
 pub const LOGOUT_TYPE_EXIT: u8 = 0;
 pub const LOGOUT_TYPE_DELETE_ACCOUNT: u8 = 1;
-pub const MSG_TYPE_SECURE_COMMAND: u8 = 0x0A;
+
 // ==================== Лимиты ====================
 pub const MAX_MESSAGE_SIZE: usize = 64 * 1024;
 pub const RATE_LIMIT_WINDOW: StdDuration = StdDuration::from_secs(1);

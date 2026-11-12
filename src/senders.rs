@@ -40,14 +40,12 @@ pub fn build_delete_packet(msg_id: i64, kind: u8, dtype: u8) -> Vec<u8> {
     }
 }
 
-/// C→S и S→C 0x05 (удаление целого чата/группы/канала):
-/// [0x05][0 i64 BE][kind u8][type u8][name_len u32 BE][name utf8]
 pub fn build_delete_chat_packet(kind: u8, name: &str, dtype: u8) -> Vec<u8> {
     let name_bytes = name.as_bytes();
     let total_len = 1 + 8 + 1 + 1 + 4 + name_bytes.len();
     let mut data = Vec::with_capacity(total_len);
     data.push(MSG_TYPE_DELETE);
-    data.extend_from_slice(&0i64.to_be_bytes()); // msg_id = 0
+    data.extend_from_slice(&0i64.to_be_bytes());
     data.push(kind);
     data.push(dtype);
     data.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
@@ -65,6 +63,31 @@ pub fn build_read_packet(items: &[(u8, i64)]) -> Vec<u8> {
         data.extend_from_slice(&msg_id.to_be_bytes());
     }
     data
+}
+
+pub fn build_reaction_packet(
+    msg_id: i64,
+    kind: u8,
+    symbol: &str,
+    count: u32,
+    who: &str,
+) -> Vec<u8> {
+    let sym_bytes = symbol.as_bytes();
+    let who_bytes = who.as_bytes();
+    let mut data = Vec::with_capacity(1 + 8 + 1 + 4 + sym_bytes.len() + 4 + 4 + who_bytes.len());
+    data.push(MSG_TYPE_REACTION);
+    data.extend_from_slice(&msg_id.to_be_bytes());
+    data.push(kind);
+    data.extend_from_slice(&(sym_bytes.len() as u32).to_be_bytes());
+    data.extend_from_slice(sym_bytes);
+    data.extend_from_slice(&count.to_be_bytes());
+    data.extend_from_slice(&(who_bytes.len() as u32).to_be_bytes());
+    data.extend_from_slice(who_bytes);
+    data
+}
+
+pub fn build_invalidate_cache_packet() -> Vec<u8> {
+    vec![MSG_TYPE_INVALIDATE_CACHE]
 }
 
 pub async fn send_encrypted_message(
@@ -180,6 +203,158 @@ pub async fn broadcast_system_message(
     }
 }
 
+pub async fn broadcast_invalidate_cache(state: &Arc<AppState>, exclude_username: Option<&str>) {
+    let pkt = build_invalidate_cache_packet();
+    for entry in state.sessions.iter() {
+        let session = entry.value();
+        let connected = session.connected.load(std::sync::atomic::Ordering::Relaxed);
+        if connected {
+            if let Some(uname) = session.username.get()
+                && Some(uname.as_str()) == exclude_username
+            {
+                continue;
+            }
+            let _ = session.tx.send(Message::Binary(pkt.clone()));
+        }
+    }
+}
+
+pub async fn push_login_history(
+    tx: &mpsc::UnboundedSender<Message>,
+    keys: &SessionKeys,
+    my_user_id: &str,
+    state: &Arc<AppState>,
+) {
+    if my_user_id.is_empty() {
+        return;
+    }
+    let tx_h = tx.clone();
+    let keys_h = keys.clone();
+    let uid_h = my_user_id.to_string();
+    let state_h = state.clone();
+
+    let personal = state_h.get_recent_personal(&uid_h, LOGIN_PER_CHAT).await;
+    if let Ok(msgs) = personal {
+        let msg_ids: Vec<i64> = msgs.iter().map(|m| m.0).collect();
+        let reactions = state_h
+            .get_reactions_for_messages(MSG_KIND_PERSONAL, &msg_ids)
+            .await
+            .unwrap_or_default();
+        for (msg_id, sender_id, recipient_id, content, ts, reply_id, flag_me, flag_any, edited) in
+            msgs
+        {
+            let sender = state_h.resolve_username(&sender_id).await;
+            let recipient = state_h.resolve_username(&recipient_id).await;
+            let _ = send_encrypted_message(
+                &tx_h,
+                &keys_h,
+                &sender,
+                &recipient,
+                content.as_bytes(),
+                MsgFields {
+                    timestamp: ts,
+                    msg_id,
+                    reply_to_id: reply_id.unwrap_or(0),
+                    flag_me,
+                    flag_any,
+                    views: None,
+                    edited,
+                },
+                None,
+            )
+            .await;
+            if let Some(msg_reacts) = reactions.get(&msg_id) {
+                for (emoji, users) in msg_reacts {
+                    let count = users.len() as u32;
+                    let who = users.join(",");
+                    let pkt = build_reaction_packet(msg_id, MSG_KIND_PERSONAL, emoji, count, &who);
+                    let _ = tx_h.send(Message::Binary(pkt));
+                }
+            }
+        }
+    }
+
+    let groups = state_h.get_recent_groups(&uid_h, LOGIN_PER_CHAT).await;
+    if let Ok(msgs) = groups {
+        let msg_ids: Vec<i64> = msgs.iter().map(|m| m.0).collect();
+        let reactions = state_h
+            .get_reactions_for_messages(MSG_KIND_GROUP, &msg_ids)
+            .await
+            .unwrap_or_default();
+        for (msg_id, gname, sender_id, content, ts, reply_id, flag_me, flag_any, edited) in msgs {
+            let sender = state_h.resolve_username(&sender_id).await;
+            let recipient = format!("#{}", gname);
+            let _ = send_encrypted_message(
+                &tx_h,
+                &keys_h,
+                &sender,
+                &recipient,
+                content.as_bytes(),
+                MsgFields {
+                    timestamp: ts,
+                    msg_id,
+                    reply_to_id: reply_id.unwrap_or(0),
+                    flag_me,
+                    flag_any,
+                    views: None,
+                    edited,
+                },
+                None,
+            )
+            .await;
+            if let Some(msg_reacts) = reactions.get(&msg_id) {
+                for (emoji, users) in msg_reacts {
+                    let count = users.len() as u32;
+                    let who = users.join(",");
+                    let pkt = build_reaction_packet(msg_id, MSG_KIND_GROUP, emoji, count, &who);
+                    let _ = tx_h.send(Message::Binary(pkt));
+                }
+            }
+        }
+    }
+
+    let channels = state_h.get_recent_channels(&uid_h, LOGIN_PER_CHAT).await;
+    if let Ok(msgs) = channels {
+        let msg_ids: Vec<i64> = msgs.iter().map(|m| m.0).collect();
+        let reactions = state_h
+            .get_reactions_for_messages(MSG_KIND_CHANNEL, &msg_ids)
+            .await
+            .unwrap_or_default();
+        for (msg_id, cname, sender_id, content, ts, reply_id, flag_me, flag_any, views, edited) in
+            msgs
+        {
+            let sender = state_h.resolve_username(&sender_id).await;
+            let recipient = format!("&{}", cname);
+            let _ = send_encrypted_message(
+                &tx_h,
+                &keys_h,
+                &sender,
+                &recipient,
+                content.as_bytes(),
+                MsgFields {
+                    timestamp: ts,
+                    msg_id,
+                    reply_to_id: reply_id.unwrap_or(0),
+                    flag_me,
+                    flag_any,
+                    views: Some(views),
+                    edited,
+                },
+                None,
+            )
+            .await;
+            if let Some(msg_reacts) = reactions.get(&msg_id) {
+                for (emoji, users) in msg_reacts {
+                    let count = users.len() as u32;
+                    let who = users.join(",");
+                    let pkt = build_reaction_packet(msg_id, MSG_KIND_CHANNEL, emoji, count, &who);
+                    let _ = tx_h.send(Message::Binary(pkt));
+                }
+            }
+        }
+    }
+}
+
 pub async fn send_chat_history(
     tx: &mpsc::UnboundedSender<Message>,
     keys: &SessionKeys,
@@ -195,10 +370,10 @@ pub async fn send_chat_history(
 
     type HistRow = (
         i64,
-        String, // sender_id (пока что)
-        String, // recipient_name (с префиксом # или &)
-        String, // content
-        i64,    // ts
+        String,
+        String,
+        String,
+        i64,
         Option<i64>,
         bool,
         bool,
@@ -206,7 +381,6 @@ pub async fn send_chat_history(
         bool,
     );
 
-    // Асинхронно получаем данные из Postgres
     let client = match state.db.get().await {
         Ok(c) => c,
         Err(e) => {
@@ -356,10 +530,24 @@ pub async fn send_chat_history(
     };
 
     let mut msgs = raw;
-    msgs.reverse(); // В хронологическом порядке
+    msgs.reverse();
 
     let count = msgs.len();
     info!("История {}: отдано {} сообщений", chat, count);
+
+    let kind = if chat_owned.starts_with('#') {
+        MSG_KIND_GROUP
+    } else if chat_owned.starts_with('&') {
+        MSG_KIND_CHANNEL
+    } else {
+        MSG_KIND_PERSONAL
+    };
+
+    let msg_ids: Vec<i64> = msgs.iter().map(|m| m.0).collect();
+    let reactions = state
+        .get_reactions_for_messages(kind, &msg_ids)
+        .await
+        .unwrap_or_default();
 
     for (msg_id, sender_id, recipient, content, ts, reply_id, flag_me, flag_any, views, edited) in
         msgs
@@ -384,6 +572,15 @@ pub async fn send_chat_history(
             None,
         )
         .await;
+
+        if let Some(msg_reacts) = reactions.get(&msg_id) {
+            for (emoji, users) in msg_reacts {
+                let count = users.len() as u32;
+                let who = users.join(",");
+                let pkt = build_reaction_packet(msg_id, kind, emoji, count, &who);
+                let _ = tx.send(Message::Binary(pkt));
+            }
+        }
     }
 
     let _ = send_system_message(tx, &format!("[Система] history_done|{}|{}", chat, count)).await;
@@ -419,6 +616,12 @@ pub async fn send_messages_by_ids(
         requested,
         msgs.len()
     );
+
+    let reactions = state
+        .get_reactions_for_messages(kind, &ids)
+        .await
+        .unwrap_or_default();
+
     for (msg_id, sender, recipient, content, ts, reply_id, flag_me, flag_any, views, edited) in msgs
     {
         let _ = send_encrypted_message(
@@ -439,8 +642,18 @@ pub async fn send_messages_by_ids(
             None,
         )
         .await;
+
+        if let Some(msg_reacts) = reactions.get(&msg_id) {
+            for (emoji, users) in msg_reacts {
+                let count = users.len() as u32;
+                let who = users.join(",");
+                let pkt = build_reaction_packet(msg_id, kind, emoji, count, &who);
+                let _ = tx.send(Message::Binary(pkt));
+            }
+        }
     }
 }
+
 use serde_json::json;
 
 pub async fn send_system_notification(state: &Arc<AppState>, target_user_id: &str, text: &str) {
@@ -449,7 +662,6 @@ pub async fn send_system_notification(state: &Arc<AppState>, target_user_id: &st
         .unwrap()
         .as_millis() as i64;
 
-    // 1. Сохраняем в БД
     let msg_id = match state
         .store_message("system", target_user_id, text, now, None)
         .await
@@ -461,13 +673,11 @@ pub async fn send_system_notification(state: &Arc<AppState>, target_user_id: &st
         }
     };
 
-    // 2. Находим имя получателя
     let target_name = state.resolve_username(target_user_id).await;
     if target_name == DELETED_LABEL {
         return;
     }
 
-    // 3. Отправляем в WebSocket, если онлайн
     let tokens = state
         .online_users
         .get(&target_name)
@@ -501,7 +711,6 @@ pub async fn send_system_notification(state: &Arc<AppState>, target_user_id: &st
         }
     }
 
-    // 4. Отправляем FCM, если офлайн (или всегда, на ваше усмотрение, но обычно если офлайн)
     if !is_online {
         let fcm_tokens = state
             .get_fcm_tokens_for_user(target_user_id)
@@ -510,11 +719,8 @@ pub async fn send_system_notification(state: &Arc<AppState>, target_user_id: &st
         for fcm_tok in fcm_tokens {
             let title = "VartChat System".to_string();
             let body = text.chars().take(150).collect::<String>();
-            let data_payload = json!({
-                "chatKey": "system",
-                "kind": "system",
-                "sender": "VartChat System"
-            });
+            let data_payload =
+                json!({ "chatKey": "system", "kind": "system", "sender": "VartChat System" });
             let state_fcm = state.clone();
             tokio::spawn(async move {
                 crate::fcm::send_fcm_push_and_cleanup(

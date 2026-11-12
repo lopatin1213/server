@@ -7,9 +7,13 @@ use super::core::AppState;
 impl AppState {
     // Переносим сюда функцию хэширования, она нужна и тут, и в user.rs
     pub fn compute_phone_hash(phone: &str) -> String {
+        // Читаем PEPPER из переменных окружения (куда его положил main.rs)
+        let pepper =
+            std::env::var("PEPPER").unwrap_or_else(|_| crate::constants::PEPPER.to_string());
+
         let mut hasher = Sha256::new();
         hasher.update(phone.as_bytes());
-        hasher.update(crate::constants::PEPPER.as_bytes());
+        hasher.update(pepper.as_bytes());
         format!("{:x}", hasher.finalize())
     }
 
@@ -143,6 +147,14 @@ impl AppState {
                 reason TEXT NOT NULL,
                 expires_at TIMESTAMPTZ,
                 created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS message_reactions (
+                kind SMALLINT NOT NULL,
+                msg_id BIGINT NOT NULL,
+                user_id TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (kind, msg_id, user_id)
             );
 
             CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id);
