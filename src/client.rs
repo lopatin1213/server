@@ -896,6 +896,17 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
             break;
         }
 
+        // КРИТИЧЕСКАЯ ПРОВЕРКА БЕЗОПАСНОСТИ:
+        // Если токена больше нет в state.sessions, значит сессию убили с другого устройства.
+        if let Some(tok) = session.token.get() {
+            if !state.sessions.contains_key(tok) {
+                info!("Сессия {} была завершена с другого устройства. Отключаем.", tok);
+                let _ = send_system_message(&tx, "[Система] Сессия завершена с другого устройства").await;
+                let _ = tx.send(Message::Close(None));
+                break;
+            }
+        }
+
         let msg = match tokio::time::timeout(PONG_TIMEOUT, stream.next()).await {
             Ok(Some(Ok(msg))) => msg,
             Ok(Some(Err(e))) => {
@@ -2366,6 +2377,8 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                             let sess = state.sessions.get(tok).map(|r| r.clone());
                             if let Some(s) = sess {
                                 let _ = s.tx.send(Message::Binary(pkt.clone()));
+                                let _ = s.tx.send(Message::Close(None));
+                                s.connected.store(false, Ordering::Relaxed);
                             }
                         }
 
@@ -2397,6 +2410,23 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     match result {
                         Ok(_) => {
+                            // Мгновенно убиваем сокет целевой сессии, если она онлайн
+                            if !is_current {
+                                if let Some(target_sess) = state.sessions.get(token).map(|r| r.clone()) {
+                                    let reason = "[Система] Сессия завершена с другого устройства";
+                                    let rb = reason.as_bytes();
+                                    let mut pkt = Vec::with_capacity(1 + 4 + rb.len());
+                                    pkt.push(MSG_TYPE_LOGOUT);
+                                    pkt.extend_from_slice(&(rb.len() as u32).to_be_bytes());
+                                    pkt.extend_from_slice(rb);
+
+                                    let _ = target_sess.tx.send(Message::Binary(pkt));
+                                    let _ = target_sess.tx.send(Message::Close(None));
+                                    target_sess.connected.store(false, Ordering::Relaxed);
+                                    info!("Сессия {} принудительно завершена (сокет закрыт).", token);
+                                }
+                            }
+
                             state.sessions.remove(token);
 
                             if !is_background {
@@ -2610,6 +2640,7 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                         let _ = send_system_message(&tx, &response).await;
                     }
                 }
+
                 MSG_TYPE_REACTION => {
                     if rest.len() < 8 + 1 + 4 {
                         warn!("0x0B: мало данных");
@@ -2620,32 +2651,21 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
                     offset += 8;
                     let kind = rest[offset];
                     offset += 1;
-                    let sym_len =
-                        u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
+                    let sym_len = u32::from_be_bytes(rest[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;
                     if rest.len() < offset + sym_len {
                         continue;
                     }
-                    let symbol =
-                        String::from_utf8_lossy(&rest[offset..offset + sym_len]).to_string();
+                    let symbol = String::from_utf8_lossy(&rest[offset..offset + sym_len]).to_string();
 
-                    // Сохраняем/удаляем реакцию (логика переключения в user.rs)
-                    let _ = state
-                        .save_reaction(kind, msg_id, &my_user_id, &symbol)
-                        .await;
+                    let _ = state.save_reaction(kind, msg_id, &my_user_id, &symbol).await;
 
-                    // Получаем актуальное состояние реакций для этого сообщения
-                    let reactions = state
-                        .get_reactions_for_messages(kind, &[msg_id])
-                        .await
-                        .unwrap_or_default();
+                    let reactions = state.get_reactions_for_messages(kind, &[msg_id]).await.unwrap_or_default();
 
                     let mut target_users = Vec::new();
                     match kind {
                         MSG_KIND_PERSONAL => {
-                            if let Ok(Some((sender_id, recipient_id))) =
-                                state.lookup_personal_message(msg_id).await
-                            {
+                            if let Ok(Some((sender_id, recipient_id))) = state.lookup_personal_message(msg_id).await {
                                 target_users.push(sender_id.clone());
                                 if recipient_id != sender_id {
                                     target_users.push(recipient_id);
@@ -2677,31 +2697,24 @@ pub async fn handle_client(stream: TcpStream, state: Arc<AppState>) {
 
                     let mut updated_symbols = std::collections::HashSet::new();
 
-                    // Рассылаем актуальные реакции
                     if let Some(msg_reacts) = reactions.get(&msg_id) {
                         for (emoji, users) in msg_reacts {
                             updated_symbols.insert(emoji.clone());
                             let count = users.len() as u32;
                             let who = users.join(",");
-                            let pkt = crate::senders::build_reaction_packet(
-                                msg_id, kind, emoji, count, &who,
-                            );
+                            let pkt = crate::senders::build_reaction_packet(msg_id, kind, emoji, count, &who);
                             for uid in &target_users {
                                 let uname = state.resolve_username(uid).await;
-                                crate::senders::send_to_user_sessions(&state, &uname, pkt.clone())
-                                    .await;
+                                crate::senders::send_to_user_sessions(&state, &uname, pkt.clone()).await;
                             }
                         }
                     }
-
-                    // Если эмодзи больше нет в списке, значит он был удален. Явно шлем count=0.
+                    
                     if !updated_symbols.contains(&symbol) {
-                        let pkt =
-                            crate::senders::build_reaction_packet(msg_id, kind, &symbol, 0, "");
+                        let pkt = crate::senders::build_reaction_packet(msg_id, kind, &symbol, 0, "");
                         for uid in &target_users {
                             let uname = state.resolve_username(&uid).await;
-                            crate::senders::send_to_user_sessions(&state, &uname, pkt.clone())
-                                .await;
+                            crate::senders::send_to_user_sessions(&state, &uname, pkt.clone()).await;
                         }
                     }
                 }
