@@ -711,27 +711,25 @@ pub async fn send_system_notification(state: &Arc<AppState>, target_user_id: &st
         }
     }
 
-    if !is_online {
-        let fcm_tokens = state
-            .get_fcm_tokens_for_user(target_user_id)
-            .await
-            .unwrap_or_default();
-        for fcm_tok in fcm_tokens {
-            let title = "VartChat System".to_string();
-            let body = text.chars().take(150).collect::<String>();
-            let data_payload =
-                json!({ "chatKey": "system", "kind": "system", "sender": "VartChat System" });
-            let state_fcm = state.clone();
-            tokio::spawn(async move {
-                crate::fcm::send_fcm_push_and_cleanup(
-                    state_fcm,
-                    &fcm_tok,
-                    &title,
-                    &body,
-                    Some(data_payload),
-                )
-                .await;
-            });
-        }
+    let fcm_tokens = state
+        .get_fcm_tokens_for_user(target_user_id)
+        .await
+        .unwrap_or_default();
+    for fcm_tok in fcm_tokens {
+        let title = "VartChat System".to_string();
+        let body = text.chars().take(150).collect::<String>();
+        let data_payload =
+            json!({ "chatKey": "system", "kind": "system", "sender": "VartChat System" });
+        let state_fcm = state.clone();
+        tokio::spawn(async move {
+            crate::fcm::send_fcm_push_and_cleanup(
+                state_fcm,
+                &fcm_tok,
+                &title,
+                &body,
+                Some(data_payload),
+            )
+            .await;
+        });
     }
 }
