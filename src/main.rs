@@ -2,6 +2,7 @@ mod app_state;
 mod client;
 mod constants;
 mod fcm;
+mod handlers;
 mod handshake;
 mod senders;
 

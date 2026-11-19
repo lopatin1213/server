@@ -136,6 +136,219 @@ pub async fn send_encrypted_message(
         .map_err(|e| format!("send error: {}", e))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_state::Session;
+    use aes_gcm::aead::KeyInit;
+
+    #[test]
+    fn build_delete_packet_roundtrip() {
+        // Удаление для всех: [0x05][msg_id 8][kind 1]
+        let pkt = build_delete_packet(42, MSG_KIND_GROUP, MSG_DELETE_FOR_ALL);
+        assert_eq!(pkt[0], MSG_TYPE_DELETE);
+        assert_eq!(pkt.len(), 10);
+        let msg_id = i64::from_be_bytes(pkt[1..9].try_into().unwrap());
+        assert_eq!(msg_id, 42);
+        assert_eq!(pkt[9], MSG_KIND_GROUP);
+    }
+
+    #[test]
+    fn build_delete_packet_for_me_has_dtype() {
+        let pkt = build_delete_packet(7, MSG_KIND_PERSONAL, MSG_DELETE_FOR_ME);
+        assert_eq!(pkt[0], MSG_TYPE_DELETE);
+        assert_eq!(pkt.len(), 11);
+        assert_eq!(pkt[9], MSG_KIND_PERSONAL);
+        assert_eq!(pkt[10], MSG_DELETE_FOR_ME);
+    }
+
+    #[test]
+    fn build_delete_chat_packet_layout() {
+        let pkt = build_delete_chat_packet(MSG_KIND_GROUP, "team", 0);
+        assert_eq!(pkt[0], MSG_TYPE_DELETE);
+        assert_eq!(i64::from_be_bytes(pkt[1..9].try_into().unwrap()), 0); // chat = 0
+        assert_eq!(pkt[9], MSG_KIND_GROUP);
+        assert_eq!(pkt[10], 0); // dtype
+        let name_len = u32::from_be_bytes(pkt[11..15].try_into().unwrap()) as usize;
+        assert_eq!(name_len, 4);
+        assert_eq!(&pkt[15..15 + name_len], b"team");
+    }
+
+    #[test]
+    fn build_read_packet_layout() {
+        let items = vec![(MSG_KIND_PERSONAL, 1i64), (MSG_KIND_GROUP, 99i64)];
+        let pkt = build_read_packet(&items);
+        assert_eq!(pkt[0], MSG_TYPE_READ);
+        assert_eq!(u16::from_be_bytes(pkt[1..3].try_into().unwrap()), 2);
+        // каждая запись: kind(1) + msg_id(8)
+        assert_eq!(pkt[3], MSG_KIND_PERSONAL);
+        assert_eq!(i64::from_be_bytes(pkt[4..12].try_into().unwrap()), 1);
+        assert_eq!(pkt[12], MSG_KIND_GROUP);
+        assert_eq!(i64::from_be_bytes(pkt[13..21].try_into().unwrap()), 99);
+    }
+
+    #[test]
+    fn build_reaction_packet_layout() {
+        let pkt = build_reaction_packet(5, MSG_KIND_CHANNEL, "🔥", 3, "alice,bob");
+        assert_eq!(pkt[0], MSG_TYPE_REACTION);
+        assert_eq!(i64::from_be_bytes(pkt[1..9].try_into().unwrap()), 5);
+        assert_eq!(pkt[9], MSG_KIND_CHANNEL);
+        let mut off = 10;
+        let sym_len = u32::from_be_bytes(pkt[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        assert_eq!(&pkt[off..off + sym_len], "🔥".as_bytes());
+        off += sym_len;
+        assert_eq!(u32::from_be_bytes(pkt[off..off + 4].try_into().unwrap()), 3);
+        off += 4;
+        let who_len = u32::from_be_bytes(pkt[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        assert_eq!(&pkt[off..off + who_len], b"alice,bob");
+    }
+
+    #[test]
+    fn build_invalidate_cache_packet_is_single_byte() {
+        assert_eq!(build_invalidate_cache_packet(), vec![MSG_TYPE_INVALIDATE_CACHE]);
+    }
+
+    #[test]
+    fn send_encrypted_message_roundtrip_and_layout() {
+        // Проверяем, что send_encrypted_message корректно шифрует и собирает пакет,
+        // который расшифровывается симметричным ключом и сохраняет все поля.
+        let key_bytes: [u8; 32] = [7u8; 32];
+        let keys = SessionKeys { key: key_bytes };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let fields = MsgFields {
+            timestamp: 1_700_000_000_000,
+            msg_id: 123,
+            reply_to_id: 77,
+            flag_me: true,
+            flag_any: false,
+            views: Some(9),
+            edited: true,
+        };
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let data = rt.block_on(async {
+            send_encrypted_message(
+                &tx,
+                &keys,
+                "alice",
+                "bob",
+                b"hello world",
+                fields,
+                Some(555),
+            )
+            .await
+            .unwrap();
+            let msg = rx.recv().await.unwrap();
+            match msg {
+                Message::Binary(d) => d,
+                _ => panic!("expected binary"),
+            }
+        });
+
+        // layout: [0x01][sender_len 4][recipient_len 4][nonce 12][enc_len 4][enc][ts 8][id 8][rt 8][flags...][cmid 8]
+        assert_eq!(data[0], MSG_TYPE_USER);
+        // sender
+        let sender_len = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
+        assert_eq!(sender_len, 5);
+        assert_eq!(&data[5..5 + sender_len], b"alice");
+        // recipient
+        let mut off = 5 + sender_len;
+        let recip_len = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        assert_eq!(recip_len, 3);
+        assert_eq!(&data[off..off + recip_len], b"bob");
+        off += recip_len;
+        // nonce
+        let nonce = &data[off..off + 12];
+        off += 12;
+        // encrypted
+        let enc_len = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        off += 4;
+        let enc = &data[off..off + enc_len];
+        off += enc_len;
+
+        // Расшифровываем обратно
+        let cipher = aes_gcm::Aes256Gcm::new(Key::<aes_gcm::Aes256Gcm>::from_slice(&keys.key));
+        let plain = cipher
+            .decrypt(aes_gcm::Nonce::from_slice(nonce), enc)
+            .unwrap();
+        assert_eq!(plain, b"hello world");
+
+        assert_eq!(i64::from_be_bytes(data[off..off + 8].try_into().unwrap()), fields.timestamp);
+        off += 8;
+        assert_eq!(i64::from_be_bytes(data[off..off + 8].try_into().unwrap()), 123);
+        off += 8;
+        assert_eq!(i64::from_be_bytes(data[off..off + 8].try_into().unwrap()), 77);
+        off += 8;
+        assert_eq!(data[off], 1);
+        off += 1;
+        assert_eq!(data[off], 0);
+        off += 1;
+        assert_eq!(u32::from_be_bytes(data[off..off + 4].try_into().unwrap()), 9);
+        off += 4;
+        assert_eq!(data[off], 1);
+        off += 1;
+        assert_eq!(i64::from_be_bytes(data[off..off + 8].try_into().unwrap()), 555);
+    }
+
+    #[test]
+    fn send_encrypted_message_rejects_oversized() {
+        let keys = SessionKeys { key: [9u8; 32] };
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let big = vec![0u8; MAX_MESSAGE_SIZE + 1];
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let res = rt.block_on(send_encrypted_message(
+            &tx,
+            &keys,
+            "a",
+            "b",
+            &big,
+            MsgFields {
+                timestamp: 0,
+                msg_id: 0,
+                reply_to_id: 0,
+                flag_me: false,
+                flag_any: false,
+                views: None,
+                edited: false,
+            },
+            None,
+        ));
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn send_system_message_layout() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let data = rt.block_on(async {
+            send_system_message(&tx, "привет").await.unwrap();
+            match rx.recv().await.unwrap() {
+                Message::Binary(d) => d,
+                _ => panic!("expected binary"),
+            }
+        });
+        assert_eq!(data[0], MSG_TYPE_SYSTEM);
+        let len = u32::from_be_bytes(data[1..5].try_into().unwrap()) as usize;
+        assert_eq!(&data[5..5 + len], "привет".as_bytes());
+    }
+
+    #[test]
+    fn rate_limit_allows_max_then_blocks() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let session = Session::new(tx, SessionKeys { key: [0u8; 32] });
+        // В первые RATE_LIMIT_WINDOW пропускается до RATE_LIMIT_MAX сообщений
+        for _ in 0..RATE_LIMIT_MAX {
+            assert!(session.check_rate_limit());
+        }
+        // Следующее в этом же окне — уже нет
+        assert!(!session.check_rate_limit());
+    }
+}
+
 pub async fn send_to_all_my_sessions(
     state: &Arc<AppState>,
     my_username: &str,

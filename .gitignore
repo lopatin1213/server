@@ -7,3 +7,4 @@ users.txt
 server.key
 *-firebase-adminsdk-*.json
 /migrate.py
+.env

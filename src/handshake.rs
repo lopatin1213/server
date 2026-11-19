@@ -105,3 +105,64 @@ async fn reject(stream: &mut tokio_tungstenite::WebSocketStream<TcpStream>, reas
     let _ = stream.send(Message::Binary(resp)).await;
     warn!("Handshake: отказ — {}", reason);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use x25519_dalek::{EphemeralSecret, PublicKey};
+
+    /// Проверяем, что согласованное ключевое производство через X25519 + HKDF
+    /// детерминировано: обе стороны получают одинаковый 32-байтовый ключ,
+    /// и оно соответствует коду production-функции.
+    #[test]
+    fn x25519_hkdf_derives_consistent_keys() {
+        // Эмулируем обе стороны handshake
+        let client_secret = EphemeralSecret::random_from_rng(OsRng);
+        let client_pub = PublicKey::from(&client_secret);
+        let server_secret = EphemeralSecret::random_from_rng(OsRng);
+        let server_pub = PublicKey::from(&server_secret);
+
+        let client_shared = client_secret.diffie_hellman(&server_pub).to_bytes();
+        let server_shared = server_secret.diffie_hellman(&client_pub).to_bytes();
+        assert_eq!(client_shared, server_shared, "X25519 shared secret mismatch");
+
+        // Применяем тот же HKDF, что в ws_handshake
+        let derive = |shared: &[u8]| -> [u8; 32] {
+            let hk = Hkdf::<Sha256>::new(None, shared);
+            let mut out = [0u8; 32];
+            hk.expand(b"relay-server", &mut out).unwrap();
+            out
+        };
+        assert_eq!(derive(&client_shared), derive(&server_shared));
+        // Длина ключа — 32 байта (SessionKeys.key)
+        assert_eq!(derive(&client_shared).len(), 32);
+    }
+
+    /// Проверяем, что разные эфемерные ключи дают разные производные ключи
+    /// (с вероятностью ~1, но практически — всегда)
+    #[test]
+    fn x25519_hkdf_keys_differ_across_handshakes() {
+        let (k1, k2) = {
+            let a1 = EphemeralSecret::random_from_rng(OsRng);
+            let a2 = EphemeralSecret::random_from_rng(OsRng);
+            let b = EphemeralSecret::random_from_rng(OsRng);
+            let b_pub = PublicKey::from(&b);
+            let s1 = a1.diffie_hellman(&b_pub).to_bytes();
+            let s2 = a2.diffie_hellman(&b_pub).to_bytes();
+            let derive = |shared: &[u8]| -> [u8; 32] {
+                let hk = Hkdf::<Sha256>::new(None, shared);
+                let mut out = [0u8; 32];
+                hk.expand(b"relay-server", &mut out).unwrap();
+                out
+            };
+            (derive(&s1), derive(&s2))
+        };
+        assert_ne!(k1, k2);
+    }
+
+    #[test]
+    fn session_keys_struct_is_32_bytes() {
+        let keys = crate::app_state::SessionKeys { key: [5u8; 32] };
+        assert_eq!(keys.key.len(), 32);
+    }
+}
